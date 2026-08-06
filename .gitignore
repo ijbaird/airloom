@@ -7,3 +7,4 @@ flatpak-repo/
 dist/
 work/
 outputs/
+.superpowers/
