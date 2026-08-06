@@ -15,7 +15,7 @@ class GeoClueLocator:
         self.timeout_seconds = timeout_seconds
         self._delivered = False
         self._timeout_id = None
-        self._simple = None  # keeps the GeoClue client alive until delivery
+        self._simple = None  # keeps the GeoClue client alive until delivery completes (not beyond)
 
     def start(self, on_fix) -> None:
         try:

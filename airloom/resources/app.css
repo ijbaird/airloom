@@ -55,6 +55,7 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .corner-buttons { left: 14px; bottom: 34px; display: flex; gap: 8px; }
 .corner-buttons button { background: var(--panel-solid); border: 0; border-radius: 18px; padding: 8px 13px; box-shadow: 0 2px 8px rgba(0,0,0,.18); font: inherit; cursor: pointer; }
 .corner-buttons .count { margin-left: 6px; padding: 1px 6px; border-radius: 99px; background: var(--soft); color: var(--muted); font-size: 10px; font-weight: 700; }
+/* z-index 8: must clear .corner-buttons (the "AQI" toggle below it lives in the z-index 5 .overlay stack) */
 .legend { position: absolute; left: 14px; bottom: 76px; z-index: 8; background: var(--panel-solid); border-radius: 12px; padding: 10px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.22); }
 .legend div { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
 .legend i { width: 12px; height: 12px; border-radius: 4px; background: var(--c); }
@@ -63,6 +64,7 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .map-controls { right: 14px; bottom: 34px; display: flex; flex-direction: column; gap: 6px; }
 .map-controls button { width: 38px; height: 38px; border: 0; border-radius: 10px; background: var(--panel-solid); box-shadow: 0 2px 8px rgba(0,0,0,.18); font-size: 18px; cursor: pointer; display: grid; place-items: center; }
 
+/* z-index 7 (sensors-panel and detail-card): must clear the map-controls/corner-buttons .overlay stack (z-index 5) they sit above */
 .sensors-panel { position: absolute; z-index: 7; top: 70px; left: 14px; bottom: 84px; width: min(320px, calc(100vw - 28px)); background: var(--panel-solid); border-radius: 14px; box-shadow: 0 6px 24px rgba(0,0,0,.25); display: flex; flex-direction: column; padding: 12px; }
 .sensors-panel[hidden], .detail-card[hidden], .legend[hidden], .search-results[hidden] { display: none; }
 .sensors-panel header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }

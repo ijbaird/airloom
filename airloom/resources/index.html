@@ -37,7 +37,7 @@
         <button id="sensors-button">☰ Sensors <span class="count" id="sensor-count">0</span></button>
         <button id="legend-chip" aria-expanded="false">AQI</button>
       </div>
-      <div class="legend" id="legend" hidden>
+      <div class="legend" id="legend" aria-label="AQI color legend" hidden>
         <div><i style="--c:#35b779"></i><span>Good</span><b>0–50</b></div>
         <div><i style="--c:#f6c945"></i><span>Moderate</span><b>51–100</b></div>
         <div><i style="--c:#f39c3d"></i><span>Sensitive</span><b>101–150</b></div>
@@ -52,7 +52,7 @@
         </button>
       </div>
 
-      <aside class="sensors-panel" id="sensors-panel" hidden>
+      <aside class="sensors-panel" id="sensors-panel" aria-label="Sensor list" hidden>
         <header><h2>Sensors</h2><button class="icon-button" id="close-sensors" aria-label="Close sensor list">×</button></header>
         <div class="section-heading"><h3>Favorites</h3><span id="favorite-count">0</span></div>
         <div class="sensor-list compact" id="favorites-list"></div>
@@ -61,7 +61,7 @@
         <footer class="panel-footer"><span class="status-dot"></span><span id="data-source">Starting Airloom</span><button id="footer-refresh">Refresh</button></footer>
       </aside>
 
-      <aside class="detail-card" id="detail-card" hidden>
+      <aside class="detail-card" id="detail-card" aria-label="Sensor detail" hidden>
         <div class="detail-topbar">
           <span id="updated-time">Waiting for data</span>
           <span class="detail-actions">

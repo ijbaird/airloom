@@ -142,7 +142,6 @@
       $("#detail-card").hidden = true;
       return;
     }
-    $("#detail-card").hidden = false;
     $("#sensor-name").textContent = sensor.name;
     $("#aqi-number").textContent = sensor.aqi ?? "—";
     $("#aqi-number").style.color = sensor.color;

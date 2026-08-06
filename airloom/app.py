@@ -43,6 +43,7 @@ class AirloomApplication(Adw.Application):
         self.pending_fetch: tuple | None = None
         self.locator: GeoClueLocator | None = None
         self.view_bounds: Bounds | None = None
+        self.view_center: tuple[float, float] | None = None
         self.view_fetched_at = 0.0
         self.connect("activate", self._on_activate)
 
@@ -95,7 +96,14 @@ class AirloomApplication(Adw.Application):
             self.locator.start(self._on_location_fix)
 
     def _auto_refresh(self) -> bool:
-        self.refresh()
+        # Refresh whatever the user is currently looking at, not home — a user
+        # who panned elsewhere shouldn't watch their markers get replaced by
+        # home-area sensors every 5 minutes. Favorites are still folded in so
+        # the alert check keeps covering starred sensors regardless of view.
+        if self.view_bounds is not None and self.view_center is not None:
+            self._start_fetch(self.view_bounds, self.view_center, include_favorites=True)
+        else:
+            self.refresh()
         return GLib.SOURCE_CONTINUE
 
     def _on_decide_policy(self, _webview, decision, decision_type) -> bool:
@@ -222,8 +230,14 @@ class AirloomApplication(Adw.Application):
             center = (float(message["lat"]), float(message["lon"]))
         except (KeyError, TypeError, ValueError):
             return
-        if not (-90 <= view.south <= view.north <= 90 and -180 <= view.west <= 180 and -180 <= view.east <= 180):
+        if not (
+            -90 <= view.south <= view.north <= 90
+            and -180 <= view.west <= 180
+            and -180 <= view.east <= 180
+            and view.west <= view.east
+        ):
             return
+        self.view_center = center
         fresh = (time.monotonic() - self.view_fetched_at) < AUTO_REFRESH_SECONDS
         if self.view_bounds is not None and fresh and bounds_contains(self.view_bounds, view):
             return
@@ -288,6 +302,18 @@ class AirloomApplication(Adw.Application):
         if home_mode == "auto" and previous_mode != "auto":
             self.locator = GeoClueLocator()
             self.locator.start(self._on_location_fix)
+        if home_mode == "fixed":
+            # Glide the map to the newly pinned home instead of leaving it
+            # wherever the user happened to be looking when they saved.
+            self._send(
+                "location",
+                {
+                    "latitude": self.store.data["latitude"],
+                    "longitude": self.store.data["longitude"],
+                    "name": self.store.data["location_name"],
+                    "source": "fixed",
+                },
+            )
         self.refresh()
 
     def refresh(self) -> None:
@@ -348,8 +374,11 @@ class AirloomApplication(Adw.Application):
         if error:
             self._send("error", {"message": error})
         self._check_alerts()
-        self.view_bounds = bounds
-        self.view_fetched_at = time.monotonic()
+        if error is None:
+            # A transient live-API failure must not be remembered as fresh —
+            # that would suppress retries for AUTO_REFRESH_SECONDS.
+            self.view_bounds = bounds
+            self.view_fetched_at = time.monotonic()
         if self.pending_fetch is not None:
             pending, self.pending_fetch = self.pending_fetch, None
             self._start_fetch(*pending)
