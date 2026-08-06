@@ -10,6 +10,7 @@ finish-args:
   - --socket=wayland
   - --device=dri
   - --talk-name=org.freedesktop.Notifications
+  - --system-talk-name=org.freedesktop.GeoClue2
 modules:
   - name: airloom
     buildsystem: simple
