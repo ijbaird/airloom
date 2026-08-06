@@ -1,7 +1,8 @@
 import json
 import unittest
+from unittest import mock
 
-from airloom.purpleair import PurpleAirError, bounds_around, parse_sensor_payload
+from airloom.purpleair import PurpleAirClient, PurpleAirError, Bounds, bounds_around, bounds_contains, parse_sensor_payload
 
 
 class PurpleAirTest(unittest.TestCase):
@@ -66,6 +67,34 @@ class PurpleAirTest(unittest.TestCase):
     def test_string_sensor_index_is_coerced(self):
         payload = {"fields": ["sensor_index", "latitude", "longitude"], "data": [["42", 45.0, -122.0]]}
         self.assertEqual(parse_sensor_payload(payload)[0].sensor_id, 42)
+
+    def test_bounds_contains(self):
+        outer = Bounds(46.0, -123.0, 45.0, -122.0)
+        self.assertTrue(bounds_contains(outer, Bounds(45.9, -122.9, 45.1, -122.1)))
+        self.assertTrue(bounds_contains(outer, outer))
+        self.assertFalse(bounds_contains(outer, Bounds(46.1, -122.9, 45.1, -122.1)))  # pokes north
+        self.assertFalse(bounds_contains(outer, Bounds(45.9, -123.5, 45.1, -122.1)))  # pokes west
+
+    def test_fetch_sensors_builds_show_only_query(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            import io
+            return mock.MagicMock(
+                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __exit__=lambda s, *a: False,
+            )
+
+        client = PurpleAirClient("key")
+        with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen):
+            client.fetch_sensors(show_only=[42, 7])
+        self.assertIn("show_only=42%2C7", captured["url"])
+        self.assertNotIn("nwlat", captured["url"])
+
+    def test_fetch_sensors_requires_bounds_or_show_only(self):
+        with self.assertRaises(PurpleAirError):
+            PurpleAirClient("key").fetch_sensors()
 
 
 if __name__ == "__main__":

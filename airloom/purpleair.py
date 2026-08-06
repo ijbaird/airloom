@@ -64,6 +64,16 @@ def bounds_around(latitude: float, longitude: float, radius_km: float) -> Bounds
     )
 
 
+def bounds_contains(outer: Bounds, inner: Bounds) -> bool:
+    """True when `inner` lies entirely within `outer`."""
+    return (
+        inner.north <= outer.north
+        and inner.south >= outer.south
+        and inner.west >= outer.west
+        and inner.east <= outer.east
+    )
+
+
 class PurpleAirError(RuntimeError):
     pass
 
@@ -73,19 +83,24 @@ class PurpleAirClient:
         self.api_key = api_key.strip()
         self.timeout = timeout
 
-    def fetch_sensors(self, bounds: Bounds) -> list[Sensor]:
+    def fetch_sensors(self, bounds: Bounds | None = None, show_only: list[int] | None = None) -> list[Sensor]:
         if not self.api_key:
             raise PurpleAirError("A PurpleAir read key is required for live data.")
-        query = urlencode(
-            {
-                "fields": ",".join(FIELDS),
-                "location_type": 0,
-                "nwlat": f"{bounds.north:.6f}",
-                "nwlng": f"{bounds.west:.6f}",
-                "selat": f"{bounds.south:.6f}",
-                "selng": f"{bounds.east:.6f}",
-            }
-        )
+        if bounds is None and not show_only:
+            raise PurpleAirError("A sensor query needs bounds or sensor ids.")
+        params: dict[str, str] = {"fields": ",".join(FIELDS), "location_type": "0"}
+        if show_only:
+            params["show_only"] = ",".join(str(int(sensor_id)) for sensor_id in show_only)
+        else:
+            params.update(
+                {
+                    "nwlat": f"{bounds.north:.6f}",
+                    "nwlng": f"{bounds.west:.6f}",
+                    "selat": f"{bounds.south:.6f}",
+                    "selng": f"{bounds.east:.6f}",
+                }
+            )
+        query = urlencode(params)
         request = Request(
             f"{API_URL}?{query}",
             headers={"X-API-Key": self.api_key, "User-Agent": f"Airloom/{__version__}"},
