@@ -5,10 +5,20 @@ project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${AIRLOOM_BUILD_DIR:-${project_dir}/build-dir}"
 repo_dir="${AIRLOOM_REPO_DIR:-${project_dir}/flatpak-repo}"
 dist_dir="${AIRLOOM_DIST_DIR:-${project_dir}/dist}"
-manifest="${project_dir}/packaging/ai.stealthvision.Airloom.yml"
+
+# Build from a pristine export of committed HEAD so stray working-tree files
+# (a local config.json with a real API key, editor backups, …) can never be
+# baked into the bundle.
+export_dir="$(mktemp -d)"
+trap 'rm -rf "${export_dir}"' EXIT
+git -C "${project_dir}" archive --format=tar HEAD | tar -xf - -C "${export_dir}"
+if ! git -C "${project_dir}" diff --quiet HEAD -- 2>/dev/null; then
+  echo "Note: uncommitted changes detected; the bundle is built from committed HEAD only." >&2
+fi
+manifest="${export_dir}/packaging/ai.stealthvision.Airloom.yml"
 app_id="ai.stealthvision.Airloom"
 remote="${FLATPAK_REMOTE:-flathub}"
-version="$(PYTHONPATH="${project_dir}" python3 -c 'from airloom import __version__; print(__version__)')"
+version="$(PYTHONPATH="${export_dir}" python3 -c 'from airloom import __version__; print(__version__)')"
 arch="$(flatpak --default-arch)"
 bundle="${dist_dir}/Airloom-${version}-${arch}.flatpak"
 
@@ -24,7 +34,7 @@ else
 fi
 
 mkdir -p "${dist_dir}"
-python3 -m unittest discover -s "${project_dir}/tests" -v
+(cd "${export_dir}" && python3 -m unittest discover -s tests -v)
 
 "${builder_command[@]}" \
   --user \

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from . import __version__
 from .aqi import aqi_from_pm25, epa_corrected_pm25
 from .models import Sensor
 
@@ -51,11 +52,16 @@ class Bounds:
 
 
 def bounds_around(latitude: float, longitude: float, radius_km: float) -> Bounds:
-    radius = max(1.0, min(100.0, radius_km))
+    radius = max(2.0, min(100.0, radius_km))
     lat_delta = radius / 111.0
     lon_scale = max(0.1, math.cos(math.radians(latitude)))
     lon_delta = radius / (111.0 * lon_scale)
-    return Bounds(latitude + lat_delta, longitude - lon_delta, latitude - lat_delta, longitude + lon_delta)
+    return Bounds(
+        min(90.0, latitude + lat_delta),
+        max(-180.0, longitude - lon_delta),
+        max(-90.0, latitude - lat_delta),
+        min(180.0, longitude + lon_delta),
+    )
 
 
 class PurpleAirError(RuntimeError):
@@ -82,17 +88,24 @@ class PurpleAirClient:
         )
         request = Request(
             f"{API_URL}?{query}",
-            headers={"X-API-Key": self.api_key, "User-Agent": "Airloom/0.1"},
+            headers={"X-API-Key": self.api_key, "User-Agent": f"Airloom/{__version__}"},
         )
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 payload = json.load(response)
         except Exception as exc:
             raise PurpleAirError(f"PurpleAir request failed: {exc}") from exc
-        return parse_sensor_payload(payload)
+        try:
+            return parse_sensor_payload(payload)
+        except PurpleAirError:
+            raise
+        except Exception as exc:
+            raise PurpleAirError(f"PurpleAir returned unparseable data: {exc}") from exc
 
 
 def parse_sensor_payload(payload: dict) -> list[Sensor]:
+    if not isinstance(payload, dict):
+        raise PurpleAirError("Unexpected PurpleAir response.")
     fields = payload.get("fields")
     rows = payload.get("data")
     if not isinstance(fields, list) or not isinstance(rows, list):
@@ -106,7 +119,7 @@ def parse_sensor_payload(payload: dict) -> list[Sensor]:
         values = dict(zip(fields, row, strict=False))
         lat = _number(values.get("latitude"))
         lon = _number(values.get("longitude"))
-        sensor_id = values.get("sensor_index")
+        sensor_id = _integer(values.get("sensor_index"))
         if lat is None or lon is None or sensor_id is None:
             continue
 
@@ -124,7 +137,7 @@ def parse_sensor_payload(payload: dict) -> list[Sensor]:
         ambient_temperature = temperature - 8.0 if temperature is not None else None
         sensors.append(
             Sensor(
-                sensor_id=int(sensor_id),
+                sensor_id=sensor_id,
                 name=str(values.get("name") or f"Sensor {sensor_id}"),
                 latitude=lat,
                 longitude=lon,
@@ -134,7 +147,7 @@ def parse_sensor_payload(payload: dict) -> list[Sensor]:
                 humidity=_rounded(humidity),
                 pm1=_rounded(_number(values.get("pm1.0"))),
                 pm10=_rounded(_number(values.get("pm10.0"))),
-                last_seen=int(values["last_seen"]) if values.get("last_seen") else None,
+                last_seen=_integer(values.get("last_seen")),
                 trend=trend,
             )
         )
@@ -145,8 +158,18 @@ def _number(value) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _integer(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

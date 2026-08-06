@@ -15,6 +15,7 @@ gi.require_version("Notify", "0.7")
 from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 
 from . import __version__
+from .bridge import decode_message
 from .demo import demo_sensors
 from .models import Sensor
 from .purpleair import PurpleAirClient, PurpleAirError, bounds_around
@@ -23,6 +24,7 @@ from .store import Store
 
 APP_ID = "ai.stealthvision.Airloom"
 RESOURCE_DIR = Path(__file__).parent / "resources"
+AUTO_REFRESH_SECONDS = 300
 
 
 class AirloomApplication(Adw.Application):
@@ -35,6 +37,7 @@ class AirloomApplication(Adw.Application):
         self.sensors: list[Sensor] = []
         self.selected_id: int | None = None
         self.refreshing = False
+        self.refresh_pending = False
         self.connect("activate", self._on_activate)
 
     def _on_activate(self, _application) -> None:
@@ -70,13 +73,38 @@ class AirloomApplication(Adw.Application):
         self.webview = WebKit.WebView(user_content_manager=manager)
         self.webview.set_hexpand(True)
         self.webview.set_vexpand(True)
-        self.webview.get_settings().set_enable_developer_extras(False)
+        settings = self.webview.get_settings()
+        settings.set_enable_developer_extras(False)
+        settings.set_user_agent_with_application_details("Airloom", __version__)
+        self.webview.connect("decide-policy", self._on_decide_policy)
         self.webview.load_uri((RESOURCE_DIR / "index.html").as_uri())
 
         toolbar.add_top_bar(header)
         toolbar.set_content(self.webview)
         self.window.set_content(toolbar)
         self.window.present()
+        GLib.timeout_add_seconds(AUTO_REFRESH_SECONDS, self._auto_refresh)
+
+    def _auto_refresh(self) -> bool:
+        self.refresh()
+        return GLib.SOURCE_CONTINUE
+
+    def _on_decide_policy(self, _webview, decision, decision_type) -> bool:
+        # The UI is a local page; anything else (e.g. the OSM attribution
+        # link) belongs in the system browser, and a remote origin must never
+        # gain access to the script-message bridge.
+        if decision_type not in (
+            WebKit.PolicyDecisionType.NAVIGATION_ACTION,
+            WebKit.PolicyDecisionType.NEW_WINDOW_ACTION,
+        ):
+            return False
+        uri = decision.get_navigation_action().get_request().get_uri() or ""
+        if uri.startswith("file://"):
+            return False
+        decision.ignore()
+        if uri.startswith(("http://", "https://")) and self.window:
+            Gtk.UriLauncher.new(uri).launch(self.window, None, None)
+        return True
 
     def _on_script_message(self, _manager, value) -> None:
         try:
@@ -86,13 +114,7 @@ class AirloomApplication(Adw.Application):
                 raw = value.to_string()
             else:
                 raw = str(value)
-            message = json.loads(raw)
-            # JSC's to_json() serializes a posted JavaScript string as a JSON
-            # string, so WebKitGTK may hand us one additional encoding layer.
-            if isinstance(message, str):
-                message = json.loads(message)
-            if not isinstance(message, dict):
-                raise TypeError("message is not an object")
+            message = decode_message(raw)
         except Exception as exc:
             print(f"Airloom: ignored invalid web message: {exc}", file=sys.stderr)
             return
@@ -104,16 +126,29 @@ class AirloomApplication(Adw.Application):
         elif action == "refresh":
             self.refresh()
         elif action == "select":
-            self.selected_id = int(message["id"])
+            sensor_id = self._message_sensor_id(message)
+            if sensor_id is not None:
+                self.selected_id = sensor_id
         elif action == "favorite":
-            sensor_id = int(message["id"])
-            enabled = self.store.toggle_favorite(sensor_id)
-            for sensor in self.sensors:
-                if sensor.sensor_id == sensor_id:
-                    sensor.favorite = enabled
-            self._send_sensor_state()
+            sensor_id = self._message_sensor_id(message)
+            if sensor_id is not None and any(sensor.sensor_id == sensor_id for sensor in self.sensors):
+                enabled = self.store.toggle_favorite(sensor_id)
+                for sensor in self.sensors:
+                    if sensor.sensor_id == sensor_id:
+                        sensor.favorite = enabled
+                self._send_sensor_state()
         elif action == "save-settings":
             self._save_settings(message)
+        else:
+            print(f"Airloom: ignored unknown web action: {action!r}", file=sys.stderr)
+
+    @staticmethod
+    def _message_sensor_id(message: dict) -> int | None:
+        try:
+            return int(message["id"])
+        except (KeyError, TypeError, ValueError):
+            print("Airloom: ignored web message with invalid sensor id", file=sys.stderr)
+            return None
 
     def _save_settings(self, message: dict) -> None:
         try:
@@ -149,28 +184,38 @@ class AirloomApplication(Adw.Application):
         self.refresh()
 
     def refresh(self) -> None:
-        if self.refreshing or not self.webview:
+        if not self.webview:
+            return
+        if self.refreshing:
+            # Re-run once the in-flight fetch lands so a settings change made
+            # mid-refresh is never silently dropped.
+            self.refresh_pending = True
             return
         self.refreshing = True
         self._send("loading", {"active": True})
         config = dict(self.store.data)
 
         def worker() -> None:
-            source = "demo"
+            source = "Demo data"
             error = None
+            sensors: list[Sensor] = []
             try:
-                if config.get("api_key"):
-                    client = PurpleAirClient(config["api_key"])
-                    bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
-                    sensors = client.fetch_sensors(bounds)
-                    source = "PurpleAir live"
-                    if not sensors:
-                        error = "No public outdoor sensors were found in this area."
-                else:
+                try:
+                    if config.get("api_key"):
+                        client = PurpleAirClient(config["api_key"])
+                        bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
+                        sensors = client.fetch_sensors(bounds)
+                        source = "PurpleAir live"
+                        if not sensors:
+                            error = "No public outdoor sensors were found in this area."
+                    else:
+                        sensors = demo_sensors(config["latitude"], config["longitude"])
+                except PurpleAirError as exc:
                     sensors = demo_sensors(config["latitude"], config["longitude"])
-            except PurpleAirError as exc:
-                sensors = demo_sensors(config["latitude"], config["longitude"])
-                error = f"{exc} Showing demo readings instead."
+                    error = f"{exc} Showing demo readings instead."
+            except Exception as exc:  # noqa: BLE001 — a crashed worker must never wedge the refresh state
+                sensors = []
+                error = f"Refresh failed unexpectedly: {exc}"
             GLib.idle_add(self._finish_refresh, sensors, source, error)
 
         threading.Thread(target=worker, name="airloom-refresh", daemon=True).start()
@@ -188,6 +233,9 @@ class AirloomApplication(Adw.Application):
         if error:
             self._send("error", {"message": error})
         self._check_alerts()
+        if self.refresh_pending:
+            self.refresh_pending = False
+            self.refresh()
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:
@@ -200,9 +248,16 @@ class AirloomApplication(Adw.Application):
         self._send("sensors", payload)
 
     def _check_alerts(self) -> None:
-        threshold = int(self.store.data.get("alert_threshold", 101))
+        try:
+            threshold = int(self.store.data.get("alert_threshold", 101))
+        except (TypeError, ValueError):
+            threshold = 101
         states = self.store.data.setdefault("alert_states", {})
         changed = False
+        favorite_keys = {str(sensor_id) for sensor_id in self.store.data.get("favorites", [])}
+        for stale_key in [key for key in states if key not in favorite_keys]:
+            del states[stale_key]
+            changed = True
         for sensor in self.sensors:
             if not sensor.favorite or sensor.aqi is None:
                 continue
@@ -214,7 +269,7 @@ class AirloomApplication(Adw.Application):
                 changed = True
                 if is_high:
                     notification = Notify.Notification.new(
-                        f"Air quality alert · {sensor.name}",
+                        f"Air quality alert · {sensor.name[:80]}",
                         f"AQI is now {sensor.aqi}. Open Airloom for health guidance.",
                         APP_ID,
                     )
@@ -228,8 +283,10 @@ class AirloomApplication(Adw.Application):
     def _send(self, event: str, payload) -> None:
         if not self.webview:
             return
-        event_json = json.dumps(event, ensure_ascii=False)
-        payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        # ensure_ascii keeps U+2028/U+2029 (JS line terminators) out of the
+        # evaluated source, since the payload is spliced in as a JS literal.
+        event_json = json.dumps(event, ensure_ascii=True)
+        payload_json = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         script = f"window.Airloom && window.Airloom.receive({event_json}, {payload_json});"
         self.webview.evaluate_javascript(script, -1, None, None, None, None, None)
 

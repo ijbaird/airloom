@@ -33,3 +33,7 @@ modules:
           - work
           - __pycache__
           - '*.pyc'
+          - config.json
+          - '.env'
+          - '*.tmp'
+          - '*.orig'

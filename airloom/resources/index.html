@@ -134,7 +134,7 @@
       <form method="dialog" id="settings-form">
         <div class="dialog-heading">
           <div><p class="eyebrow">AIRLOOM</p><h2>Preferences</h2></div>
-          <button class="icon-button" value="cancel" aria-label="Close preferences">×</button>
+          <button class="icon-button" type="button" id="close-settings" aria-label="Close preferences">×</button>
         </div>
         <p class="dialog-intro">Use demo readings immediately, or add your own PurpleAir read key for live public sensors.</p>
         <div class="form-grid">
@@ -147,8 +147,8 @@
           <label><span>Alert at AQI</span><input name="alert_threshold" type="number" step="1" min="1" max="500" required></label>
           <fieldset class="wide"><legend>Temperature</legend><label><input name="temperature_unit" type="radio" value="F"><span>Fahrenheit</span></label><label><input name="temperature_unit" type="radio" value="C"><span>Celsius</span></label></fieldset>
         </div>
-        <p class="privacy-note">Your key and favorites stay in a private local config file. Your location is sent only as PurpleAir map bounds when live data is enabled.</p>
-        <div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
+        <p class="privacy-note">Your key and favorites stay in a private local config file. Map tiles are loaded from OpenStreetMap as you browse the map, and your location is sent to PurpleAir as map bounds only when live data is enabled.</p>
+        <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
       </form>
     </dialog>
     <script src="app.js"></script>

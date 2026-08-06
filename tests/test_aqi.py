@@ -37,10 +37,31 @@ class AQITest(unittest.TestCase):
         self.assertEqual(band_for_aqi(122).label, "Unhealthy for sensitive groups")
         self.assertEqual(band_for_aqi(None).label, "Unavailable")
 
-    def test_epa_correction(self):
-        self.assertAlmostEqual(epa_corrected_pm25(20, 50), 11.93, places=2)
+    def test_epa_correction_linear_branch(self):
+        self.assertAlmostEqual(epa_corrected_pm25(20, 50), 11.85, places=2)
         self.assertEqual(epa_corrected_pm25(1, 100), 0.0)
         self.assertIsNone(epa_corrected_pm25(None, 50))
+
+    def test_epa_correction_quadratic_branch(self):
+        # 0.46 * 500 + 3.93e-4 * 500**2 + 2.97, independent of humidity
+        self.assertAlmostEqual(epa_corrected_pm25(500, 50), 331.22, places=2)
+        self.assertEqual(epa_corrected_pm25(500, 10), epa_corrected_pm25(500, 90))
+        below = epa_corrected_pm25(342.9, 50)
+        above = epa_corrected_pm25(343.0, 50)
+        self.assertGreater(above, below)
+
+    def test_epa_correction_missing_humidity_uses_neutral_default(self):
+        self.assertEqual(epa_corrected_pm25(20, None), epa_corrected_pm25(20, 50))
+        self.assertEqual(epa_corrected_pm25(20, float("nan")), epa_corrected_pm25(20, 50))
+
+    def test_epa_correction_rejects_non_finite_concentration(self):
+        self.assertIsNone(epa_corrected_pm25(float("inf"), 50))
+        self.assertIsNone(epa_corrected_pm25(float("nan"), 50))
+
+    def test_truncate_handles_non_finite(self):
+        self.assertEqual(truncate_pm25(float("inf")), 0.0)
+        self.assertEqual(truncate_pm25(float("-inf")), 0.0)
+        self.assertEqual(truncate_pm25(float("nan")), 0.0)
 
 
 if __name__ == "__main__":

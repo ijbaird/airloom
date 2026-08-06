@@ -32,9 +32,13 @@
 
   function applyConfig(config) {
     state.config = { ...state.config, ...config };
-    state.home = { lat: Number(config.latitude), lon: Number(config.longitude) };
-    state.center = { ...state.home };
-    $("#place-name").textContent = config.location_name;
+    const lat = Number(state.config.latitude);
+    const lon = Number(state.config.longitude);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      state.home = { lat, lon };
+      state.center = { ...state.home };
+    }
+    $("#place-name").textContent = state.config.location_name;
     renderMap();
   }
 
@@ -58,7 +62,14 @@
   function renderSummary() {
     const valid = state.sensors.filter((s) => Number.isFinite(s.aqi)).sort((a, b) => a.aqi - b.aqi);
     const sensor = valid[Math.floor(valid.length / 2)];
-    if (!sensor) return;
+    if (!sensor) {
+      $("#summary-aqi").textContent = "—";
+      $("#summary-aqi").style.background = "";
+      $("#summary-aqi").style.color = "";
+      $("#summary-label").textContent = "No readings";
+      $("#summary-subtitle").textContent = "No sensors reporting in range";
+      return;
+    }
     $("#summary-aqi").textContent = sensor.aqi;
     $("#summary-aqi").style.background = sensor.color;
     $("#summary-aqi").style.color = sensor.foreground;
@@ -106,7 +117,22 @@
 
   function renderDetail() {
     const sensor = selectedSensor();
-    if (!sensor) return;
+    if (!sensor) {
+      $("#sensor-name").textContent = "Choose a sensor";
+      $("#aqi-number").textContent = "—";
+      $("#aqi-number").style.color = "";
+      $("#aqi-category").textContent = "Unavailable";
+      $("#temperature").textContent = "—";
+      $("#humidity").textContent = "—";
+      $("#pm25").textContent = "—";
+      $("#pm10").textContent = "—";
+      $("#guidance").textContent = "Select a nearby sensor to see current guidance.";
+      $("#favorite-button").classList.remove("active");
+      $("#updated-time").textContent = "Waiting for data";
+      $("#chart").innerHTML = "";
+      $("#trend-direction").textContent = "—";
+      return;
+    }
     $("#sensor-name").textContent = sensor.name;
     $("#aqi-number").textContent = sensor.aqi ?? "—";
     $("#aqi-number").style.color = sensor.color;
@@ -124,7 +150,7 @@
 
   function renderChart(sensor) {
     const points = (sensor.trend || []).filter((point) => Number.isFinite(point.aqi));
-    if (!points.length) { $("#chart").innerHTML = '<div class="empty-state">No trend available</div>'; return; }
+    if (!points.length) { $("#chart").innerHTML = '<div class="empty-state">No trend available</div>'; $("#trend-direction").textContent = "—"; return; }
     const width = 300, height = 104, padX = 8, padTop = 9, padBottom = 20;
     const max = Math.max(60, ...points.map((point) => point.aqi)) * 1.12;
     const coordinates = points.map((point, index) => ({
@@ -145,17 +171,21 @@
   }
 
   // Minimal slippy-map renderer: bundled code, standard OSM raster tiles, no JS CDN.
+  const MAX_MAP_LAT = 85.0511; // Web Mercator limit; beyond it the projection diverges
+  const clampLat = (lat) => Math.max(-MAX_MAP_LAT, Math.min(MAX_MAP_LAT, lat));
+  const wrapLon = (lon) => ((lon + 180) % 360 + 360) % 360 - 180;
+
   function worldPoint(lat, lon, zoom) {
     const size = 256 * 2 ** zoom;
-    const sin = Math.sin(lat * Math.PI / 180);
-    return { x: (lon + 180) / 360 * size, y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size };
+    const sin = Math.sin(clampLat(lat) * Math.PI / 180);
+    return { x: (wrapLon(lon) + 180) / 360 * size, y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size };
   }
 
   function inverseWorld(x, y, zoom) {
     const size = 256 * 2 ** zoom;
-    const lon = x / size * 360 - 180;
+    const lon = wrapLon(x / size * 360 - 180);
     const n = Math.PI - 2 * Math.PI * y / size;
-    const lat = 180 / Math.PI * Math.atan(Math.sinh(n));
+    const lat = clampLat(180 / Math.PI * Math.atan(Math.sinh(n)));
     return { lat, lon };
   }
 
@@ -205,6 +235,7 @@
   }
 
   function openSettings(config = state.config) {
+    if ($("#settings-dialog").open) return;
     const form = $("#settings-form");
     for (const field of ["location_name", "latitude", "longitude", "radius_km", "alert_threshold"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
@@ -255,7 +286,7 @@
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
-    if (event.key === "Escape") document.body.classList.remove("show-detail");
+    if (event.key === "Escape" && !$("#settings-dialog").open) document.body.classList.remove("show-detail");
   });
   $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
@@ -266,9 +297,12 @@
   $("#show-list").addEventListener("click", (event) => { event.stopPropagation(); document.body.classList.remove("show-map"); });
   $("#back-to-map").addEventListener("click", () => document.body.classList.remove("show-detail"));
   $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
-  $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
+  $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
   $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
+  $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
   $("#map-panel").addEventListener("wheel", (event) => { event.preventDefault(); zoom(event.deltaY < 0 ? 1 : -1); }, { passive: false });
+  $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
+  $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#settings-form").addEventListener("submit", (event) => {
     const submitter = event.submitter;
     if (!submitter || submitter.id !== "save-settings") return;
