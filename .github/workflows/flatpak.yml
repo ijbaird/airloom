@@ -1,0 +1,94 @@
+name: Flatpak
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install metadata validators
+        run: sudo apt-get update && sudo apt-get install -y appstream desktop-file-utils
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Check JavaScript
+        run: node --check airloom/resources/app.js
+      - name: Validate desktop metadata
+        run: |
+          desktop-file-validate packaging/ai.stealthvision.Airloom.desktop
+          appstreamcli validate --no-net packaging/ai.stealthvision.Airloom.metainfo.xml
+
+  flatpak:
+    name: Flatpak (${{ matrix.arch }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: Airloom-${{ matrix.arch }}.flatpak
+          manifest-path: packaging/ai.stealthvision.Airloom.yml
+          cache-key: flatpak-builder-${{ matrix.arch }}-${{ github.sha }}
+          arch: ${{ matrix.arch }}
+          branch: stable
+          upload-artifact: false
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airloom-${{ matrix.arch }}
+          path: Airloom-${{ matrix.arch }}.flatpak
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: flatpak
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: airloom-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: cd dist && sha256sum *.flatpak > SHA256SUMS
+      - name: Create release and upload bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          dist/*.flatpak dist/SHA256SUMS
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --generate-notes
+          --title "Airloom ${GITHUB_REF_NAME#v}"

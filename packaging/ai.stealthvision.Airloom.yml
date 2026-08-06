@@ -1,0 +1,35 @@
+app-id: ai.stealthvision.Airloom
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: airloom
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --talk-name=org.freedesktop.Notifications
+modules:
+  - name: airloom
+    buildsystem: simple
+    build-commands:
+      - install -d /app/share/airloom
+      - tar --exclude='__pycache__' --exclude='*.pyc' -cf - airloom | tar -xf - -C /app/share/airloom
+      - install -Dm755 run-flatpak /app/bin/airloom
+      - install -Dm644 packaging/ai.stealthvision.Airloom.desktop /app/share/applications/ai.stealthvision.Airloom.desktop
+      - install -Dm644 packaging/ai.stealthvision.Airloom.metainfo.xml /app/share/metainfo/ai.stealthvision.Airloom.metainfo.xml
+      - install -Dm644 packaging/ai.stealthvision.Airloom.svg /app/share/icons/hicolor/scalable/apps/ai.stealthvision.Airloom.svg
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - .flatpak-builder
+          - build-dir
+          - dist
+          - flatpak-repo
+          - outputs
+          - work
+          - __pycache__
+          - '*.pyc'

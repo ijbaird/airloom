@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>ai.stealthvision.Airloom</id>
+  <name>Airloom</name>
+  <summary>See the air around you, sensor by sensor</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Airloom is a focused air-quality map for Fedora. It presents nearby public PurpleAir readings, recent trends, favorites, and local AQI threshold alerts in a GNOME-friendly desktop interface.</p>
+    <p>Airloom includes a clearly labeled demo mode and accepts a personal PurpleAir read key for live data.</p>
+  </description>
+  <launchable type="desktop-id">ai.stealthvision.Airloom.desktop</launchable>
+  <provides><binary>airloom</binary></provides>
+  <requires><display_length compare="ge">760</display_length></requires>
+  <releases>
+    <release version="0.1.0" date="2026-08-06">
+      <description><p>Initial Fedora MVP.</p></description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+  <url type="homepage">https://github.com/ijbaird/airloom</url>
+  <url type="bugtracker">https://github.com/ijbaird/airloom/issues</url>
+  <developer id="ai.stealthvision"><name>Stealth Vision</name></developer>
+</component>

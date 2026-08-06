@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible Airloom problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve Airloom. Never paste a PurpleAir API key here.
+  - type: input
+    id: version
+    attributes:
+      label: Airloom version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: fedora
+    attributes:
+      label: Fedora and desktop version
+      placeholder: Fedora 44, GNOME 50, Wayland
+    validations:
+      required: true
+  - type: dropdown
+    id: data
+    attributes:
+      label: Data mode
+      options:
+        - Demo data
+        - PurpleAir live data
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include steps to reproduce, expected behavior, and sanitized terminal output.
+    validations:
+      required: true
+
