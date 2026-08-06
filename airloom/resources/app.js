@@ -189,44 +189,93 @@
     return { lat, lon };
   }
 
-  function renderMap() {
+  let tileLayer = { zoom: null, tiles: new Map() };
+
+  function mapViewport() {
     const panel = $("#map-panel");
-    if (!panel.clientWidth || !panel.clientHeight) return;
     const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
-    const left = center.x - panel.clientWidth / 2;
-    const top = center.y - panel.clientHeight / 2;
-    const tiles = [];
+    return {
+      panel,
+      left: center.x - panel.clientWidth / 2,
+      top: center.y - panel.clientHeight / 2,
+      width: panel.clientWidth,
+      height: panel.clientHeight,
+    };
+  }
+
+  function renderMap() {
+    const view = mapViewport();
+    if (!view.width || !view.height) return;
+    const layer = $("#tiles");
+    if (tileLayer.zoom !== state.zoom) {
+      layer.textContent = "";
+      tileLayer = { zoom: state.zoom, tiles: new Map() };
+    }
     const maxTile = 2 ** state.zoom;
-    for (let ty = Math.floor(top / 256); ty <= Math.floor((top + panel.clientHeight) / 256); ty++) {
+    const needed = new Set();
+    for (let ty = Math.floor(view.top / 256); ty <= Math.floor((view.top + view.height) / 256); ty++) {
       if (ty < 0 || ty >= maxTile) continue;
-      for (let tx = Math.floor(left / 256); tx <= Math.floor((left + panel.clientWidth) / 256); tx++) {
-        const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
-        tiles.push(`<img class="tile" draggable="false" alt="" src="https://tile.openstreetmap.org/${state.zoom}/${wrappedX}/${ty}.png" style="left:${tx * 256 - left}px;top:${ty * 256 - top}px">`);
+      for (let tx = Math.floor(view.left / 256); tx <= Math.floor((view.left + view.width) / 256); tx++) {
+        const key = `${tx}/${ty}`;
+        needed.add(key);
+        if (!tileLayer.tiles.has(key)) {
+          const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
+          const img = document.createElement("img");
+          img.className = "tile";
+          img.draggable = false;
+          img.alt = "";
+          img.src = `https://tile.openstreetmap.org/${state.zoom}/${wrappedX}/${ty}.png`;
+          img.style.left = `${tx * 256}px`;
+          img.style.top = `${ty * 256}px`;
+          layer.appendChild(img);
+          tileLayer.tiles.set(key, img);
+        }
       }
     }
-    $("#tiles").innerHTML = tiles.join("");
+    for (const [key, img] of tileLayer.tiles) {
+      if (!needed.has(key)) { img.remove(); tileLayer.tiles.delete(key); }
+    }
+    updateMapTransform();
     renderMapMarkers();
   }
 
+  function updateMapTransform() {
+    const view = mapViewport();
+    if (!view.width) return;
+    const transform = `translate(${-view.left}px, ${-view.top}px)`;
+    $("#tiles").style.transform = transform;
+    $("#markers").style.transform = transform;
+  }
+
   function renderMapMarkers() {
-    const panel = $("#map-panel");
-    if (!panel.clientWidth) return;
-    const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
+    const view = mapViewport();
+    if (!view.width) return;
+    const pad = 300; // generous cull margin so mid-pan gaps are rare
     const markers = visibleSensors().map((sensor) => {
       const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
-      const x = point.x - center.x + panel.clientWidth / 2;
-      const y = point.y - center.y + panel.clientHeight / 2;
-      if (x < -40 || y < -40 || x > panel.clientWidth + 40 || y > panel.clientHeight + 40) return "";
-      return `<button class="map-marker${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${x}px;top:${y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
+      if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
+          point.y < view.top - pad || point.y > view.top + view.height + pad) return "";
+      return `<button class="map-marker${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
     });
     $("#markers").innerHTML = markers.join("");
     document.querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), true); }));
+    updateMapTransform();
   }
 
   function panBy(dx, dy) {
     const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
     state.center = inverseWorld(center.x - dx, center.y - dy, state.zoom);
-    renderMap();
+    const view = mapViewport();
+    // Cheap per-frame path: move layers; only re-diff tiles when the view
+    // crosses outside the currently materialized tile ring.
+    updateMapTransform();
+    const tx0 = Math.floor(view.left / 256), ty0 = Math.floor(view.top / 256);
+    const tx1 = Math.floor((view.left + view.width) / 256), ty1 = Math.floor((view.top + view.height) / 256);
+    for (let ty = ty0; ty <= ty1; ty++) {
+      for (let tx = tx0; tx <= tx1; tx++) {
+        if (!tileLayer.tiles.has(`${tx}/${ty}`) && ty >= 0 && ty < 2 ** state.zoom) { renderMap(); return; }
+      }
+    }
   }
 
   function zoom(delta) {
@@ -298,7 +347,7 @@
   $("#back-to-map").addEventListener("click", () => document.body.classList.remove("show-detail"));
   $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
-  $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
+  $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
   $("#map-panel").addEventListener("wheel", (event) => { event.preventDefault(); zoom(event.deltaY < 0 ? 1 : -1); }, { passive: false });
   $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));

@@ -69,7 +69,8 @@ h2 { margin: 0; font-size: 12px; font-weight: 800; text-transform: uppercase; le
 
 .map-panel { position: relative; overflow: hidden; background: #dfe7df; cursor: grab; user-select: none; touch-action: none; }
 .map-panel.dragging { cursor: grabbing; }
-.tile-layer, .marker-layer, .map-grain { position: absolute; inset: 0; overflow: hidden; }
+.tile-layer, .marker-layer { position: absolute; inset: 0; will-change: transform; }
+.map-grain { position: absolute; inset: 0; overflow: hidden; }
 .tile { position: absolute; width: 256px; height: 256px; user-select: none; -webkit-user-drag: none; filter: saturate(.7) contrast(.92) brightness(1.03); }
 .map-grain { pointer-events: none; background: linear-gradient(rgba(240,245,239,.11), rgba(226,234,227,.06)); mix-blend-mode: screen; }
 .marker-layer { pointer-events: none; }
