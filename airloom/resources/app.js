@@ -14,6 +14,7 @@
     query: "",
     placeResults: [],
     homeSearchActive: false,
+    positioned: false,
   };
 
   const bridge = (message) => {
@@ -31,8 +32,9 @@
       if (event === "open-settings") openSettings(payload);
       if (event === "location") applyLocation(payload);
       if (event === "places") {
-        if (state.homeSearchActive) renderHomePlaceResults(payload.results || [], payload.error);
-        else if (payload.query === state.query.trim()) renderSearchResults(payload.results || [], payload.error);
+        if (state.homeSearchActive) {
+          if (payload.query === $("#home-place-input").value.trim()) renderHomePlaceResults(payload.results || [], payload.error);
+        } else if (payload.query === state.query.trim()) renderSearchResults(payload.results || [], payload.error);
       }
     },
   };
@@ -41,6 +43,7 @@
     const lat = Number(payload.latitude), lon = Number(payload.longitude);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
     state.home = { lat, lon };
+    state.positioned = true;
     if (payload.name) $("#place-name").textContent = payload.name;
     if (payload.source === "geoclue" || payload.source === "fixed") flyTo(lat, lon);
   }
@@ -51,6 +54,10 @@
     const lon = Number(state.config.longitude);
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
       state.home = { lat, lon };
+      if (!state.positioned && Number.isFinite(state.home.lat) && Number.isFinite(state.home.lon)) {
+        state.center = { ...state.home };
+        state.positioned = true;
+      }
     }
     $("#place-name").textContent = state.config.location_name;
     renderMap();
@@ -278,10 +285,13 @@
     bridge({ action: "view-changed", north: nw.lat, west: nw.lon, south: se.lat, east: se.lon, lat: state.center.lat, lon: state.center.lon, zoom: state.zoom });
   }
 
+  let flyGeneration = 0;
   function flyTo(lat, lon, durationMs = 600) {
     const from = { ...state.center };
     const start = performance.now();
+    const gen = ++flyGeneration;
     function step(now) {
+      if (gen !== flyGeneration) return;
       const t = Math.min(1, (now - start) / durationMs);
       const ease = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
       state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (lon - from.lon) * ease };
