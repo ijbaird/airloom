@@ -12,6 +12,8 @@
     zoom: 12,
     drag: null,
     query: "",
+    placeResults: [],
+    homeSearchActive: false,
   };
 
   const bridge = (message) => {
@@ -27,8 +29,21 @@
       if (event === "loading") document.body.classList.toggle("loading", payload.active);
       if (event === "error") toast(payload.message);
       if (event === "open-settings") openSettings(payload);
+      if (event === "location") applyLocation(payload);
+      if (event === "places") {
+        if (state.homeSearchActive) renderHomePlaceResults(payload.results || [], payload.error);
+        else if (payload.query === state.query.trim()) renderSearchResults(payload.results || [], payload.error);
+      }
     },
   };
+
+  function applyLocation(payload) {
+    const lat = Number(payload.latitude), lon = Number(payload.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    state.home = { lat, lon };
+    if (payload.name) $("#place-name").textContent = payload.name;
+    if (payload.source === "geoclue" || payload.source === "fixed") flyTo(lat, lon);
+  }
 
   function applyConfig(config) {
     state.config = { ...state.config, ...config };
@@ -36,7 +51,6 @@
     const lon = Number(state.config.longitude);
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
       state.home = { lat, lon };
-      state.center = { ...state.home };
     }
     $("#place-name").textContent = state.config.location_name;
     renderMap();
@@ -251,6 +265,33 @@
     updateMapTransform();
   }
 
+  let viewTimer = null;
+  function scheduleViewChanged() {
+    clearTimeout(viewTimer);
+    viewTimer = setTimeout(sendViewChanged, 1200);
+  }
+  function sendViewChanged() {
+    const view = mapViewport();
+    if (!view.width) return;
+    const nw = inverseWorld(view.left, view.top, state.zoom);
+    const se = inverseWorld(view.left + view.width, view.top + view.height, state.zoom);
+    bridge({ action: "view-changed", north: nw.lat, west: nw.lon, south: se.lat, east: se.lon, lat: state.center.lat, lon: state.center.lon, zoom: state.zoom });
+  }
+
+  function flyTo(lat, lon, durationMs = 600) {
+    const from = { ...state.center };
+    const start = performance.now();
+    function step(now) {
+      const t = Math.min(1, (now - start) / durationMs);
+      const ease = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+      state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (lon - from.lon) * ease };
+      renderMap();
+      if (t < 1) requestAnimationFrame(step);
+      else scheduleViewChanged();
+    }
+    requestAnimationFrame(step);
+  }
+
   function panBy(dx, dy) {
     const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
     state.center = inverseWorld(center.x - dx, center.y - dy, state.zoom);
@@ -258,6 +299,7 @@
     // Cheap per-frame path: move layers; only re-diff tiles when the view
     // crosses outside the currently materialized tile ring.
     updateMapTransform();
+    scheduleViewChanged();
     const tx0 = Math.floor(view.left / 256), ty0 = Math.floor(view.top / 256);
     const tx1 = Math.floor((view.left + view.width) / 256), ty1 = Math.floor((view.top + view.height) / 256);
     for (let ty = ty0; ty <= ty1; ty++) {
@@ -270,15 +312,22 @@
   function zoom(delta) {
     state.zoom = Math.max(3, Math.min(17, state.zoom + delta));
     renderMap();
+    scheduleViewChanged();
   }
 
   function openSettings(config = state.config) {
     if ($("#settings-dialog").open) return;
     const form = $("#settings-form");
-    for (const field of ["location_name", "latitude", "longitude", "radius_km", "alert_threshold"]) form.elements[field].value = config[field];
+    for (const field of ["radius_km", "alert_threshold"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;
     form.elements.temperature_unit.value = config.temperature_unit || "F";
+    form.elements.home_mode.value = config.home_mode || "auto";
+    $("#home-place-row").hidden = form.elements.home_mode.value !== "fixed";
+    form.elements.home_lat.value = config.latitude;
+    form.elements.home_lon.value = config.longitude;
+    form.elements.location_name.value = config.location_name || "";
+    $("#home-place-status").textContent = config.home_mode === "fixed" ? `Fixed: ${config.location_name}` : "No fixed home chosen";
     $("#key-status").textContent = config.has_api_key ? `Saved key ${config.api_key_hint}` : "No key saved — demo mode";
     $("#settings-dialog").showModal();
   }
@@ -309,6 +358,41 @@
     return String(value).replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   }
 
+  function renderSearchResults(places, error) {
+    const box = $("#search-results");
+    const query = state.query.trim().toLowerCase();
+    const sensors = query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query)).slice(0, 4) : [];
+    if (!sensors.length && !places.length && !error) { box.hidden = true; box.innerHTML = ""; return; }
+    let html = "";
+    if (sensors.length) html += '<div class="group">Sensors</div>' + sensors.map((s) => `<button data-kind="sensor" data-id="${s.id}">${escapeHtml(s.name)} · AQI ${s.aqi ?? "—"}</button>`).join("");
+    if (places.length) html += '<div class="group">Places</div>' + places.map((p, i) => `<button data-kind="place" data-index="${i}">${escapeHtml(p.name)}</button>`).join("");
+    if (error) html += `<div class="group">${escapeHtml(error)}</div>`;
+    box.innerHTML = html;
+    box.hidden = false;
+    state.placeResults = places;
+    box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true); }
+      else { const place = state.placeResults[Number(button.dataset.index)]; if (place) flyTo(place.latitude, place.longitude); }
+      box.hidden = true;
+    }));
+  }
+
+  function renderHomePlaceResults(places, error) {
+    const box = $("#home-place-results");
+    box.innerHTML = error ? `<div class="group">${escapeHtml(error)}</div>` : places.map((p, i) => `<button type="button" data-index="${i}">${escapeHtml(p.name)}</button>`).join("");
+    box.hidden = false;
+    box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
+      const place = places[Number(button.dataset.index)];
+      const form = $("#settings-form");
+      form.elements.home_lat.value = place.latitude;
+      form.elements.home_lon.value = place.longitude;
+      form.elements.location_name.value = place.name.split(",")[0];
+      $("#home-place-status").textContent = `Fixed: ${place.name}`;
+      box.hidden = true;
+      state.homeSearchActive = false;
+    }));
+  }
+
   function browserPreviewData() {
     const readings = [18, 34, 47, 56, 72, 88, 109, 43, 63, 31, 81, 52];
     const names = ["Alberta Arts", "Laurelhurst Park", "Mount Tabor", "Sellwood Garden", "Buckman School", "Overlook Bluff", "St. Johns North", "Hawthorne Ridge", "Woodstock Library", "Council Crest", "Irvington Air", "Rose City Park"];
@@ -320,7 +404,18 @@
     });
   }
 
-  $("#search").addEventListener("input", (event) => { state.query = event.target.value; renderLists(); renderMapMarkers(); });
+  let placeTimer = null;
+  $("#search").addEventListener("input", (event) => {
+    state.query = event.target.value;
+    renderLists();
+    renderMapMarkers();
+    renderSearchResults([]);
+    clearTimeout(placeTimer);
+    if (state.query.trim().length >= 3) placeTimer = setTimeout(() => bridge({ action: "place-search", query: state.query.trim() }), 450);
+  });
+  $("#search").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && state.query.trim().length >= 2) bridge({ action: "place-search", query: state.query.trim() });
+  });
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
@@ -334,7 +429,7 @@
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
   $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); zoom(1); });
   $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); zoom(-1); });
-  $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); state.center = { ...state.home }; renderMap(); });
+  $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); flyTo(state.home.lat, state.home.lon); });
   $("#sensors-button").addEventListener("click", () => { $("#sensors-panel").hidden = !$("#sensors-panel").hidden; });
   $("#close-sensors").addEventListener("click", () => { $("#sensors-panel").hidden = true; });
   $("#close-detail").addEventListener("click", () => { $("#detail-card").hidden = true; });
@@ -350,6 +445,16 @@
   $("#map-panel").addEventListener("wheel", (event) => { event.preventDefault(); zoom(event.deltaY < 0 ? 1 : -1); }, { passive: false });
   $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
+  $("#settings-dialog").addEventListener("close", () => { state.homeSearchActive = false; });
+  document.querySelectorAll('input[name="home_mode"]').forEach((radio) => radio.addEventListener("change", () => {
+    $("#home-place-row").hidden = $("#settings-form").elements.home_mode.value !== "fixed";
+  }));
+  let homePlaceTimer = null;
+  $("#home-place-input").addEventListener("input", (event) => {
+    clearTimeout(homePlaceTimer);
+    const query = event.target.value.trim();
+    if (query.length >= 3) homePlaceTimer = setTimeout(() => { state.homeSearchActive = true; bridge({ action: "place-search", query }); }, 450);
+  });
   $("#settings-form").addEventListener("submit", (event) => {
     const submitter = event.submitter;
     if (!submitter || submitter.id !== "save-settings") return;
@@ -358,7 +463,7 @@
     bridge({
       action: "save-settings",
       api_key: form.get("api_key"), clear_api_key: form.get("clear_api_key") === "on",
-      location_name: form.get("location_name"), latitude: form.get("latitude"), longitude: form.get("longitude"),
+      home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
       radius_km: form.get("radius_km"), alert_threshold: form.get("alert_threshold"), temperature_unit: form.get("temperature_unit"),
     });
     $("#settings-dialog").close();

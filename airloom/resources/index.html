@@ -106,14 +106,21 @@
         <div class="form-grid">
           <label class="wide"><span>PurpleAir read key</span><input name="api_key" type="password" placeholder="Paste a new key"></label>
           <label class="checkbox wide"><input name="clear_api_key" type="checkbox"><span>Remove the saved key</span><small id="key-status">No key saved</small></label>
-          <label class="wide"><span>Location label</span><input name="location_name" required maxlength="80"></label>
-          <label><span>Latitude</span><input name="latitude" type="number" step="0.000001" min="-90" max="90" required></label>
-          <label><span>Longitude</span><input name="longitude" type="number" step="0.000001" min="-180" max="180" required></label>
+          <fieldset class="wide"><legend>Home location</legend>
+            <label><input name="home_mode" type="radio" value="auto" checked><span>Detect automatically</span></label>
+            <label><input name="home_mode" type="radio" value="fixed"><span>Fixed home</span></label>
+          </fieldset>
+          <label class="wide" id="home-place-row" hidden><span>Fixed home place</span>
+            <input id="home-place-input" type="search" placeholder="Search for a town or address" autocomplete="off">
+            <small id="home-place-status">No fixed home chosen</small>
+            <div id="home-place-results" class="search-results" hidden></div>
+          </label>
+          <input type="hidden" name="home_lat"><input type="hidden" name="home_lon"><input type="hidden" name="location_name">
           <label><span>Map radius (km)</span><input name="radius_km" type="number" step="1" min="2" max="100" required></label>
           <label><span>Alert at AQI</span><input name="alert_threshold" type="number" step="1" min="1" max="500" required></label>
           <fieldset class="wide"><legend>Temperature</legend><label><input name="temperature_unit" type="radio" value="F"><span>Fahrenheit</span></label><label><input name="temperature_unit" type="radio" value="C"><span>Celsius</span></label></fieldset>
         </div>
-        <p class="privacy-note">Your key and favorites stay in a private local config file. Map tiles are loaded from OpenStreetMap as you browse the map, and your location is sent to PurpleAir as map bounds only when live data is enabled.</p>
+        <p class="privacy-note">Your key and favorites stay in a private local config file. Location detection uses your system's GeoClue service; place search and labels use OpenStreetMap Nominatim; map tiles load from OpenStreetMap; your coordinates go to PurpleAir only as map bounds when live data is enabled.</p>
         <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
       </form>
     </dialog>
