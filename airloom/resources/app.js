@@ -67,14 +67,14 @@
       $("#summary-aqi").style.background = "";
       $("#summary-aqi").style.color = "";
       $("#summary-label").textContent = "No readings";
-      $("#summary-subtitle").textContent = "No sensors reporting in range";
+      $("#summary-chip").title = "No sensors reporting in range";
       return;
     }
     $("#summary-aqi").textContent = sensor.aqi;
     $("#summary-aqi").style.background = sensor.color;
     $("#summary-aqi").style.color = sensor.foreground;
     $("#summary-label").textContent = sensor.category;
-    $("#summary-subtitle").textContent = `${valid.length} outdoor sensors in range`;
+    $("#summary-chip").title = `${valid.length} sensors reporting`;
   }
 
   function visibleSensors() {
@@ -108,7 +108,7 @@
     renderLists();
     renderMapMarkers();
     renderDetail();
-    if (revealDetail) document.body.classList.add("show-detail");
+    if (revealDetail) $("#detail-card").hidden = false;
   }
 
   function selectedSensor() {
@@ -118,21 +118,10 @@
   function renderDetail() {
     const sensor = selectedSensor();
     if (!sensor) {
-      $("#sensor-name").textContent = "Choose a sensor";
-      $("#aqi-number").textContent = "—";
-      $("#aqi-number").style.color = "";
-      $("#aqi-category").textContent = "Unavailable";
-      $("#temperature").textContent = "—";
-      $("#humidity").textContent = "—";
-      $("#pm25").textContent = "—";
-      $("#pm10").textContent = "—";
-      $("#guidance").textContent = "Select a nearby sensor to see current guidance.";
-      $("#favorite-button").classList.remove("active");
-      $("#updated-time").textContent = "Waiting for data";
-      $("#chart").innerHTML = "";
-      $("#trend-direction").textContent = "—";
+      $("#detail-card").hidden = true;
       return;
     }
+    $("#detail-card").hidden = false;
     $("#sensor-name").textContent = sensor.name;
     $("#aqi-number").textContent = sensor.aqi ?? "—";
     $("#aqi-number").style.color = sensor.color;
@@ -335,16 +324,25 @@
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
-    if (event.key === "Escape" && !$("#settings-dialog").open) document.body.classList.remove("show-detail");
+    if (event.key === "Escape" && !$("#settings-dialog").open) {
+      if (!$("#search-results").hidden) $("#search-results").hidden = true;
+      else if (!$("#detail-card").hidden) $("#detail-card").hidden = true;
+      else $("#sensors-panel").hidden = true;
+    }
   });
   $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
   $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); zoom(1); });
   $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); zoom(-1); });
   $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); state.center = { ...state.home }; renderMap(); });
-  $("#show-map").addEventListener("click", () => { document.body.classList.add("show-map"); setTimeout(renderMap, 250); });
-  $("#show-list").addEventListener("click", (event) => { event.stopPropagation(); document.body.classList.remove("show-map"); });
-  $("#back-to-map").addEventListener("click", () => document.body.classList.remove("show-detail"));
+  $("#sensors-button").addEventListener("click", () => { $("#sensors-panel").hidden = !$("#sensors-panel").hidden; });
+  $("#close-sensors").addEventListener("click", () => { $("#sensors-panel").hidden = true; });
+  $("#close-detail").addEventListener("click", () => { $("#detail-card").hidden = true; });
+  $("#legend-chip").addEventListener("click", () => {
+    const legend = $("#legend");
+    legend.hidden = !legend.hidden;
+    $("#legend-chip").setAttribute("aria-expanded", String(!legend.hidden));
+  });
   $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
   $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); renderMapMarkers(); });
