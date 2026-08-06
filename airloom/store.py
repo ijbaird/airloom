@@ -14,6 +14,7 @@ DEFAULT_CONFIG = {
     "location_name": "Portland, Oregon",
     "radius_km": 22.0,
     "temperature_unit": "F",
+    "home_mode": "auto",
     "alert_threshold": 101,
     "favorites": [],
     "alert_states": {},
@@ -49,6 +50,8 @@ def _sanitize(data: dict) -> dict:
         clean["location_name"] = data["location_name"].strip()[:80]
     if data.get("temperature_unit") in ("F", "C"):
         clean["temperature_unit"] = data["temperature_unit"]
+    if data.get("home_mode") in ("auto", "fixed"):
+        clean["home_mode"] = data["home_mode"]
     favorites = data.get("favorites")
     if isinstance(favorites, list):
         clean["favorites"] = sorted(
@@ -98,6 +101,7 @@ class Store:
             "location_name": self.data["location_name"],
             "radius_km": self.data["radius_km"],
             "temperature_unit": self.data["temperature_unit"],
+            "home_mode": self.data["home_mode"],
             "alert_threshold": self.data["alert_threshold"],
             "has_api_key": has_key,
             "api_key_hint": f"••••{api_key[-4:]}" if has_key and len(api_key) >= 8 else "",

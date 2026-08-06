@@ -98,6 +98,22 @@ class StoreTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/tmp/xdg-test"}):
             self.assertEqual(_default_config_dir(), Path("/tmp/xdg-test/airloom"))
 
+    def test_home_mode_defaults_to_auto_and_survives_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            self.assertEqual(store.data["home_mode"], "auto")
+            self.assertEqual(store.public_config()["home_mode"], "auto")
+            store.data["home_mode"] = "fixed"
+            store.save()
+            self.assertEqual(Store(path).data["home_mode"], "fixed")
+
+    def test_invalid_home_mode_falls_back_to_auto(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"home_mode": "sometimes"}), encoding="utf-8")
+            self.assertEqual(Store(path).data["home_mode"], "auto")
+
 
 if __name__ == "__main__":
     unittest.main()
