@@ -116,6 +116,10 @@ class AirloomApplication(Adw.Application):
         return True
 
     def _on_location_fix(self, latitude, longitude) -> None:
+        if self.store.data.get("home_mode") != "auto":
+            # A delayed fix from a locator started under auto mode must not
+            # clobber coordinates the user has since pinned in fixed mode.
+            return
         if latitude is None or longitude is None:
             self._send(
                 "location",
@@ -248,6 +252,7 @@ class AirloomApplication(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def _save_settings(self, message: dict) -> None:
+        previous_mode = self.store.data.get("home_mode")
         try:
             radius = max(2.0, min(100.0, float(message["radius_km"])))
             threshold = max(1, min(500, int(message["alert_threshold"])))
@@ -280,7 +285,7 @@ class AirloomApplication(Adw.Application):
         if self.title:
             self.title.set_subtitle(self.store.data["location_name"])
         self._send("config", self.store.public_config())
-        if home_mode == "auto":
+        if home_mode == "auto" and previous_mode != "auto":
             self.locator = GeoClueLocator()
             self.locator.start(self._on_location_fix)
         self.refresh()
