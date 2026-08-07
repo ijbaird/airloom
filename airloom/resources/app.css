@@ -31,6 +31,7 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .map-marker { position: absolute; width: 40px; height: 40px; transform: translate(-50%, -50%); border: 3px solid rgba(255,255,255,.95); border-radius: 50%; display: grid; place-items: center; pointer-events: auto; cursor: pointer; background: var(--sensor); color: var(--sensor-fg); font-weight: 850; font-size: 12px; box-shadow: 0 4px 12px rgba(20,34,27,.28); transition: width .12s, height .12s, box-shadow .12s; }
 .map-marker:hover { width: 46px; height: 46px; z-index: 3; }
 .map-marker.selected { width: 50px; height: 50px; z-index: 4; box-shadow: 0 0 0 5px rgba(255,255,255,.72), 0 6px 18px rgba(20,34,27,.35); }
+.map-marker.indoor { border-radius: 26%; }
 
 .overlay { position: absolute; z-index: 5; }
 .search-overlay { top: 14px; left: 14px; width: min(340px, calc(100vw - 28px)); }
@@ -101,6 +102,7 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .favorite-button.active { color: #d18d12; background: rgba(246,201,69,.16); }
 .favorite-button.active svg path { d: path("m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"); }
 .sensor-name { margin: 14px 0 8px; color: var(--muted); font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.indoor-tag { margin-left: 7px; padding: 2px 7px; border-radius: 99px; background: var(--soft); color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; vertical-align: 2px; }
 .aqi-row { display: flex; align-items: center; gap: 15px; margin-bottom: 16px; }
 .aqi-number { font-size: 70px; font-weight: 780; letter-spacing: -.075em; line-height: .95; font-variant-numeric: tabular-nums; }
 .aqi-row > div { display: flex; flex-direction: column; gap: 4px; }

@@ -59,6 +59,7 @@ def demo_sensors(center_lat: float, center_lon: float) -> list[Sensor]:
                 pm10=round(pm * 1.28, 1),
                 last_seen=now - (index % 6) * 45,
                 trend=trend,
+                indoor=index % 5 == 2,
             )
         )
     # Keep the summary pleasantly varied while making demo results deterministic.

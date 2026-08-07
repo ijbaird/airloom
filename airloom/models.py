@@ -20,6 +20,7 @@ class Sensor:
     last_seen: int | None = None
     trend: list[dict[str, int | str | None]] = field(default_factory=list)
     favorite: bool = False
+    indoor: bool = False
 
     def to_dict(self) -> dict:
         result = asdict(self)

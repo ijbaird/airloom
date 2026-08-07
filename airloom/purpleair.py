@@ -20,6 +20,7 @@ FIELDS = (
     "latitude",
     "longitude",
     "last_seen",
+    "location_type",
     "humidity",
     "temperature",
     "pm1.0",
@@ -83,17 +84,25 @@ class PurpleAirClient:
         self.api_key = api_key.strip()
         self.timeout = timeout
 
-    def fetch_sensors(self, bounds: Bounds | None = None, show_only: list[int] | None = None) -> list[Sensor]:
+    def fetch_sensors(
+        self,
+        bounds: Bounds | None = None,
+        show_only: list[int] | None = None,
+        location_filter: str = "outdoor",
+    ) -> list[Sensor]:
         if not self.api_key:
             raise PurpleAirError("A PurpleAir read key is required for live data.")
         if show_only:
             show_only = [i for i in (_integer(value) for value in show_only) if i is not None]
         if bounds is None and not show_only:
             raise PurpleAirError("A sensor query needs bounds or sensor ids.")
-        params: dict[str, str] = {"fields": ",".join(FIELDS), "location_type": "0"}
+        params: dict[str, str] = {"fields": ",".join(FIELDS)}
         if show_only:
             params["show_only"] = ",".join(str(sensor_id) for sensor_id in show_only)
         else:
+            location_type = {"outdoor": "0", "indoor": "1"}.get(location_filter)
+            if location_type is not None:
+                params["location_type"] = location_type
             params.update(
                 {
                     "nwlat": f"{bounds.north:.6f}",
@@ -166,6 +175,7 @@ def parse_sensor_payload(payload: dict) -> list[Sensor]:
                 pm10=_rounded(_number(values.get("pm10.0"))),
                 last_seen=_integer(values.get("last_seen")),
                 trend=trend,
+                indoor=_integer(values.get("location_type")) == 1,
             )
         )
     return sensors
