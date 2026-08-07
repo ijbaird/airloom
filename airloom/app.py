@@ -93,6 +93,7 @@ class AirloomApplication(Adw.Application):
         settings.set_enable_developer_extras(False)
         settings.set_user_agent_with_application_details("Airloom", __version__)
         self.webview.connect("decide-policy", self._on_decide_policy)
+        self.webview.connect("notify::zoom-level", self._on_zoom_level_changed)
         self.webview.load_uri((RESOURCE_DIR / "index.html").as_uri())
 
         toolbar.add_top_bar(header)
@@ -174,6 +175,12 @@ class AirloomApplication(Adw.Application):
         if uri.startswith(("http://", "https://")) and self.window:
             Gtk.UriLauncher.new(uri).launch(self.window, None, None)
         return True
+
+    def _on_zoom_level_changed(self, webview, _pspec) -> None:
+        # The map handles pinch itself; engine-level page zoom would scale the
+        # whole document and clip the overlays, so snap it straight back.
+        if webview.get_zoom_level() != 1.0:
+            webview.set_zoom_level(1.0)
 
     def _on_location_fix(self, latitude, longitude, accuracy=None) -> None:
         if self.store.data.get("home_mode") != "auto":
