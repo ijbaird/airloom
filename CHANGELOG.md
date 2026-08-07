@@ -2,6 +2,17 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.3.0 — 2026-08-07
+
+Smooth zoom, sensor popups, and indoor/outdoor filtering.
+
+- Map zoom is now animated and anchored: wheel and button zoom ease smoothly toward the point under the cursor, rapid zooming retargets one fluid animation, and level changes cross-fade tiles instead of flashing a blank map.
+- Trackpad pinch zoom works correctly: the gesture now zooms the map around the pinch point instead of triggering the engine's page zoom, which used to scale the whole interface and clip the controls off-screen.
+- Clicking a sensor marker opens a compact popup with the AQI, category, indoor/outdoor tag, update time, and a favorite star — with buttons to open the full detail card or view the sensor on the PurpleAir web map in your browser.
+- New sensor filter chip on the map cycles between Outdoor, Indoor, and All sensors; the choice is persisted, applied to PurpleAir queries, and reflected in demo mode. Indoor sensors render as rounded squares and are tagged in the popup and detail card.
+- Favorited sensors are always fetched and shown regardless of the indoor/outdoor filter.
+- Demo readings that stand in after a failed live fetch are now always labeled as demo data, even when part of the fetch had succeeded.
+
 ## 0.2.4 — 2026-08-07
 
 - Fixed sensors not appearing after navigating with the place search: the search text no longer doubles as a sensor-name filter once a place result is chosen, so sensors fetched at the destination actually show on the map and in the list.

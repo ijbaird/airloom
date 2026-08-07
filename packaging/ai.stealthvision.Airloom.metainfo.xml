@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.3.0" date="2026-08-07">
+      <description><p>Map zoom is now smoothly animated and anchored under the cursor, trackpad pinch zooms the map instead of breaking the interface, sensor markers open a compact popup with a link to the PurpleAir web map, and a new map chip filters outdoor, indoor, or all sensors.</p></description>
+    </release>
     <release version="0.2.4" date="2026-08-07">
       <description><p>Place-search navigation now shows the sensors at the destination instead of leaving the map empty, and the area AQI chip is labeled with the area currently in view rather than always showing home.</p></description>
     </release>
