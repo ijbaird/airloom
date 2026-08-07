@@ -36,6 +36,8 @@ Two halves connected by a JSON message bridge:
 
 `app.js` also has a browser-preview fallback (bottom of file): opening `index.html` in a plain browser renders demo data without the bridge, useful for UI iteration.
 
+**Debug port**: launching with `AIRLOOM_DEBUG_SOCKET=/path/to.sock ./run` opens a local 0600 Unix socket (newline-delimited JSON: `ping`, `eval` (JS in the webview), `pinch` (synthesize begin/change/end)) so an agent can drive and inspect the running app — see `airloom/debugport.py`. Trackpad pinch is intercepted as a capture-phase `Gtk.GestureZoom` in `app.py` (claimed before WebKitGTK's internal page-scale gesture can consume it) and forwarded over the bridge as `pinch` events; `window.visualViewport.scale` staying 1.0 is the probe that page-scale zoom stayed off.
+
 ## Releasing
 
 Version lives in `airloom/__init__.py` and must match `CHANGELOG.md` and the AppStream release entry in `packaging/ai.stealthvision.Airloom.metainfo.xml`. Pushing a `vX.Y.Z` tag triggers the Flatpak workflow to build x86_64/aarch64 bundles and publish the GitHub release. See RELEASE.md.
