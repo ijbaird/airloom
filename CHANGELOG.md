@@ -2,6 +2,11 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.2.4 — 2026-08-07
+
+- Fixed sensors not appearing after navigating with the place search: the search text no longer doubles as a sensor-name filter once a place result is chosen, so sensors fetched at the destination actually show on the map and in the list.
+- The area AQI chip now names the area you are looking at: panning or searching far enough to fetch new sensors reverse-geocodes the view center, and recentering home restores the home name. The window title continues to show home.
+
 ## 0.2.3 — 2026-08-07
 
 - Fixed startup location detection on GNOME: the GeoClue request now waits until the app window has focus, so the system location-permission dialog can actually appear instead of crashing and reading as a denial (fresh installs were stuck on the shipped default location).
