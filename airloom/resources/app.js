@@ -5,7 +5,7 @@
   const state = {
     sensors: [],
     selectedId: null,
-    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "" },
+    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "", location_filter: "outdoor" },
     source: "Starting Airloom",
     center: { lat: 45.5152, lon: -122.6784 },
     home: { lat: 45.5152, lon: -122.6784 },
@@ -47,6 +47,12 @@
     $("#place-name").textContent = state.viewName || state.config.location_name;
   }
 
+  const FILTER_LABELS = { outdoor: "Outdoor", indoor: "Indoor", both: "All sensors" };
+  const FILTER_NEXT = { outdoor: "indoor", indoor: "both", both: "outdoor" };
+  function stampFilterChip() {
+    $("#filter-chip").textContent = FILTER_LABELS[state.config.location_filter] || "Outdoor";
+  }
+
   function applyLocation(payload) {
     const lat = Number(payload.latitude), lon = Number(payload.longitude);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
@@ -72,6 +78,7 @@
       }
     }
     stampPlaceName();
+    stampFilterChip();
     renderMap();
   }
 
@@ -111,8 +118,12 @@
   }
 
   function visibleSensors() {
+    let sensors = state.sensors;
+    if (!window.webkit?.messageHandlers?.airloom && state.config.location_filter !== "both") {
+      sensors = sensors.filter((s) => Boolean(s.indoor) === (state.config.location_filter === "indoor"));
+    }
     const query = state.query.trim().toLowerCase();
-    return query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : state.sensors;
+    return query ? sensors.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : sensors;
   }
 
   function renderLists() {
@@ -155,6 +166,7 @@
       return;
     }
     $("#sensor-name").textContent = sensor.name;
+    $("#detail-indoor").hidden = !sensor.indoor;
     $("#aqi-number").textContent = sensor.aqi ?? "—";
     $("#aqi-number").style.color = sensor.color;
     $("#aqi-category").textContent = sensor.category;
@@ -276,7 +288,7 @@
       const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
       if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
           point.y < view.top - pad || point.y > view.top + view.height + pad) return "";
-      return `<button class="map-marker${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
+      return `<button class="map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
     });
     $("#markers").innerHTML = markers.join("");
     $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), true); }));
@@ -433,7 +445,7 @@
     return readings.map((aqi, index) => {
       const [category, color, foreground] = colors(aqi);
       const angle = index * 2.399963;
-      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category, color, foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, guidance: aqi <= 50 ? "Air quality is satisfactory. It is a good time to be outside." : aqi <= 100 ? "Unusually sensitive people may want to reduce prolonged outdoor exertion." : "Sensitive groups should reduce prolonged or heavy outdoor exertion.", trend: ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) })) };
+      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category, color, foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, indoor: index % 5 === 2, guidance: aqi <= 50 ? "Air quality is satisfactory. It is a good time to be outside." : aqi <= 100 ? "Unusually sensitive people may want to reduce prolonged outdoor exertion." : "Sensitive groups should reduce prolonged or heavy outdoor exertion.", trend: ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) })) };
     });
   }
 
@@ -470,6 +482,12 @@
     const legend = $("#legend");
     legend.hidden = !legend.hidden;
     $("#legend-chip").setAttribute("aria-expanded", String(!legend.hidden));
+  });
+  $("#filter-chip").addEventListener("click", () => {
+    state.config.location_filter = FILTER_NEXT[state.config.location_filter] || "indoor";
+    stampFilterChip();
+    if (window.webkit?.messageHandlers?.airloom) bridge({ action: "set-location-filter", value: state.config.location_filter });
+    else renderAll(); // preview: filter locally, no bridge round-trip
   });
   $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });

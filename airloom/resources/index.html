@@ -36,6 +36,7 @@
       <div class="overlay corner-buttons">
         <button id="sensors-button">☰ Sensors <span class="count" id="sensor-count">0</span></button>
         <button id="legend-chip" aria-expanded="false">AQI</button>
+        <button id="filter-chip" title="Cycle which sensors are shown">Outdoor</button>
       </div>
       <div class="legend" id="legend" aria-label="AQI color legend" hidden>
         <div><i style="--c:#35b779"></i><span>Good</span><b>0–50</b></div>
@@ -71,7 +72,7 @@
             <button class="icon-button" id="close-detail" aria-label="Close detail">×</button>
           </span>
         </div>
-        <p class="sensor-name" id="sensor-name">Choose a sensor</p>
+        <p class="sensor-name"><span id="sensor-name">Choose a sensor</span><span class="indoor-tag" id="detail-indoor" hidden>Indoor</span></p>
         <div class="aqi-row">
           <span class="aqi-number" id="aqi-number">—</span>
           <div><span class="aqi-unit">US AQI</span><strong id="aqi-category">Unavailable</strong></div>

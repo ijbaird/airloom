@@ -121,6 +121,22 @@ class StoreTest(unittest.TestCase):
             path.write_text(json.dumps({"home_mode": "sometimes"}), encoding="utf-8")
             self.assertEqual(Store(path).data["home_mode"], "auto")
 
+    def test_location_filter_defaults_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            self.assertEqual(store.data["location_filter"], "outdoor")
+            self.assertEqual(store.public_config()["location_filter"], "outdoor")
+            store.data["location_filter"] = "both"
+            store.save()
+            self.assertEqual(Store(path).data["location_filter"], "both")
+
+    def test_invalid_location_filter_falls_back_to_outdoor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"location_filter": "underwater"}), encoding="utf-8")
+            self.assertEqual(Store(path).data["location_filter"], "outdoor")
+
 
 if __name__ == "__main__":
     unittest.main()

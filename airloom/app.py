@@ -31,6 +31,17 @@ AUTO_REFRESH_SECONDS = 300
 LOCATOR_FOCUS_FALLBACK_SECONDS = 20
 
 
+def _filter_demo(sensors: list[Sensor], mode: str) -> list[Sensor]:
+    if mode not in ("indoor", "outdoor"):
+        return sensors
+    return [sensor for sensor in sensors if sensor.indoor == (mode == "indoor")]
+
+
+def _no_sensors_message(mode: str) -> str:
+    kind = {"outdoor": "outdoor ", "indoor": "indoor "}.get(mode, "")
+    return f"No public {kind}sensors were found in this area."
+
+
 class AirloomApplication(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
@@ -299,6 +310,8 @@ class AirloomApplication(Adw.Application):
             self._on_view_changed(message)
         elif action == "place-search":
             self._on_place_search(message)
+        elif action == "set-location-filter":
+            self._set_location_filter(message)
         else:
             print(f"Airloom: ignored unknown web action: {action!r}", file=sys.stderr)
 
@@ -378,6 +391,20 @@ class AirloomApplication(Adw.Application):
         self._send("places", payload)
         return GLib.SOURCE_REMOVE
 
+    def _set_location_filter(self, message: dict) -> None:
+        value = message.get("value")
+        if value not in ("outdoor", "indoor", "both"):
+            print(f"Airloom: ignored invalid location filter: {value!r}", file=sys.stderr)
+            return
+        self.store.data["location_filter"] = value
+        self.store.save()
+        self._send("config", self.store.public_config())
+        if self.current_view is not None:
+            bounds, center = self.current_view
+            self._start_fetch(bounds, center, include_favorites=True)
+        else:
+            self.refresh()
+
     def _save_settings(self, message: dict) -> None:
         previous_mode = self.store.data.get("home_mode")
         try:
@@ -451,22 +478,23 @@ class AirloomApplication(Adw.Application):
             source = "Demo data"
             error = None
             sensors: list[Sensor] = []
+            mode = config.get("location_filter", "outdoor")
             try:
                 try:
                     if config.get("api_key"):
                         client = PurpleAirClient(config["api_key"])
-                        sensors = client.fetch_sensors(bounds=bounds)
+                        sensors = client.fetch_sensors(bounds=bounds, location_filter=mode)
                         source = "PurpleAir live"
                         if include_favorites:
                             missing = set(config.get("favorites", [])) - {s.sensor_id for s in sensors}
                             if missing:
                                 sensors += client.fetch_sensors(show_only=sorted(missing))
                         if not sensors:
-                            error = "No public outdoor sensors were found in this area."
+                            error = _no_sensors_message(mode)
                     else:
-                        sensors = demo_sensors(center[0], center[1])
+                        sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
                 except PurpleAirError as exc:
-                    sensors = demo_sensors(center[0], center[1])
+                    sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
                     error = f"{exc} Showing demo readings instead."
             except Exception as exc:  # noqa: BLE001 — a crashed worker must never wedge the refresh state
                 sensors = []
