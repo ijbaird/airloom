@@ -19,13 +19,34 @@ def is_coarse_fix(accuracy: float | None) -> bool:
 
 
 class GeoClueLocator:
-    """Requests a single fix; reports via callback on the GLib main loop."""
+    """Requests a single fix; reports via callback on the GLib main loop.
+
+    The callback may fire twice: once with (None, None, None) when the
+    attempt times out or errors, and once more with real coordinates if a
+    fix still arrives afterwards — the GNOME permission dialog can easily
+    outlive the timeout, and a late "Allow" must not be wasted.
+    """
 
     def __init__(self, timeout_seconds: int = 10):
         self.timeout_seconds = timeout_seconds
-        self._delivered = False
+        self._fix_delivered = False
+        self._fallback_sent = False
         self._timeout_id = None
         self._simple = None  # keeps the GeoClue client alive until delivery completes (not beyond)
+
+    def _note_fix(self) -> bool:
+        """Record a genuine fix; True when it should be delivered."""
+        if self._fix_delivered:
+            return False
+        self._fix_delivered = True
+        return True
+
+    def _note_fallback(self) -> bool:
+        """Record a failed attempt; True when the fallback should be reported."""
+        if self._fix_delivered or self._fallback_sent:
+            return False
+        self._fallback_sent = True
+        return True
 
     def start(self, on_fix) -> None:
         try:
@@ -35,23 +56,22 @@ class GeoClueLocator:
             from gi.repository import Geoclue, GLib
         except (ImportError, ValueError) as exc:
             print(f"Airloom: GeoClue unavailable: {exc}", file=sys.stderr)
-            on_fix(None, None, None)
+            if self._note_fallback():
+                on_fix(None, None, None)
             return
 
-        def deliver(latitude, longitude, accuracy):
-            if self._delivered:
-                return
-            self._delivered = True
+        def cancel_timeout():
             if self._timeout_id is not None:
                 GLib.source_remove(self._timeout_id)
                 self._timeout_id = None
-            self._simple = None
-            on_fix(latitude, longitude, accuracy)
 
         def on_timeout():
             self._timeout_id = None
             print("Airloom: location fix timed out", file=sys.stderr)
-            deliver(None, None, None)
+            # Report the fallback but keep listening: the fix that follows a
+            # slow answer to the permission dialog is still worth having.
+            if self._note_fallback():
+                on_fix(None, None, None)
             return GLib.SOURCE_REMOVE
 
         def finished(_source, result):
@@ -59,14 +79,19 @@ class GeoClueLocator:
                 simple = Geoclue.Simple.new_finish(result)
                 location = simple.get_location()
                 self._simple = simple
-                deliver(
-                    float(location.get_property("latitude")),
-                    float(location.get_property("longitude")),
-                    float(location.get_property("accuracy")),
-                )
+                if self._note_fix():
+                    cancel_timeout()
+                    on_fix(
+                        float(location.get_property("latitude")),
+                        float(location.get_property("longitude")),
+                        float(location.get_property("accuracy")),
+                    )
             except Exception as exc:  # denial, agent missing, service error
                 print(f"Airloom: location fix failed: {exc}", file=sys.stderr)
-                deliver(None, None, None)
+                cancel_timeout()
+                self._simple = None
+                if self._note_fallback():
+                    on_fix(None, None, None)
 
         self._timeout_id = GLib.timeout_add_seconds(self.timeout_seconds, on_timeout)
         Geoclue.Simple.new(APP_ID, Geoclue.AccuracyLevel.NEIGHBORHOOD, None, finished)
