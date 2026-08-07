@@ -146,7 +146,7 @@
     renderLists();
     renderMapMarkers();
     renderDetail();
-    if (revealDetail) $("#detail-card").hidden = false;
+    if (revealDetail) { hidePopup(); $("#detail-card").hidden = false; }
   }
 
   function selectedSensor() {
@@ -505,7 +505,7 @@
     legend.hidden = !legend.hidden;
     $("#legend-chip").setAttribute("aria-expanded", String(!legend.hidden));
   });
-  $("#map-panel").addEventListener("pointerdown", (event) => { hidePopup(); if (event.target.closest("button, a, .map-popup")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
+  $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button, a, .map-popup")) return; hidePopup(); state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
   $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
