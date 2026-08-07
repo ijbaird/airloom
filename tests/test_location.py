@@ -49,5 +49,26 @@ class DeliveryBookkeepingTest(unittest.TestCase):
         self.assertFalse(locator._note_fallback())
 
 
+class CancelTest(unittest.TestCase):
+    def test_cancel_suppresses_all_later_delivery(self):
+        locator = GeoClueLocator()
+        locator.cancel()
+        self.assertFalse(locator._note_fix())
+        self.assertFalse(locator._note_fallback())
+
+
+class GeoClueUnavailableTest(unittest.TestCase):
+    def test_missing_gi_reports_fallback_exactly_once(self):
+        import sys as _sys
+        from unittest import mock
+
+        calls = []
+        locator = GeoClueLocator()
+        with mock.patch.dict(_sys.modules, {"gi": None}):
+            locator.start(lambda *args: calls.append(args))
+            locator.start(lambda *args: calls.append(args))
+        self.assertEqual(calls, [(None, None, None)])
+
+
 if __name__ == "__main__":
     unittest.main()

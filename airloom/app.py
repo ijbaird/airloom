@@ -100,6 +100,8 @@ class AirloomApplication(Adw.Application):
             self._start_locator_when_focused()
 
     def _start_locator(self) -> None:
+        if self.locator is not None:
+            self.locator.cancel()
         self.locator = GeoClueLocator()
         self.locator.start(self._on_location_fix)
 
@@ -126,7 +128,9 @@ class AirloomApplication(Adw.Application):
 
     def _on_locator_focus_fallback(self) -> bool:
         self._locator_focus_fallback = None
-        self._clear_locator_focus_wait()
+        # Fire even without focus — better than never asking — but keep the
+        # focus handler connected: if the window gains focus later, the retry
+        # replaces this attempt, which GNOME may have refused unfocused.
         self._start_locator()
         return GLib.SOURCE_REMOVE
 
