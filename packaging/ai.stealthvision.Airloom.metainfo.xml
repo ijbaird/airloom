@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.2.2" date="2026-08-06">
+      <description><p>Small towns are now labeled by name rather than by their county.</p></description>
+    </release>
     <release version="0.2.1" date="2026-08-06">
       <description><p>Location detection now distinguishes precise fixes from coarse IP-level guesses and never overwrites a known location with the wrong city.</p></description>
     </release>

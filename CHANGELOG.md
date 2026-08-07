@@ -2,6 +2,10 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.2.2 — 2026-08-06
+
+- Reverse geocoding now resolves town-level names, so small towns (like Tahoe City) are labeled by name instead of their county.
+
 ## 0.2.1 — 2026-08-06
 
 Trustworthy location detection.
