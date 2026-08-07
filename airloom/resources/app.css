@@ -25,8 +25,10 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .map-shell { position: fixed; inset: 0; }
 .map-panel { position: absolute; inset: 0; overflow: hidden; background: #dfe7df; cursor: grab; user-select: none; touch-action: none; }
 .map-panel.dragging { cursor: grabbing; }
-.tile-layer, .marker-layer { position: absolute; inset: 0; will-change: transform; }
-.tile { position: absolute; width: 256px; height: 256px; user-select: none; -webkit-user-drag: none; filter: saturate(.7) contrast(.92) brightness(1.03); }
+.tile-layer, .marker-layer { position: absolute; inset: 0; will-change: transform; transform-origin: 0 0; }
+.tile-layer[hidden] { display: none; }
+.tile { position: absolute; width: 256px; height: 256px; user-select: none; -webkit-user-drag: none; filter: saturate(.7) contrast(.92) brightness(1.03); opacity: 0; transition: opacity .18s linear; }
+.tile.loaded { opacity: 1; }
 .marker-layer { pointer-events: none; }
 .map-marker { position: absolute; width: 40px; height: 40px; transform: translate(-50%, -50%); border: 3px solid rgba(255,255,255,.95); border-radius: 50%; display: grid; place-items: center; pointer-events: auto; cursor: pointer; background: var(--sensor); color: var(--sensor-fg); font-weight: 850; font-size: 12px; box-shadow: 0 4px 12px rgba(20,34,27,.28); transition: width .12s, height .12s, box-shadow .12s; }
 .map-marker:hover { width: 46px; height: 46px; z-index: 3; }

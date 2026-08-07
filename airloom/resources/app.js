@@ -222,7 +222,11 @@
     return { lat, lon };
   }
 
-  let tileLayer = { zoom: null, tiles: new Map() };
+  let tileLayer = { zoom: null, tiles: new Map(), pending: 0 };
+  let retireTimer = null;
+  const MARKER_CULL_PAD = 300; // generous cull margin so mid-pan gaps are rare
+
+  function tileZoomLevel() { return Math.max(3, Math.min(17, Math.round(state.zoom))); }
 
   function mapViewport() {
     const panel = $("#map-panel");
@@ -236,19 +240,56 @@
     };
   }
 
-  function renderMap() {
+  function retireTiles() {
+    const live = $("#tiles");
+    const old = $("#tiles-old");
+    if (!live.querySelector(".tile.loaded")) {
+      // The outgoing layer never finished loading (e.g. a fast double zoom
+      // crossed tile levels before any tile arrived) — discard its blank
+      // tiles but keep whatever imagery #tiles-old is already showing rather
+      // than replacing it with nothing.
+      while (live.firstChild) { live.firstChild.onload = live.firstChild.onerror = null; live.firstChild.remove(); }
+      clearTimeout(retireTimer);
+      retireTimer = setTimeout(clearRetiredTiles, 1500);
+      return;
+    }
+    old.textContent = "";
+    while (live.firstChild) {
+      const img = live.firstChild;
+      img.onload = img.onerror = null;
+      old.appendChild(img);
+    }
+    old.dataset.zoom = tileLayer.zoom;
+    old.hidden = !old.firstChild;
+    clearTimeout(retireTimer);
+    retireTimer = setTimeout(clearRetiredTiles, 1500);
+  }
+
+  function clearRetiredTiles() {
+    clearTimeout(retireTimer);
+    const old = $("#tiles-old");
+    old.textContent = "";
+    old.hidden = true;
+  }
+
+  function renderFrame() {
     const view = mapViewport();
     if (!view.width || !view.height) return;
-    const layer = $("#tiles");
-    if (tileLayer.zoom !== state.zoom) {
-      layer.textContent = "";
-      tileLayer = { zoom: state.zoom, tiles: new Map() };
+    const tz = tileZoomLevel();
+    if (tileLayer.zoom !== tz) {
+      if (tileLayer.zoom !== null) retireTiles();
+      tileLayer = { zoom: tz, tiles: new Map(), pending: 0 };
     }
-    const maxTile = 2 ** state.zoom;
+    const scale = 2 ** (state.zoom - tz);
+    const maxTile = 2 ** tz;
+    // Visible range in tile-zoom space (view coords are fractional-zoom space).
+    const left = view.left / scale, top = view.top / scale;
+    const right = (view.left + view.width) / scale, bottom = (view.top + view.height) / scale;
+    const layer = $("#tiles");
     const needed = new Set();
-    for (let ty = Math.floor(view.top / 256); ty <= Math.floor((view.top + view.height) / 256); ty++) {
+    for (let ty = Math.floor(top / 256); ty <= Math.floor(bottom / 256); ty++) {
       if (ty < 0 || ty >= maxTile) continue;
-      for (let tx = Math.floor(view.left / 256); tx <= Math.floor((view.left + view.width) / 256); tx++) {
+      for (let tx = Math.floor(left / 256); tx <= Math.floor(right / 256); tx++) {
         const key = `${tx}/${ty}`;
         needed.add(key);
         if (!tileLayer.tiles.has(key)) {
@@ -257,7 +298,18 @@
           img.className = "tile";
           img.draggable = false;
           img.alt = "";
-          img.src = `https://tile.openstreetmap.org/${state.zoom}/${wrappedX}/${ty}.png`;
+          // Capture the layer this tile belongs to: tileLayer gets reassigned
+          // wholesale on a zoom-level change, and a stale in-flight load must
+          // decrement its own (possibly retired) layer's counter, not
+          // whatever layer happens to be current when it fires.
+          const owner = tileLayer;
+          owner.pending++;
+          img.onload = img.onerror = () => {
+            img.classList.add("loaded");
+            img.onload = img.onerror = null;
+            if (--owner.pending <= 0 && owner === tileLayer) clearRetiredTiles();
+          };
+          img.src = `https://tile.openstreetmap.org/${tz}/${wrappedX}/${ty}.png`;
           img.style.left = `${tx * 256}px`;
           img.style.top = `${ty * 256}px`;
           layer.appendChild(img);
@@ -266,24 +318,100 @@
       }
     }
     for (const [key, img] of tileLayer.tiles) {
-      if (!needed.has(key)) { img.remove(); tileLayer.tiles.delete(key); }
+      if (!needed.has(key)) {
+        if (!img.classList.contains("loaded")) tileLayer.pending--;
+        img.onload = img.onerror = null;
+        img.remove();
+        tileLayer.tiles.delete(key);
+      }
     }
-    updateMapTransform();
+    if (tileLayer.pending <= 0) clearRetiredTiles();
+    layer.style.transform = `translate(${-view.left}px, ${-view.top}px) scale(${scale})`;
+    const old = $("#tiles-old");
+    if (!old.hidden) {
+      const oldScale = 2 ** (state.zoom - Number(old.dataset.zoom));
+      old.style.transform = `translate(${-view.left}px, ${-view.top}px) scale(${oldScale})`;
+    }
+    layoutMarkers(view);
+  }
+
+  function layoutMarkers(view = mapViewport()) {
+    const markers = $("#markers");
+    markers.style.transform = `translate(${-view.left}px, ${-view.top}px)`;
+    const byId = new Map(state.sensors.map((sensor) => [sensor.id, sensor]));
+    markers.querySelectorAll(".map-marker").forEach((element) => {
+      const sensor = byId.get(Number(element.dataset.id));
+      if (!sensor) return;
+      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+      element.style.left = `${point.x}px`;
+      element.style.top = `${point.y}px`;
+    });
+  }
+
+  function renderMap() {
+    renderFrame();
     renderMapMarkers();
   }
 
-  function updateMapTransform() {
+  // Transient overlays (Task B's popup) hook in here; base build has none.
+  function hideTransientOverlays() {}
+
+  function applyZoom(z, anchor) {
     const view = mapViewport();
     if (!view.width) return;
-    const transform = `translate(${-view.left}px, ${-view.top}px)`;
-    $("#tiles").style.transform = transform;
-    $("#markers").style.transform = transform;
+    z = Math.max(3, Math.min(17, z));
+    const geo = inverseWorld(view.left + anchor.x, view.top + anchor.y, state.zoom);
+    const point = worldPoint(geo.lat, geo.lon, z);
+    state.zoom = z;
+    state.center = inverseWorld(
+      point.x - anchor.x + view.width / 2,
+      point.y - anchor.y + view.height / 2,
+      z,
+    );
+    renderFrame();
   }
+
+  function centerAnchor() {
+    const view = mapViewport();
+    return { x: view.width / 2, y: view.height / 2 };
+  }
+
+  let zoomAnim = null;
+  let zoomAnimGeneration = 0;
+  function animateZoomTo(target, anchor) {
+    hideTransientOverlays();
+    // A pending pinch/ctrl+wheel settle must never fire mid-flight and
+    // hijack this animation's target/anchor (covers the wheel, button, and
+    // gestureend entry points in one place).
+    clearTimeout(pinchSettleTimer);
+    target = Math.max(3, Math.min(17, Math.round(target)));
+    if (zoomAnim) { zoomAnim.target = target; zoomAnim.anchor = anchor; return; }
+    zoomAnim = { target, anchor };
+    const gen = ++zoomAnimGeneration;
+    const step = () => {
+      if (!zoomAnim || gen !== zoomAnimGeneration) return;
+      const diff = zoomAnim.target - state.zoom;
+      if (Math.abs(diff) < 0.02) {
+        applyZoom(zoomAnim.target, zoomAnim.anchor);
+        zoomAnim = null;
+        renderMapMarkers();
+        scheduleViewChanged();
+        return;
+      }
+      // Exponential ease-out: retargeting mid-flight stays smooth.
+      applyZoom(state.zoom + diff * 0.22, zoomAnim.anchor);
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  function cancelZoomAnimation() { zoomAnim = null; zoomAnimGeneration++; }
 
   function renderMapMarkers() {
     const view = mapViewport();
     if (!view.width) return;
-    const pad = 300; // generous cull margin so mid-pan gaps are rare
+    markerDriftX = markerDriftY = 0;
+    const pad = MARKER_CULL_PAD;
     const markers = visibleSensors().map((sensor) => {
       const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
       if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
@@ -292,7 +420,7 @@
     });
     $("#markers").innerHTML = markers.join("");
     $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), true); }));
-    updateMapTransform();
+    layoutMarkers(view);
   }
 
   let viewTimer = null;
@@ -318,33 +446,23 @@
       const t = Math.min(1, (now - start) / durationMs);
       const ease = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
       state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (lon - from.lon) * ease };
-      renderMap();
+      renderFrame();
       if (t < 1) requestAnimationFrame(step);
-      else scheduleViewChanged();
+      else { renderMapMarkers(); scheduleViewChanged(); }
     }
     requestAnimationFrame(step);
   }
 
+  let markerDriftX = 0, markerDriftY = 0;
   function panBy(dx, dy) {
     const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
     state.center = inverseWorld(center.x - dx, center.y - dy, state.zoom);
-    const view = mapViewport();
-    // Cheap per-frame path: move layers; only re-diff tiles when the view
-    // crosses outside the currently materialized tile ring.
-    updateMapTransform();
-    scheduleViewChanged();
-    const tx0 = Math.floor(view.left / 256), ty0 = Math.floor(view.top / 256);
-    const tx1 = Math.floor((view.left + view.width) / 256), ty1 = Math.floor((view.top + view.height) / 256);
-    for (let ty = ty0; ty <= ty1; ty++) {
-      for (let tx = tx0; tx <= tx1; tx++) {
-        if (!tileLayer.tiles.has(`${tx}/${ty}`) && ty >= 0 && ty < 2 ** state.zoom) { renderMap(); return; }
-      }
-    }
-  }
-
-  function zoom(delta) {
-    state.zoom = Math.max(3, Math.min(17, state.zoom + delta));
-    renderMap();
+    renderFrame();
+    // renderFrame() only repositions already-rendered markers; a long drag
+    // can carry the view past the cull pad before a full re-render happens,
+    // so force one once accumulated drift since the last full render exceeds it.
+    markerDriftX += dx; markerDriftY += dy;
+    if (Math.hypot(markerDriftX, markerDriftY) > MARKER_CULL_PAD) renderMapMarkers();
     scheduleViewChanged();
   }
 
@@ -472,8 +590,8 @@
   });
   $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
-  $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); zoom(1); });
-  $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); zoom(-1); });
+  $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) + 1, centerAnchor()); });
+  $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) - 1, centerAnchor()); });
   $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); flyTo(state.home.lat, state.home.lon); });
   $("#sensors-button").addEventListener("click", () => { $("#sensors-panel").hidden = !$("#sensors-panel").hidden; });
   $("#close-sensors").addEventListener("click", () => { $("#sensors-panel").hidden = true; });
@@ -489,11 +607,70 @@
     if (window.webkit?.messageHandlers?.airloom) bridge({ action: "set-location-filter", value: state.config.location_filter });
     else renderAll(); // preview: filter locally, no bridge round-trip
   });
-  $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
+  $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; hideTransientOverlays(); state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
   $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
-  $("#map-panel").addEventListener("wheel", (event) => { event.preventDefault(); zoom(event.deltaY < 0 ? 1 : -1); }, { passive: false });
+  $("#map-panel").addEventListener("wheel", (event) => {
+    if (event.ctrlKey) return; // pinch path; the document-level handler owns it
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const base = zoomAnim ? zoomAnim.target : Math.round(state.zoom);
+    animateZoomTo(base + (event.deltaY < 0 ? 1 : -1), { x: event.clientX - rect.left, y: event.clientY - rect.top });
+  }, { passive: false });
+
+  let pinch = null;
+  let pinchSettleTimer = null;
+  let lastZoomAnchor = null;
+
+  function mapAnchorFromClient(clientX, clientY) {
+    const rect = $("#map-panel").getBoundingClientRect();
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }
+
+  // Pinch/ctrl+wheel should drive the map only when the gesture is over it;
+  // ctrl-scrolling over the sensors list, detail card, search results, or
+  // the open settings dialog must not zoom the map underneath them.
+  function overBlockingOverlay(target) {
+    return !!(target && target.closest && target.closest("#settings-dialog, #sensors-panel, #detail-card, #search-results"));
+  }
+
+  // WebKitGTK delivers trackpad pinch either as ctrl+wheel or as proprietary
+  // gesture* events depending on version/compositor. preventDefault on both,
+  // unconditionally, so the engine can never apply page zoom (which scaled the
+  // whole document and clipped the fixed overlays).
+  document.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    if (overBlockingOverlay(event.target)) return;
+    cancelZoomAnimation();
+    hideTransientOverlays();
+    lastZoomAnchor = mapAnchorFromClient(event.clientX, event.clientY);
+    applyZoom(state.zoom - event.deltaY * 0.01, lastZoomAnchor);
+    clearTimeout(pinchSettleTimer);
+    pinchSettleTimer = setTimeout(() => animateZoomTo(Math.round(state.zoom), lastZoomAnchor), 180);
+  }, { passive: false });
+
+  document.addEventListener("gesturestart", (event) => {
+    event.preventDefault();
+    if (overBlockingOverlay(event.target)) return;
+    cancelZoomAnimation();
+    hideTransientOverlays();
+    pinch = { startZoom: state.zoom };
+  }, { passive: false });
+  document.addEventListener("gesturechange", (event) => {
+    event.preventDefault();
+    if (!pinch) return;
+    lastZoomAnchor = mapAnchorFromClient(event.clientX, event.clientY);
+    applyZoom(pinch.startZoom + Math.log2(Math.max(0.05, event.scale)), lastZoomAnchor);
+  }, { passive: false });
+  document.addEventListener("gestureend", (event) => {
+    event.preventDefault();
+    if (!pinch) return;
+    pinch = null;
+    animateZoomTo(Math.round(state.zoom), lastZoomAnchor || centerAnchor());
+  }, { passive: false });
+
   $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#settings-dialog").addEventListener("close", () => { state.homeSearchActive = false; });
