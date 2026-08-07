@@ -57,6 +57,10 @@ class AirloomApplication(Adw.Application):
         self._locator_focus_handler: int | None = None
         self._locator_focus_fallback: int | None = None
         self.view_bounds: Bounds | None = None
+        # Last real fetch outcome ("PurpleAir live" / "Demo data"), so callers
+        # that resend sensor state without refetching (e.g. favorite toggles)
+        # never guess a label that contradicts what was actually fetched.
+        self.last_source: str | None = None
         # Where the user is currently looking, stamped as one (bounds, center)
         # pair so the auto-refresh timer can never combine a stale half.
         self.current_view: tuple[Bounds, tuple[float, float]] | None = None
@@ -518,6 +522,7 @@ class AirloomApplication(Adw.Application):
         if self.selected_id not in {sensor.sensor_id for sensor in sensors}:
             self.selected_id = sensors[0].sensor_id if sensors else None
         self.refreshing = False
+        self.last_source = source
         self._send_sensor_state(source)
         self._send("loading", {"active": False})
         if error:
@@ -537,7 +542,7 @@ class AirloomApplication(Adw.Application):
         payload = {
             "items": [sensor.to_dict() for sensor in self.sensors],
             "selected_id": self.selected_id,
-            "source": source or ("PurpleAir live" if self.store.data.get("api_key") else "Demo data"),
+            "source": source or self.last_source or ("PurpleAir live" if self.store.data.get("api_key") else "Demo data"),
             "config": self.store.public_config(),
         }
         self._send("sensors", payload)

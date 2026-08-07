@@ -91,10 +91,7 @@
     stampPlaceName();
     $("#data-source").textContent = state.source;
     renderAll();
-    if (state.popupId !== null) {
-      const open = state.sensors.find((s) => s.id === state.popupId);
-      open ? showPopup(open) : hidePopup();
-    }
+    reconcilePopup();
   }
 
   function renderAll() {
@@ -105,7 +102,7 @@
   }
 
   function renderSummary() {
-    const valid = state.sensors.filter((s) => Number.isFinite(s.aqi)).sort((a, b) => a.aqi - b.aqi);
+    const valid = locationFiltered(state.sensors).filter((s) => Number.isFinite(s.aqi)).sort((a, b) => a.aqi - b.aqi);
     const sensor = valid[Math.floor(valid.length / 2)];
     if (!sensor) {
       $("#summary-aqi").textContent = "—";
@@ -122,13 +119,29 @@
     $("#summary-chip").title = `${valid.length} sensors reporting`;
   }
 
-  function visibleSensors() {
-    let sensors = state.sensors;
+  // Preview mode filters sensors locally by indoor/outdoor; app mode leaves
+  // that filtering to the Python fetch, so this is a no-op there. Shared by
+  // visibleSensors() (which layers the search query on top) and
+  // renderSummary() (which must reflect the location filter but not search).
+  function locationFiltered(sensors) {
     if (!window.webkit?.messageHandlers?.airloom && state.config.location_filter !== "both") {
-      sensors = sensors.filter((s) => Boolean(s.indoor) === (state.config.location_filter === "indoor"));
+      return sensors.filter((s) => Boolean(s.indoor) === (state.config.location_filter === "indoor"));
     }
+    return sensors;
+  }
+
+  function visibleSensors() {
+    const sensors = locationFiltered(state.sensors);
     const query = state.query.trim().toLowerCase();
     return query ? sensors.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : sensors;
+  }
+
+  // A sensor filtered out by the location filter or search query must not
+  // leave a stale popup open for a marker that's no longer shown.
+  function reconcilePopup() {
+    if (state.popupId === null) return;
+    const open = visibleSensors().find((s) => s.id === state.popupId);
+    open ? showPopup(open) : hidePopup();
   }
 
   function renderLists() {
@@ -613,6 +626,7 @@
     state.query = event.target.value;
     renderLists();
     renderMapMarkers();
+    reconcilePopup();
     renderSearchResults([]);
     clearTimeout(placeTimer);
     if (state.query.trim().length >= 3) placeTimer = setTimeout(() => bridge({ action: "place-search", query: state.query.trim() }), 450);
@@ -649,7 +663,7 @@
     state.config.location_filter = FILTER_NEXT[state.config.location_filter] || "indoor";
     stampFilterChip();
     if (window.webkit?.messageHandlers?.airloom) bridge({ action: "set-location-filter", value: state.config.location_filter });
-    else renderAll(); // preview: filter locally, no bridge round-trip
+    else { renderAll(); reconcilePopup(); } // preview: filter locally, no bridge round-trip
   });
   $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button, a, .map-popup")) return; hideTransientOverlays(); state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
@@ -700,6 +714,7 @@
     if (overBlockingOverlay(event.target)) return;
     cancelZoomAnimation();
     hideTransientOverlays();
+    lastZoomAnchor = null;
     pinch = { startZoom: state.zoom };
   }, { passive: false });
   document.addEventListener("gesturechange", (event) => {
