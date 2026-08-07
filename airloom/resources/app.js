@@ -212,6 +212,7 @@
 
   let tileLayer = { zoom: null, tiles: new Map(), pending: 0 };
   let retireTimer = null;
+  const MARKER_CULL_PAD = 300; // generous cull margin so mid-pan gaps are rare
 
   function tileZoomLevel() { return Math.max(3, Math.min(17, Math.round(state.zoom))); }
 
@@ -228,10 +229,24 @@
   }
 
   function retireTiles() {
-    const old = $("#tiles-old");
-    old.textContent = "";
     const live = $("#tiles");
-    while (live.firstChild) old.appendChild(live.firstChild);
+    const old = $("#tiles-old");
+    if (!live.querySelector(".tile.loaded")) {
+      // The outgoing layer never finished loading (e.g. a fast double zoom
+      // crossed tile levels before any tile arrived) — discard its blank
+      // tiles but keep whatever imagery #tiles-old is already showing rather
+      // than replacing it with nothing.
+      while (live.firstChild) { live.firstChild.onload = live.firstChild.onerror = null; live.firstChild.remove(); }
+      clearTimeout(retireTimer);
+      retireTimer = setTimeout(clearRetiredTiles, 1500);
+      return;
+    }
+    old.textContent = "";
+    while (live.firstChild) {
+      const img = live.firstChild;
+      img.onload = img.onerror = null;
+      old.appendChild(img);
+    }
     old.dataset.zoom = tileLayer.zoom;
     old.hidden = !old.firstChild;
     clearTimeout(retireTimer);
@@ -271,11 +286,16 @@
           img.className = "tile";
           img.draggable = false;
           img.alt = "";
-          tileLayer.pending++;
+          // Capture the layer this tile belongs to: tileLayer gets reassigned
+          // wholesale on a zoom-level change, and a stale in-flight load must
+          // decrement its own (possibly retired) layer's counter, not
+          // whatever layer happens to be current when it fires.
+          const owner = tileLayer;
+          owner.pending++;
           img.onload = img.onerror = () => {
             img.classList.add("loaded");
             img.onload = img.onerror = null;
-            if (--tileLayer.pending <= 0) clearRetiredTiles();
+            if (--owner.pending <= 0 && owner === tileLayer) clearRetiredTiles();
           };
           img.src = `https://tile.openstreetmap.org/${tz}/${wrappedX}/${ty}.png`;
           img.style.left = `${tx * 256}px`;
@@ -345,13 +365,19 @@
   }
 
   let zoomAnim = null;
+  let zoomAnimGeneration = 0;
   function animateZoomTo(target, anchor) {
     hideTransientOverlays();
+    // A pending pinch/ctrl+wheel settle must never fire mid-flight and
+    // hijack this animation's target/anchor (covers the wheel, button, and
+    // gestureend entry points in one place).
+    clearTimeout(pinchSettleTimer);
     target = Math.max(3, Math.min(17, Math.round(target)));
     if (zoomAnim) { zoomAnim.target = target; zoomAnim.anchor = anchor; return; }
     zoomAnim = { target, anchor };
+    const gen = ++zoomAnimGeneration;
     const step = () => {
-      if (!zoomAnim) return;
+      if (!zoomAnim || gen !== zoomAnimGeneration) return;
       const diff = zoomAnim.target - state.zoom;
       if (Math.abs(diff) < 0.02) {
         applyZoom(zoomAnim.target, zoomAnim.anchor);
@@ -367,12 +393,13 @@
     requestAnimationFrame(step);
   }
 
-  function cancelZoomAnimation() { zoomAnim = null; }
+  function cancelZoomAnimation() { zoomAnim = null; zoomAnimGeneration++; }
 
   function renderMapMarkers() {
     const view = mapViewport();
     if (!view.width) return;
-    const pad = 300; // generous cull margin so mid-pan gaps are rare
+    markerDriftX = markerDriftY = 0;
+    const pad = MARKER_CULL_PAD;
     const markers = visibleSensors().map((sensor) => {
       const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
       if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
@@ -414,10 +441,16 @@
     requestAnimationFrame(step);
   }
 
+  let markerDriftX = 0, markerDriftY = 0;
   function panBy(dx, dy) {
     const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
     state.center = inverseWorld(center.x - dx, center.y - dy, state.zoom);
     renderFrame();
+    // renderFrame() only repositions already-rendered markers; a long drag
+    // can carry the view past the cull pad before a full re-render happens,
+    // so force one once accumulated drift since the last full render exceeds it.
+    markerDriftX += dx; markerDriftY += dy;
+    if (Math.hypot(markerDriftX, markerDriftY) > MARKER_CULL_PAD) renderMapMarkers();
     scheduleViewChanged();
   }
 
@@ -577,6 +610,13 @@
     return { x: clientX - rect.left, y: clientY - rect.top };
   }
 
+  // Pinch/ctrl+wheel should drive the map only when the gesture is over it;
+  // ctrl-scrolling over the sensors list, detail card, search results, or
+  // the open settings dialog must not zoom the map underneath them.
+  function overBlockingOverlay(target) {
+    return !!(target && target.closest && target.closest("#settings-dialog, #sensors-panel, #detail-card, #search-results"));
+  }
+
   // WebKitGTK delivers trackpad pinch either as ctrl+wheel or as proprietary
   // gesture* events depending on version/compositor. preventDefault on both,
   // unconditionally, so the engine can never apply page zoom (which scaled the
@@ -584,6 +624,7 @@
   document.addEventListener("wheel", (event) => {
     if (!event.ctrlKey) return;
     event.preventDefault();
+    if (overBlockingOverlay(event.target)) return;
     cancelZoomAnimation();
     hideTransientOverlays();
     lastZoomAnchor = mapAnchorFromClient(event.clientX, event.clientY);
@@ -594,6 +635,7 @@
 
   document.addEventListener("gesturestart", (event) => {
     event.preventDefault();
+    if (overBlockingOverlay(event.target)) return;
     cancelZoomAnimation();
     hideTransientOverlays();
     pinch = { startZoom: state.zoom };
