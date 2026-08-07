@@ -7,6 +7,16 @@ import sys
 
 APP_ID = "ai.stealthvision.Airloom"
 
+# GeoClue stamps every fix with an accuracy radius in meters. IP-based
+# fallback fixes come back around 25 km — a city-level guess that is often
+# the wrong city — while genuine WiFi/GNSS fixes are a few hundred meters.
+COARSE_FIX_METERS = 10000.0
+
+
+def is_coarse_fix(accuracy: float | None) -> bool:
+    """True when a fix is too imprecise to trust over a known location."""
+    return accuracy is None or accuracy > COARSE_FIX_METERS
+
 
 class GeoClueLocator:
     """Requests a single fix; reports via callback on the GLib main loop."""
@@ -25,10 +35,10 @@ class GeoClueLocator:
             from gi.repository import Geoclue, GLib
         except (ImportError, ValueError) as exc:
             print(f"Airloom: GeoClue unavailable: {exc}", file=sys.stderr)
-            on_fix(None, None)
+            on_fix(None, None, None)
             return
 
-        def deliver(latitude, longitude):
+        def deliver(latitude, longitude, accuracy):
             if self._delivered:
                 return
             self._delivered = True
@@ -36,12 +46,12 @@ class GeoClueLocator:
                 GLib.source_remove(self._timeout_id)
                 self._timeout_id = None
             self._simple = None
-            on_fix(latitude, longitude)
+            on_fix(latitude, longitude, accuracy)
 
         def on_timeout():
             self._timeout_id = None
             print("Airloom: location fix timed out", file=sys.stderr)
-            deliver(None, None)
+            deliver(None, None, None)
             return GLib.SOURCE_REMOVE
 
         def finished(_source, result):
@@ -52,10 +62,11 @@ class GeoClueLocator:
                 deliver(
                     float(location.get_property("latitude")),
                     float(location.get_property("longitude")),
+                    float(location.get_property("accuracy")),
                 )
             except Exception as exc:  # denial, agent missing, service error
                 print(f"Airloom: location fix failed: {exc}", file=sys.stderr)
-                deliver(None, None)
+                deliver(None, None, None)
 
         self._timeout_id = GLib.timeout_add_seconds(self.timeout_seconds, on_timeout)
         Geoclue.Simple.new(APP_ID, Geoclue.AccuracyLevel.NEIGHBORHOOD, None, finished)

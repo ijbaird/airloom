@@ -108,6 +108,13 @@ class StoreTest(unittest.TestCase):
             store.save()
             self.assertEqual(Store(path).data["home_mode"], "fixed")
 
+    def test_has_custom_location_flips_once_coordinates_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            self.assertFalse(store.has_custom_location())
+            store.data.update({"latitude": 39.1677, "longitude": -120.1452})
+            self.assertTrue(store.has_custom_location())
+
     def test_invalid_home_mode_falls_back_to_auto(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

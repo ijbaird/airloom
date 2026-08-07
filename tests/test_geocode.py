@@ -31,6 +31,7 @@ class GeocodeTest(unittest.TestCase):
         url = spy.call_args[0][0].full_url
         self.assertIn("nominatim.openstreetmap.org/search", url)
         self.assertIn("q=tahoe+city", url)
+        self.assertIn("limit=5", url)
         self.assertIn("Airloom/", spy.call_args[0][0].get_header("User-agent"))
 
     def test_search_empty_query_returns_empty_without_request(self):

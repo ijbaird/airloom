@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.2.1" date="2026-08-06">
+      <description><p>Location detection now distinguishes precise fixes from coarse IP-level guesses and never overwrites a known location with the wrong city.</p></description>
+    </release>
     <release version="0.2.0" date="2026-08-06">
       <description><p>Automatic location detection, place search, and redesigned map-first interface with persistent tile rendering and independent alert timers.</p></description>
     </release>

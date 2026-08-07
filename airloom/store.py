@@ -107,6 +107,13 @@ class Store:
             "api_key_hint": f"••••{api_key[-4:]}" if has_key and len(api_key) >= 8 else "",
         }
 
+    def has_custom_location(self) -> bool:
+        """True once the stored location differs from the shipped default."""
+        return (self.data["latitude"], self.data["longitude"]) != (
+            DEFAULT_CONFIG["latitude"],
+            DEFAULT_CONFIG["longitude"],
+        )
+
     def toggle_favorite(self, sensor_id: int) -> bool:
         favorites = set(self.data.get("favorites", []))
         if sensor_id in favorites:

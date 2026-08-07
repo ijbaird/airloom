@@ -2,6 +2,15 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.2.1 — 2026-08-06
+
+Trustworthy location detection.
+
+- Location detection now respects GeoClue's reported accuracy: a coarse, IP-level fix (which is often the ISP's city rather than yours) no longer overwrites a known location — the app keeps your saved home and explains that detection was only approximate. Precise WiFi/GNSS fixes behave as before, and first-run detection still accepts any fix.
+- The 5-minute background refresh now tracks the viewed area and its center as one unit, so a failed or empty fetch can no longer cause later refreshes to target a stale area.
+- PurpleAir favorite queries tolerate malformed sensor ids instead of failing the whole fetch.
+- Small polish: the fixed-home search no longer shows an empty dropdown, and map marker lookups are scoped to the marker layer.
+
 ## 0.2.0 — 2026-08-06
 
 Major UI redesign and automatic location detection.

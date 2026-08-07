@@ -267,7 +267,7 @@
       return `<button class="map-marker${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
     });
     $("#markers").innerHTML = markers.join("");
-    document.querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), true); }));
+    $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), true); }));
     updateMapTransform();
   }
 
@@ -388,6 +388,7 @@
 
   function renderHomePlaceResults(places, error) {
     const box = $("#home-place-results");
+    if (!places.length && !error) { box.hidden = true; box.innerHTML = ""; return; }
     box.innerHTML = error ? `<div class="group">${escapeHtml(error)}</div>` : places.map((p, i) => `<button type="button" data-index="${i}">${escapeHtml(p.name)}</button>`).join("");
     box.hidden = false;
     box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {

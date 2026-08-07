@@ -19,7 +19,7 @@ from . import __version__
 from .bridge import decode_message
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
-from .location import GeoClueLocator
+from .location import GeoClueLocator, is_coarse_fix
 from .models import Sensor
 from .purpleair import Bounds, PurpleAirClient, PurpleAirError, bounds_around, bounds_contains
 from .store import Store
@@ -43,7 +43,9 @@ class AirloomApplication(Adw.Application):
         self.pending_fetch: tuple | None = None
         self.locator: GeoClueLocator | None = None
         self.view_bounds: Bounds | None = None
-        self.view_center: tuple[float, float] | None = None
+        # Where the user is currently looking, stamped as one (bounds, center)
+        # pair so the auto-refresh timer can never combine a stale half.
+        self.current_view: tuple[Bounds, tuple[float, float]] | None = None
         self.view_fetched_at = 0.0
         self.connect("activate", self._on_activate)
 
@@ -100,8 +102,9 @@ class AirloomApplication(Adw.Application):
         # who panned elsewhere shouldn't watch their markers get replaced by
         # home-area sensors every 5 minutes. Favorites are still folded in so
         # the alert check keeps covering starred sensors regardless of view.
-        if self.view_bounds is not None and self.view_center is not None:
-            self._start_fetch(self.view_bounds, self.view_center, include_favorites=True)
+        if self.current_view is not None:
+            bounds, center = self.current_view
+            self._start_fetch(bounds, center, include_favorites=True)
         else:
             self.refresh()
         return GLib.SOURCE_CONTINUE
@@ -123,7 +126,7 @@ class AirloomApplication(Adw.Application):
             Gtk.UriLauncher.new(uri).launch(self.window, None, None)
         return True
 
-    def _on_location_fix(self, latitude, longitude) -> None:
+    def _on_location_fix(self, latitude, longitude, accuracy=None) -> None:
         if self.store.data.get("home_mode") != "auto":
             # A delayed fix from a locator started under auto mode must not
             # clobber coordinates the user has since pinned in fixed mode.
@@ -139,6 +142,29 @@ class AirloomApplication(Adw.Application):
                 },
             )
             self._send("error", {"message": "Using last known location."})
+            return
+        if is_coarse_fix(accuracy) and self.store.has_custom_location():
+            # An IP-level guess (tens of km, often the ISP's city rather than
+            # the user's) must not overwrite a location we already know.
+            self._send(
+                "location",
+                {
+                    "latitude": self.store.data["latitude"],
+                    "longitude": self.store.data["longitude"],
+                    "name": self.store.data["location_name"],
+                    "source": "fallback",
+                },
+            )
+            self._send(
+                "error",
+                {
+                    "message": (
+                        f"Location detection was only approximate — keeping "
+                        f"{self.store.data['location_name']}. Set a fixed home in "
+                        f"Preferences if this looks wrong."
+                    )
+                },
+            )
             return
         self.store.data.update({"latitude": float(latitude), "longitude": float(longitude)})
         self.store.save()
@@ -237,7 +263,7 @@ class AirloomApplication(Adw.Application):
             and view.west <= view.east
         ):
             return
-        self.view_center = center
+        self.current_view = (view, center)
         fresh = (time.monotonic() - self.view_fetched_at) < AUTO_REFRESH_SECONDS
         if self.view_bounds is not None and fresh and bounds_contains(self.view_bounds, view):
             return

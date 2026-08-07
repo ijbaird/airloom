@@ -92,6 +92,26 @@ class PurpleAirTest(unittest.TestCase):
         self.assertIn("show_only=42%2C7", captured["url"])
         self.assertNotIn("nwlat", captured["url"])
 
+    def test_show_only_tolerates_bad_ids(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            import io
+            return mock.MagicMock(
+                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __exit__=lambda s, *a: False,
+            )
+
+        client = PurpleAirClient("key")
+        with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen):
+            client.fetch_sensors(show_only=["42", "abc", 7])
+        self.assertIn("show_only=42%2C7", captured["url"])
+
+    def test_show_only_with_no_valid_ids_raises(self):
+        with self.assertRaises(PurpleAirError):
+            PurpleAirClient("key").fetch_sensors(show_only=["abc"])
+
     def test_fetch_sensors_requires_bounds_or_show_only(self):
         with self.assertRaises(PurpleAirError):
             PurpleAirClient("key").fetch_sensors()

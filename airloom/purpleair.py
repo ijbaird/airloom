@@ -86,11 +86,13 @@ class PurpleAirClient:
     def fetch_sensors(self, bounds: Bounds | None = None, show_only: list[int] | None = None) -> list[Sensor]:
         if not self.api_key:
             raise PurpleAirError("A PurpleAir read key is required for live data.")
+        if show_only:
+            show_only = [i for i in (_integer(value) for value in show_only) if i is not None]
         if bounds is None and not show_only:
             raise PurpleAirError("A sensor query needs bounds or sensor ids.")
         params: dict[str, str] = {"fields": ",".join(FIELDS), "location_type": "0"}
         if show_only:
-            params["show_only"] = ",".join(str(int(sensor_id)) for sensor_id in show_only)
+            params["show_only"] = ",".join(str(sensor_id) for sensor_id in show_only)
         else:
             params.update(
                 {
