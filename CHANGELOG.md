@@ -2,6 +2,11 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.3.2 — 2026-08-07
+
+- Fixed trackpad pinch really this time: WebKitGTK consumes touchpad pinch internally as page-scale zoom before the page ever sees it, so 0.3.0's in-page handlers never ran. The gesture is now intercepted at the GTK layer (capture-phase claim) and forwarded to the map, which zooms smoothly around the pinch point; the interface chrome stays put.
+- New developer feature: an opt-in debug socket (`AIRLOOM_DEBUG_SOCKET`) lets tooling drive and inspect a running instance (ping, JS eval, synthetic pinch) for autonomous debugging.
+
 ## 0.3.1 — 2026-08-07
 
 - Fixed sensor markers being unclickable: releasing the pointer rebuilt the marker layer before the click could be delivered, so marker clicks were silently dropped. Latent since the 0.2.0 map redesign, it also blocked the new 0.3.0 marker popup. Clicking a marker now opens the popup as intended.
