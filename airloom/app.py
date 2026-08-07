@@ -182,7 +182,21 @@ class AirloomApplication(Adw.Application):
                     "source": "fallback",
                 },
             )
-            self._send("error", {"message": "Using last known location."})
+            if self.store.has_custom_location():
+                self._send("error", {"message": "Using last known location."})
+            else:
+                # Fresh install: the store still holds the shipped default,
+                # which is nobody's "last known location" - say what happened.
+                self._send(
+                    "error",
+                    {
+                        "message": (
+                            "Couldn't detect your location - showing a default area. "
+                            "Set your home in Preferences, or check that location "
+                            "access is allowed in system Settings."
+                        )
+                    },
+                )
             return
         if is_coarse_fix(accuracy) and self.store.has_custom_location():
             # An IP-level guess (tens of km, often the ISP's city rather than

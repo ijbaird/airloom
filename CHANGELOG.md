@@ -2,6 +2,12 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## Unreleased
+
+- Fixed startup location detection on GNOME: the GeoClue request now waits until the app window has focus, so the system location-permission dialog can actually appear instead of crashing and reading as a denial (fresh installs were stuck on the shipped default location).
+- A location fix that arrives after the 10-second timeout (for example while the permission dialog is open) is now applied instead of being dropped for the session.
+- When detection fails on a fresh install, the app now says location couldn't be detected and points to Preferences, instead of calling the shipped default the "last known location".
+
 ## 0.2.2 — 2026-08-06
 
 - Reverse geocoding now resolves town-level names, so small towns (like Tahoe City) are labeled by name instead of their county.
