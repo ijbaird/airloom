@@ -11,8 +11,24 @@
   <body>
     <main class="map-shell">
       <section class="map-panel" id="map-panel" aria-label="Air quality sensor map">
+        <div id="tiles-old" class="tile-layer" hidden></div>
         <div id="tiles" class="tile-layer"></div>
         <div id="markers" class="marker-layer"></div>
+        <div id="popup-layer" class="marker-layer">
+          <div class="map-popup" id="map-popup" hidden>
+            <div class="popup-head">
+              <span class="popup-aqi" id="popup-aqi">—</span>
+              <div class="popup-copy"><strong id="popup-name"></strong><small id="popup-meta"></small></div>
+              <button class="icon-button popup-star" id="popup-favorite" title="Favorite this sensor" aria-label="Favorite this sensor">
+                <svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg>
+              </button>
+            </div>
+            <div class="popup-actions">
+              <button id="popup-details" class="popup-action">Details</button>
+              <a id="popup-purpleair" class="popup-action" target="_blank" rel="noreferrer">Open in PurpleAir ↗</a>
+            </div>
+          </div>
+        </div>
       </section>
 
       <div class="overlay search-overlay">
@@ -36,6 +52,7 @@
       <div class="overlay corner-buttons">
         <button id="sensors-button">☰ Sensors <span class="count" id="sensor-count">0</span></button>
         <button id="legend-chip" aria-expanded="false">AQI</button>
+        <button id="filter-chip" title="Cycle which sensors are shown">Outdoor</button>
       </div>
       <div class="legend" id="legend" aria-label="AQI color legend" hidden>
         <div><i style="--c:#35b779"></i><span>Good</span><b>0–50</b></div>
@@ -71,7 +88,7 @@
             <button class="icon-button" id="close-detail" aria-label="Close detail">×</button>
           </span>
         </div>
-        <p class="sensor-name" id="sensor-name">Choose a sensor</p>
+        <p class="sensor-name"><span id="sensor-name">Choose a sensor</span><span class="indoor-tag" id="detail-indoor" hidden>Indoor</span></p>
         <div class="aqi-row">
           <span class="aqi-number" id="aqi-number">—</span>
           <div><span class="aqi-unit">US AQI</span><strong id="aqi-category">Unavailable</strong></div>

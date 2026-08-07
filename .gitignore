@@ -8,3 +8,4 @@ dist/
 work/
 outputs/
 .superpowers/
+.claude/

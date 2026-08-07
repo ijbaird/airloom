@@ -116,6 +116,47 @@ class PurpleAirTest(unittest.TestCase):
         with self.assertRaises(PurpleAirError):
             PurpleAirClient("key").fetch_sensors()
 
+    def _fetch_url(self, **kwargs):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            import io
+            return mock.MagicMock(
+                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __exit__=lambda s, *a: False,
+            )
+
+        with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen):
+            PurpleAirClient("key").fetch_sensors(**kwargs)
+        return captured["url"]
+
+    def test_location_filter_maps_to_location_type_param(self):
+        bounds = Bounds(46.0, -123.0, 45.0, -122.0)
+        self.assertIn("location_type=0", self._fetch_url(bounds=bounds))
+        self.assertIn("location_type=0", self._fetch_url(bounds=bounds, location_filter="outdoor"))
+        self.assertIn("location_type=1", self._fetch_url(bounds=bounds, location_filter="indoor"))
+        # "location_type" (no "=") also appears in the fields= listing (the
+        # field is always requested so payloads can be parsed for `indoor`),
+        # so this checks for the query *parameter* specifically.
+        self.assertNotIn("location_type=", self._fetch_url(bounds=bounds, location_filter="both"))
+
+    def test_show_only_never_sends_location_filter(self):
+        url = self._fetch_url(show_only=[42], location_filter="outdoor")
+        self.assertNotIn("location_type=", url)
+
+    def test_location_type_field_is_requested_and_parsed(self):
+        self.assertIn("location_type", self._fetch_url(bounds=Bounds(46.0, -123.0, 45.0, -122.0)))
+        payload = {
+            "fields": ["sensor_index", "latitude", "longitude", "location_type"],
+            "data": [[1, 45.0, -122.0, 1], [2, 45.1, -122.1, 0], [3, 45.2, -122.2, None]],
+        }
+        sensors = {s.sensor_id: s for s in parse_sensor_payload(payload)}
+        self.assertTrue(sensors[1].indoor)
+        self.assertFalse(sensors[2].indoor)
+        self.assertFalse(sensors[3].indoor)
+        self.assertTrue(sensors[1].to_dict()["indoor"])
+
 
 if __name__ == "__main__":
     unittest.main()

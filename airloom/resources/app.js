@@ -5,7 +5,7 @@
   const state = {
     sensors: [],
     selectedId: null,
-    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "" },
+    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "", location_filter: "outdoor" },
     source: "Starting Airloom",
     center: { lat: 45.5152, lon: -122.6784 },
     home: { lat: 45.5152, lon: -122.6784 },
@@ -18,6 +18,7 @@
     // Name of the area currently in view (reverse-geocoded by Python);
     // overrides the configured home name on the summary chip until replaced.
     viewName: null,
+    popupId: null,
   };
 
   const bridge = (message) => {
@@ -47,6 +48,12 @@
     $("#place-name").textContent = state.viewName || state.config.location_name;
   }
 
+  const FILTER_LABELS = { outdoor: "Outdoor", indoor: "Indoor", both: "All sensors" };
+  const FILTER_NEXT = { outdoor: "indoor", indoor: "both", both: "outdoor" };
+  function stampFilterChip() {
+    $("#filter-chip").textContent = FILTER_LABELS[state.config.location_filter] || "Outdoor";
+  }
+
   function applyLocation(payload) {
     const lat = Number(payload.latitude), lon = Number(payload.longitude);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
@@ -72,6 +79,7 @@
       }
     }
     stampPlaceName();
+    stampFilterChip();
     renderMap();
   }
 
@@ -83,6 +91,7 @@
     stampPlaceName();
     $("#data-source").textContent = state.source;
     renderAll();
+    reconcilePopup();
   }
 
   function renderAll() {
@@ -93,7 +102,7 @@
   }
 
   function renderSummary() {
-    const valid = state.sensors.filter((s) => Number.isFinite(s.aqi)).sort((a, b) => a.aqi - b.aqi);
+    const valid = locationFiltered(state.sensors).filter((s) => Number.isFinite(s.aqi)).sort((a, b) => a.aqi - b.aqi);
     const sensor = valid[Math.floor(valid.length / 2)];
     if (!sensor) {
       $("#summary-aqi").textContent = "—";
@@ -110,9 +119,29 @@
     $("#summary-chip").title = `${valid.length} sensors reporting`;
   }
 
+  // Preview mode filters sensors locally by indoor/outdoor; app mode leaves
+  // that filtering to the Python fetch, so this is a no-op there. Shared by
+  // visibleSensors() (which layers the search query on top) and
+  // renderSummary() (which must reflect the location filter but not search).
+  function locationFiltered(sensors) {
+    if (!window.webkit?.messageHandlers?.airloom && state.config.location_filter !== "both") {
+      return sensors.filter((s) => Boolean(s.indoor) === (state.config.location_filter === "indoor"));
+    }
+    return sensors;
+  }
+
   function visibleSensors() {
+    const sensors = locationFiltered(state.sensors);
     const query = state.query.trim().toLowerCase();
-    return query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : state.sensors;
+    return query ? sensors.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : sensors;
+  }
+
+  // A sensor filtered out by the location filter or search query must not
+  // leave a stale popup open for a marker that's no longer shown.
+  function reconcilePopup() {
+    if (state.popupId === null) return;
+    const open = visibleSensors().find((s) => s.id === state.popupId);
+    open ? showPopup(open) : hidePopup();
   }
 
   function renderLists() {
@@ -141,11 +170,35 @@
     renderLists();
     renderMapMarkers();
     renderDetail();
-    if (revealDetail) $("#detail-card").hidden = false;
+    if (revealDetail) { hidePopup(); $("#detail-card").hidden = false; }
   }
 
   function selectedSensor() {
     return state.sensors.find((sensor) => sensor.id === state.selectedId);
+  }
+
+  function showPopup(sensor) {
+    const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+    const popup = $("#map-popup");
+    popup.style.left = `${point.x}px`;
+    popup.style.top = `${point.y}px`;
+    $("#popup-aqi").textContent = sensor.aqi ?? "—";
+    $("#popup-aqi").style.background = sensor.color || "";
+    $("#popup-aqi").style.color = sensor.foreground || "";
+    $("#popup-name").textContent = sensor.name;
+    $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
+    $("#popup-favorite").classList.toggle("active", Boolean(sensor.favorite));
+    const demo = (state.source || "").includes("Demo");
+    const link = $("#popup-purpleair");
+    link.hidden = demo; // demo sensor ids do not exist on the public map
+    if (!demo) link.href = `https://map.purpleair.com/1/mAQI/a10/p604800/cC0?select=${sensor.id}#14/${sensor.latitude}/${sensor.longitude}`;
+    popup.hidden = false;
+    state.popupId = sensor.id;
+  }
+
+  function hidePopup() {
+    $("#map-popup").hidden = true;
+    state.popupId = null;
   }
 
   function renderDetail() {
@@ -155,6 +208,7 @@
       return;
     }
     $("#sensor-name").textContent = sensor.name;
+    $("#detail-indoor").hidden = !sensor.indoor;
     $("#aqi-number").textContent = sensor.aqi ?? "—";
     $("#aqi-number").style.color = sensor.color;
     $("#aqi-category").textContent = sensor.category;
@@ -210,7 +264,11 @@
     return { lat, lon };
   }
 
-  let tileLayer = { zoom: null, tiles: new Map() };
+  let tileLayer = { zoom: null, tiles: new Map(), pending: 0 };
+  let retireTimer = null;
+  const MARKER_CULL_PAD = 300; // generous cull margin so mid-pan gaps are rare
+
+  function tileZoomLevel() { return Math.max(3, Math.min(17, Math.round(state.zoom))); }
 
   function mapViewport() {
     const panel = $("#map-panel");
@@ -224,19 +282,56 @@
     };
   }
 
-  function renderMap() {
+  function retireTiles() {
+    const live = $("#tiles");
+    const old = $("#tiles-old");
+    if (!live.querySelector(".tile.loaded")) {
+      // The outgoing layer never finished loading (e.g. a fast double zoom
+      // crossed tile levels before any tile arrived) — discard its blank
+      // tiles but keep whatever imagery #tiles-old is already showing rather
+      // than replacing it with nothing.
+      while (live.firstChild) { live.firstChild.onload = live.firstChild.onerror = null; live.firstChild.remove(); }
+      clearTimeout(retireTimer);
+      retireTimer = setTimeout(clearRetiredTiles, 1500);
+      return;
+    }
+    old.textContent = "";
+    while (live.firstChild) {
+      const img = live.firstChild;
+      img.onload = img.onerror = null;
+      old.appendChild(img);
+    }
+    old.dataset.zoom = tileLayer.zoom;
+    old.hidden = !old.firstChild;
+    clearTimeout(retireTimer);
+    retireTimer = setTimeout(clearRetiredTiles, 1500);
+  }
+
+  function clearRetiredTiles() {
+    clearTimeout(retireTimer);
+    const old = $("#tiles-old");
+    old.textContent = "";
+    old.hidden = true;
+  }
+
+  function renderFrame() {
     const view = mapViewport();
     if (!view.width || !view.height) return;
-    const layer = $("#tiles");
-    if (tileLayer.zoom !== state.zoom) {
-      layer.textContent = "";
-      tileLayer = { zoom: state.zoom, tiles: new Map() };
+    const tz = tileZoomLevel();
+    if (tileLayer.zoom !== tz) {
+      if (tileLayer.zoom !== null) retireTiles();
+      tileLayer = { zoom: tz, tiles: new Map(), pending: 0 };
     }
-    const maxTile = 2 ** state.zoom;
+    const scale = 2 ** (state.zoom - tz);
+    const maxTile = 2 ** tz;
+    // Visible range in tile-zoom space (view coords are fractional-zoom space).
+    const left = view.left / scale, top = view.top / scale;
+    const right = (view.left + view.width) / scale, bottom = (view.top + view.height) / scale;
+    const layer = $("#tiles");
     const needed = new Set();
-    for (let ty = Math.floor(view.top / 256); ty <= Math.floor((view.top + view.height) / 256); ty++) {
+    for (let ty = Math.floor(top / 256); ty <= Math.floor(bottom / 256); ty++) {
       if (ty < 0 || ty >= maxTile) continue;
-      for (let tx = Math.floor(view.left / 256); tx <= Math.floor((view.left + view.width) / 256); tx++) {
+      for (let tx = Math.floor(left / 256); tx <= Math.floor(right / 256); tx++) {
         const key = `${tx}/${ty}`;
         needed.add(key);
         if (!tileLayer.tiles.has(key)) {
@@ -245,7 +340,18 @@
           img.className = "tile";
           img.draggable = false;
           img.alt = "";
-          img.src = `https://tile.openstreetmap.org/${state.zoom}/${wrappedX}/${ty}.png`;
+          // Capture the layer this tile belongs to: tileLayer gets reassigned
+          // wholesale on a zoom-level change, and a stale in-flight load must
+          // decrement its own (possibly retired) layer's counter, not
+          // whatever layer happens to be current when it fires.
+          const owner = tileLayer;
+          owner.pending++;
+          img.onload = img.onerror = () => {
+            img.classList.add("loaded");
+            img.onload = img.onerror = null;
+            if (--owner.pending <= 0 && owner === tileLayer) clearRetiredTiles();
+          };
+          img.src = `https://tile.openstreetmap.org/${tz}/${wrappedX}/${ty}.png`;
           img.style.left = `${tx * 256}px`;
           img.style.top = `${ty * 256}px`;
           layer.appendChild(img);
@@ -254,33 +360,121 @@
       }
     }
     for (const [key, img] of tileLayer.tiles) {
-      if (!needed.has(key)) { img.remove(); tileLayer.tiles.delete(key); }
+      if (!needed.has(key)) {
+        if (!img.classList.contains("loaded")) tileLayer.pending--;
+        img.onload = img.onerror = null;
+        img.remove();
+        tileLayer.tiles.delete(key);
+      }
     }
-    updateMapTransform();
+    if (tileLayer.pending <= 0) clearRetiredTiles();
+    layer.style.transform = `translate(${-view.left}px, ${-view.top}px) scale(${scale})`;
+    const old = $("#tiles-old");
+    if (!old.hidden) {
+      const oldScale = 2 ** (state.zoom - Number(old.dataset.zoom));
+      old.style.transform = `translate(${-view.left}px, ${-view.top}px) scale(${oldScale})`;
+    }
+    layoutMarkers(view);
+  }
+
+  function layoutMarkers(view = mapViewport()) {
+    const markers = $("#markers");
+    markers.style.transform = `translate(${-view.left}px, ${-view.top}px)`;
+    $("#popup-layer").style.transform = markers.style.transform;
+    const byId = new Map(state.sensors.map((sensor) => [sensor.id, sensor]));
+    markers.querySelectorAll(".map-marker").forEach((element) => {
+      const sensor = byId.get(Number(element.dataset.id));
+      if (!sensor) return;
+      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+      element.style.left = `${point.x}px`;
+      element.style.top = `${point.y}px`;
+    });
+    // Zoom gestures close the popup up front (hideTransientOverlays), so this
+    // reposition only matters for flyTo/pan frames while a popup stays open.
+    if (state.popupId !== null) {
+      const open = byId.get(state.popupId);
+      if (open) {
+        const point = worldPoint(open.latitude, open.longitude, state.zoom);
+        const popup = $("#map-popup");
+        popup.style.left = `${point.x}px`;
+        popup.style.top = `${point.y}px`;
+      }
+    }
+  }
+
+  function renderMap() {
+    renderFrame();
     renderMapMarkers();
   }
 
-  function updateMapTransform() {
+  // Transient overlays hook: called at the start of every zoom gesture/drag.
+  function hideTransientOverlays() { hidePopup(); }
+
+  function applyZoom(z, anchor) {
     const view = mapViewport();
     if (!view.width) return;
-    const transform = `translate(${-view.left}px, ${-view.top}px)`;
-    $("#tiles").style.transform = transform;
-    $("#markers").style.transform = transform;
+    z = Math.max(3, Math.min(17, z));
+    const geo = inverseWorld(view.left + anchor.x, view.top + anchor.y, state.zoom);
+    const point = worldPoint(geo.lat, geo.lon, z);
+    state.zoom = z;
+    state.center = inverseWorld(
+      point.x - anchor.x + view.width / 2,
+      point.y - anchor.y + view.height / 2,
+      z,
+    );
+    renderFrame();
   }
+
+  function centerAnchor() {
+    const view = mapViewport();
+    return { x: view.width / 2, y: view.height / 2 };
+  }
+
+  let zoomAnim = null;
+  let zoomAnimGeneration = 0;
+  function animateZoomTo(target, anchor) {
+    hideTransientOverlays();
+    // A pending pinch/ctrl+wheel settle must never fire mid-flight and
+    // hijack this animation's target/anchor (covers the wheel, button, and
+    // gestureend entry points in one place).
+    clearTimeout(pinchSettleTimer);
+    target = Math.max(3, Math.min(17, Math.round(target)));
+    if (zoomAnim) { zoomAnim.target = target; zoomAnim.anchor = anchor; return; }
+    zoomAnim = { target, anchor };
+    const gen = ++zoomAnimGeneration;
+    const step = () => {
+      if (!zoomAnim || gen !== zoomAnimGeneration) return;
+      const diff = zoomAnim.target - state.zoom;
+      if (Math.abs(diff) < 0.02) {
+        applyZoom(zoomAnim.target, zoomAnim.anchor);
+        zoomAnim = null;
+        renderMapMarkers();
+        scheduleViewChanged();
+        return;
+      }
+      // Exponential ease-out: retargeting mid-flight stays smooth.
+      applyZoom(state.zoom + diff * 0.22, zoomAnim.anchor);
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  function cancelZoomAnimation() { zoomAnim = null; zoomAnimGeneration++; }
 
   function renderMapMarkers() {
     const view = mapViewport();
     if (!view.width) return;
-    const pad = 300; // generous cull margin so mid-pan gaps are rare
+    markerDriftX = markerDriftY = 0;
+    const pad = MARKER_CULL_PAD;
     const markers = visibleSensors().map((sensor) => {
       const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
       if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
           point.y < view.top - pad || point.y > view.top + view.height + pad) return "";
-      return `<button class="map-marker${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
+      return `<button class="map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
     });
     $("#markers").innerHTML = markers.join("");
-    $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), true); }));
-    updateMapTransform();
+    $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), false); const sensor = state.sensors.find((s) => s.id === Number(marker.dataset.id)); if (sensor) showPopup(sensor); }));
+    layoutMarkers(view);
   }
 
   let viewTimer = null;
@@ -306,33 +500,23 @@
       const t = Math.min(1, (now - start) / durationMs);
       const ease = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
       state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (lon - from.lon) * ease };
-      renderMap();
+      renderFrame();
       if (t < 1) requestAnimationFrame(step);
-      else scheduleViewChanged();
+      else { renderMapMarkers(); scheduleViewChanged(); }
     }
     requestAnimationFrame(step);
   }
 
+  let markerDriftX = 0, markerDriftY = 0;
   function panBy(dx, dy) {
     const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
     state.center = inverseWorld(center.x - dx, center.y - dy, state.zoom);
-    const view = mapViewport();
-    // Cheap per-frame path: move layers; only re-diff tiles when the view
-    // crosses outside the currently materialized tile ring.
-    updateMapTransform();
-    scheduleViewChanged();
-    const tx0 = Math.floor(view.left / 256), ty0 = Math.floor(view.top / 256);
-    const tx1 = Math.floor((view.left + view.width) / 256), ty1 = Math.floor((view.top + view.height) / 256);
-    for (let ty = ty0; ty <= ty1; ty++) {
-      for (let tx = tx0; tx <= tx1; tx++) {
-        if (!tileLayer.tiles.has(`${tx}/${ty}`) && ty >= 0 && ty < 2 ** state.zoom) { renderMap(); return; }
-      }
-    }
-  }
-
-  function zoom(delta) {
-    state.zoom = Math.max(3, Math.min(17, state.zoom + delta));
-    renderMap();
+    renderFrame();
+    // renderFrame() only repositions already-rendered markers; a long drag
+    // can carry the view past the cull pad before a full re-render happens,
+    // so force one once accumulated drift since the last full render exceeds it.
+    markerDriftX += dx; markerDriftY += dy;
+    if (Math.hypot(markerDriftX, markerDriftY) > MARKER_CULL_PAD) renderMapMarkers();
     scheduleViewChanged();
   }
 
@@ -433,7 +617,7 @@
     return readings.map((aqi, index) => {
       const [category, color, foreground] = colors(aqi);
       const angle = index * 2.399963;
-      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category, color, foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, guidance: aqi <= 50 ? "Air quality is satisfactory. It is a good time to be outside." : aqi <= 100 ? "Unusually sensitive people may want to reduce prolonged outdoor exertion." : "Sensitive groups should reduce prolonged or heavy outdoor exertion.", trend: ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) })) };
+      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category, color, foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, indoor: index % 5 === 2, guidance: aqi <= 50 ? "Air quality is satisfactory. It is a good time to be outside." : aqi <= 100 ? "Unusually sensitive people may want to reduce prolonged outdoor exertion." : "Sensitive groups should reduce prolonged or heavy outdoor exertion.", trend: ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) })) };
     });
   }
 
@@ -442,6 +626,7 @@
     state.query = event.target.value;
     renderLists();
     renderMapMarkers();
+    reconcilePopup();
     renderSearchResults([]);
     clearTimeout(placeTimer);
     if (state.query.trim().length >= 3) placeTimer = setTimeout(() => bridge({ action: "place-search", query: state.query.trim() }), 450);
@@ -453,15 +638,18 @@
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
     if (event.key === "Escape" && !$("#settings-dialog").open) {
-      if (!$("#search-results").hidden) $("#search-results").hidden = true;
+      if (!$("#map-popup").hidden) hidePopup();
+      else if (!$("#search-results").hidden) $("#search-results").hidden = true;
       else if (!$("#detail-card").hidden) $("#detail-card").hidden = true;
       else $("#sensors-panel").hidden = true;
     }
   });
   $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
-  $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); zoom(1); });
-  $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); zoom(-1); });
+  $("#popup-details").addEventListener("click", () => { $("#detail-card").hidden = false; renderDetail(); hidePopup(); });
+  $("#popup-favorite").addEventListener("click", () => { if (state.popupId !== null) { if (window.webkit?.messageHandlers?.airloom) bridge({ action: "favorite", id: state.popupId }); else { const sensor = state.sensors.find((s) => s.id === state.popupId); if (sensor) { sensor.favorite = !sensor.favorite; renderAll(); showPopup(sensor); } } } });
+  $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) + 1, centerAnchor()); });
+  $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) - 1, centerAnchor()); });
   $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); flyTo(state.home.lat, state.home.lon); });
   $("#sensors-button").addEventListener("click", () => { $("#sensors-panel").hidden = !$("#sensors-panel").hidden; });
   $("#close-sensors").addEventListener("click", () => { $("#sensors-panel").hidden = true; });
@@ -471,11 +659,77 @@
     legend.hidden = !legend.hidden;
     $("#legend-chip").setAttribute("aria-expanded", String(!legend.hidden));
   });
-  $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
+  $("#filter-chip").addEventListener("click", () => {
+    state.config.location_filter = FILTER_NEXT[state.config.location_filter] || "indoor";
+    stampFilterChip();
+    if (window.webkit?.messageHandlers?.airloom) bridge({ action: "set-location-filter", value: state.config.location_filter });
+    else { renderAll(); reconcilePopup(); } // preview: filter locally, no bridge round-trip
+  });
+  $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button, a, .map-popup")) return; hideTransientOverlays(); state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
   $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
-  $("#map-panel").addEventListener("wheel", (event) => { event.preventDefault(); zoom(event.deltaY < 0 ? 1 : -1); }, { passive: false });
+  $("#map-panel").addEventListener("wheel", (event) => {
+    if (event.ctrlKey) return; // pinch path; the document-level handler owns it
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const base = zoomAnim ? zoomAnim.target : Math.round(state.zoom);
+    animateZoomTo(base + (event.deltaY < 0 ? 1 : -1), { x: event.clientX - rect.left, y: event.clientY - rect.top });
+  }, { passive: false });
+
+  let pinch = null;
+  let pinchSettleTimer = null;
+  let lastZoomAnchor = null;
+
+  function mapAnchorFromClient(clientX, clientY) {
+    const rect = $("#map-panel").getBoundingClientRect();
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }
+
+  // Pinch/ctrl+wheel should drive the map only when the gesture is over it;
+  // ctrl-scrolling over the sensors list, detail card, search results, or
+  // the open settings dialog must not zoom the map underneath them.
+  function overBlockingOverlay(target) {
+    return !!(target && target.closest && target.closest("#settings-dialog, #sensors-panel, #detail-card, #search-results"));
+  }
+
+  // WebKitGTK delivers trackpad pinch either as ctrl+wheel or as proprietary
+  // gesture* events depending on version/compositor. preventDefault on both,
+  // unconditionally, so the engine can never apply page zoom (which scaled the
+  // whole document and clipped the fixed overlays).
+  document.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    if (overBlockingOverlay(event.target)) return;
+    cancelZoomAnimation();
+    hideTransientOverlays();
+    lastZoomAnchor = mapAnchorFromClient(event.clientX, event.clientY);
+    applyZoom(state.zoom - event.deltaY * 0.01, lastZoomAnchor);
+    clearTimeout(pinchSettleTimer);
+    pinchSettleTimer = setTimeout(() => animateZoomTo(Math.round(state.zoom), lastZoomAnchor), 180);
+  }, { passive: false });
+
+  document.addEventListener("gesturestart", (event) => {
+    event.preventDefault();
+    if (overBlockingOverlay(event.target)) return;
+    cancelZoomAnimation();
+    hideTransientOverlays();
+    lastZoomAnchor = null;
+    pinch = { startZoom: state.zoom };
+  }, { passive: false });
+  document.addEventListener("gesturechange", (event) => {
+    event.preventDefault();
+    if (!pinch) return;
+    lastZoomAnchor = mapAnchorFromClient(event.clientX, event.clientY);
+    applyZoom(pinch.startZoom + Math.log2(Math.max(0.05, event.scale)), lastZoomAnchor);
+  }, { passive: false });
+  document.addEventListener("gestureend", (event) => {
+    event.preventDefault();
+    if (!pinch) return;
+    pinch = null;
+    animateZoomTo(Math.round(state.zoom), lastZoomAnchor || centerAnchor());
+  }, { passive: false });
+
   $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#settings-dialog").addEventListener("close", () => { state.homeSearchActive = false; });
