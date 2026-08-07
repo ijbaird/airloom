@@ -2,6 +2,10 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.3.1 — 2026-08-07
+
+- Fixed sensor markers being unclickable: releasing the pointer rebuilt the marker layer before the click could be delivered, so marker clicks were silently dropped. Latent since the 0.2.0 map redesign, it also blocked the new 0.3.0 marker popup. Clicking a marker now opens the popup as intended.
+
 ## 0.3.0 — 2026-08-07
 
 Smooth zoom, sensor popups, and indoor/outdoor filtering.

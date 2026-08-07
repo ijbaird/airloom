@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.3.1" date="2026-08-07">
+      <description><p>Clicking a sensor marker now reliably opens its popup: pointer releases no longer rebuild the marker layer before the click is delivered.</p></description>
+    </release>
     <release version="0.3.0" date="2026-08-07">
       <description><p>Map zoom is now smoothly animated and anchored under the cursor, trackpad pinch zooms the map instead of breaking the interface, sensor markers open a compact popup with a link to the PurpleAir web map, and a new map chip filters outdoor, indoor, or all sensors.</p></description>
     </release>
