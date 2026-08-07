@@ -36,12 +36,16 @@
       if (event === "open-settings") openSettings(payload);
       if (event === "location") applyLocation(payload);
       if (event === "view-name" && payload.name) { state.viewName = payload.name; stampPlaceName(); }
+      if (event === "pinch") nativePinch(payload);
       if (event === "places") {
         if (state.homeSearchActive) {
           if (payload.query === $("#home-place-input").value.trim()) renderHomePlaceResults(payload.results || [], payload.error);
         } else if (payload.query === state.query.trim()) renderSearchResults(payload.results || [], payload.error);
       }
     },
+    // Small, legitimate debug accessor used by the debug-port self-test to
+    // read map state without reaching into module-private variables.
+    debugState: () => ({ zoom: state.zoom, center: state.center }),
   };
 
   function stampPlaceName() {
@@ -733,6 +737,34 @@
     pinch = null;
     animateZoomTo(Math.round(state.zoom), lastZoomAnchor || centerAnchor());
   }, { passive: false });
+
+  // Native (GTK-level) pinch path: on this platform WebKitGTK's internal
+  // gesture controller consumes trackpad pinch as page scale before the DOM
+  // ever sees ctrl+wheel or gesture* events, so app.py intercepts the
+  // GtkGestureZoom in capture phase and forwards begin/change/end over the
+  // bridge as a "pinch" event. x/y arrive as widget (CSS-pixel) coordinates
+  // for the webview, which fills the whole content area — #map-panel is
+  // `position: absolute; inset: 0` inside that same page, so those
+  // coordinates are already map-panel-relative and need no translation
+  // before being passed to applyZoom()'s anchor.
+  let nativePinchStartZoom = null;
+  function nativePinch(payload) {
+    if (payload.phase === "begin") {
+      const blocked = document.elementFromPoint(payload.x, payload.y)?.closest("#settings-dialog, #sensors-panel, #detail-card, #search-results");
+      nativePinchStartZoom = blocked ? null : state.zoom;
+      if (nativePinchStartZoom === null) return;
+      cancelZoomAnimation();
+      hideTransientOverlays();
+    } else if (payload.phase === "change") {
+      if (nativePinchStartZoom === null) return;
+      lastZoomAnchor = { x: payload.x, y: payload.y };
+      applyZoom(nativePinchStartZoom + Math.log2(Math.max(0.05, payload.scale)), lastZoomAnchor);
+    } else if (payload.phase === "end") {
+      if (nativePinchStartZoom === null) return;
+      nativePinchStartZoom = null;
+      animateZoomTo(Math.round(state.zoom), lastZoomAnchor || centerAnchor());
+    }
+  }
 
   $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));

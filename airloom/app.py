@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -17,12 +18,17 @@ from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 
 from . import __version__
 from .bridge import decode_message
+from .debugport import DebugPort
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
 from .location import GeoClueLocator, is_coarse_fix
 from .models import Sensor
 from .purpleair import Bounds, PurpleAirClient, PurpleAirError, bounds_around, bounds_contains
 from .store import Store
+
+# How long a debug-port `eval` command waits for evaluate_javascript to
+# call back before giving up and returning a timeout error to the client.
+DEBUG_EVAL_TIMEOUT_SECONDS = 5
 
 
 APP_ID = "ai.stealthvision.Airloom"
@@ -69,6 +75,8 @@ class AirloomApplication(Adw.Application):
         # request may label the chip, so a slow lookup for a view the user
         # already left can never overwrite a fresher name.
         self._view_name_generation = 0
+        self._pinch_gesture: Gtk.GestureZoom | None = None
+        self._debug_port: DebugPort | None = None
         self.connect("activate", self._on_activate)
 
     def _on_activate(self, _application) -> None:
@@ -111,6 +119,20 @@ class AirloomApplication(Adw.Application):
         self.webview.connect("notify::zoom-level", self._on_zoom_level_changed)
         self.webview.load_uri((RESOURCE_DIR / "index.html").as_uri())
 
+        # WebKitGTK's own gesture controller silently claims trackpad pinch
+        # as an internal page-scale zoom before the DOM ever sees a
+        # ctrl+wheel or gesture* event for it. Intercepting in the capture
+        # phase and claiming the sequence up front denies WebKit that
+        # gesture, so we can forward it to the JS map zoom instead.
+        pinch = Gtk.GestureZoom()
+        pinch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        pinch.connect("begin", self._on_native_pinch_begin)
+        pinch.connect("scale-changed", self._on_native_pinch_scale)
+        pinch.connect("end", self._on_native_pinch_end)
+        pinch.connect("cancel", self._on_native_pinch_end)
+        self.webview.add_controller(pinch)
+        self._pinch_gesture = pinch
+
         toolbar.add_top_bar(header)
         toolbar.set_content(self.webview)
         self.window.set_content(toolbar)
@@ -118,6 +140,12 @@ class AirloomApplication(Adw.Application):
         GLib.timeout_add_seconds(AUTO_REFRESH_SECONDS, self._auto_refresh)
         if self.store.data.get("home_mode") == "auto":
             self._start_locator_when_focused()
+
+        debug_socket_path = os.environ.get("AIRLOOM_DEBUG_SOCKET")
+        if debug_socket_path:
+            self._debug_port = DebugPort(debug_socket_path, self._dispatch_debug_command)
+            self._debug_port.start()
+            print(f"Airloom: debug port listening on {debug_socket_path}", file=sys.stderr)
 
     def _start_locator(self) -> None:
         if self.locator is not None:
@@ -196,6 +224,34 @@ class AirloomApplication(Adw.Application):
         # whole document and clip the overlays, so snap it straight back.
         if webview.get_zoom_level() != 1.0:
             webview.set_zoom_level(1.0)
+
+    def _pinch_centroid(self, gesture: Gtk.GestureZoom) -> tuple[float, float]:
+        ok, x, y = gesture.get_bounding_box_center()
+        if ok:
+            return x, y
+        width = self.webview.get_width() if self.webview else 0
+        height = self.webview.get_height() if self.webview else 0
+        return width / 2, height / 2
+
+    def _on_native_pinch_begin(self, gesture: Gtk.GestureZoom, _sequence) -> None:
+        if not self.webview:
+            return
+        # Claiming the sequence here is what denies WebKit's internal
+        # page-scale gesture controller the same touch sequence.
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        x, y = self._pinch_centroid(gesture)
+        self._send("pinch", {"phase": "begin", "scale": 1.0, "x": x, "y": y})
+
+    def _on_native_pinch_scale(self, gesture: Gtk.GestureZoom, scale: float) -> None:
+        if not self.webview:
+            return
+        x, y = self._pinch_centroid(gesture)
+        self._send("pinch", {"phase": "change", "scale": float(scale), "x": x, "y": y})
+
+    def _on_native_pinch_end(self, gesture: Gtk.GestureZoom, _sequence=None) -> None:
+        if not self.webview:
+            return
+        self._send("pinch", {"phase": "end"})
 
     def _on_location_fix(self, latitude, longitude, accuracy=None) -> None:
         if self.store.data.get("home_mode") != "auto":
@@ -593,6 +649,108 @@ class AirloomApplication(Adw.Application):
         payload_json = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         script = f"window.Airloom && window.Airloom.receive({event_json}, {payload_json});"
         self.webview.evaluate_javascript(script, -1, None, None, None, None, None)
+
+    # -- Debug port -------------------------------------------------------
+    # Only ever reachable when AIRLOOM_DEBUG_SOCKET is set (see _on_activate).
+    # DebugPort calls this from its own accept/serve thread, so the very
+    # first thing it must do is marshal onto the GTK main loop — nothing
+    # below this point may touch GTK/WebKit off that thread.
+
+    def _dispatch_debug_command(self, message: dict, reply) -> None:
+        def run_on_main_loop() -> bool:
+            self._handle_debug_command(message, reply)
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(run_on_main_loop)
+
+    def _handle_debug_command(self, message: dict, reply) -> None:
+        cmd = message.get("cmd")
+        if cmd == "ping":
+            reply({"ok": True, "result": {"pong": True}})
+        elif cmd == "eval":
+            self._debug_eval(message, reply)
+        elif cmd == "pinch":
+            self._debug_pinch(message, reply)
+        else:
+            reply({"ok": False, "error": f"unknown cmd: {cmd!r}"})
+
+    def _debug_pinch(self, message: dict, reply) -> None:
+        phase = message.get("phase")
+        if phase not in ("begin", "change", "end"):
+            reply({"ok": False, "error": f"invalid pinch phase: {phase!r}"})
+            return
+        try:
+            payload: dict = {"phase": phase}
+            if phase in ("begin", "change"):
+                scale = float(message.get("scale"))
+                if not scale > 0:
+                    raise ValueError("scale must be > 0")
+                payload["scale"] = scale
+                payload["x"] = float(message.get("x"))
+                payload["y"] = float(message.get("y"))
+        except (TypeError, ValueError) as exc:
+            reply({"ok": False, "error": f"invalid pinch params: {exc}"})
+            return
+        self._send("pinch", payload)
+        reply({"ok": True, "result": {"sent": True}})
+
+    def _debug_eval(self, message: dict, reply) -> None:
+        js = message.get("js")
+        if not isinstance(js, str):
+            reply({"ok": False, "error": "eval requires a string 'js' field"})
+            return
+        if not self.webview:
+            reply({"ok": False, "error": "webview not available"})
+            return
+
+        done = False
+        timeout_id: list[int | None] = [None]
+
+        def finish(response: dict) -> None:
+            nonlocal done
+            if done:
+                return
+            done = True
+            if timeout_id[0] is not None:
+                GLib.source_remove(timeout_id[0])
+                timeout_id[0] = None
+            reply(response)
+
+        def on_timeout() -> bool:
+            timeout_id[0] = None
+            finish({"ok": False, "error": "eval timed out"})
+            return GLib.SOURCE_REMOVE
+
+        timeout_id[0] = GLib.timeout_add_seconds(DEBUG_EVAL_TIMEOUT_SECONDS, on_timeout)
+
+        def on_result(webview, task, _data) -> None:
+            try:
+                value = webview.evaluate_javascript_finish(task)
+            except GLib.Error as exc:
+                finish({"ok": False, "error": str(exc)})
+                return
+            if value is None:
+                finish({"ok": True, "result": None})
+                return
+            raw = None
+            try:
+                raw = value.to_json(0)
+            except Exception:  # noqa: BLE001 — fall back to to_string below
+                pass
+            if raw is None:
+                try:
+                    raw = value.to_string()
+                except Exception:  # noqa: BLE001 — genuinely unrepresentable result
+                    raw = None
+            result = raw
+            if raw is not None:
+                try:
+                    result = json.loads(raw)
+                except (TypeError, ValueError):
+                    result = raw
+            finish({"ok": True, "result": result})
+
+        self.webview.evaluate_javascript(js, -1, None, None, None, on_result, None)
 
     def _show_about(self, _button) -> None:
         if not self.window:
