@@ -18,6 +18,7 @@
     // Name of the area currently in view (reverse-geocoded by Python);
     // overrides the configured home name on the summary chip until replaced.
     viewName: null,
+    popupId: null,
   };
 
   const bridge = (message) => {
@@ -83,6 +84,10 @@
     stampPlaceName();
     $("#data-source").textContent = state.source;
     renderAll();
+    if (state.popupId !== null) {
+      const open = state.sensors.find((s) => s.id === state.popupId);
+      open ? showPopup(open) : hidePopup();
+    }
   }
 
   function renderAll() {
@@ -146,6 +151,30 @@
 
   function selectedSensor() {
     return state.sensors.find((sensor) => sensor.id === state.selectedId);
+  }
+
+  function showPopup(sensor) {
+    const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+    const popup = $("#map-popup");
+    popup.style.left = `${point.x}px`;
+    popup.style.top = `${point.y}px`;
+    $("#popup-aqi").textContent = sensor.aqi ?? "—";
+    $("#popup-aqi").style.background = sensor.color || "";
+    $("#popup-aqi").style.color = sensor.foreground || "";
+    $("#popup-name").textContent = sensor.name;
+    $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
+    $("#popup-favorite").classList.toggle("active", Boolean(sensor.favorite));
+    const demo = (state.source || "").includes("Demo");
+    const link = $("#popup-purpleair");
+    link.hidden = demo; // demo sensor ids do not exist on the public map
+    if (!demo) link.href = `https://map.purpleair.com/1/mAQI/a10/p604800/cC0?select=${sensor.id}#14/${sensor.latitude}/${sensor.longitude}`;
+    popup.hidden = false;
+    state.popupId = sensor.id;
+  }
+
+  function hidePopup() {
+    $("#map-popup").hidden = true;
+    state.popupId = null;
   }
 
   function renderDetail() {
@@ -266,6 +295,7 @@
     const transform = `translate(${-view.left}px, ${-view.top}px)`;
     $("#tiles").style.transform = transform;
     $("#markers").style.transform = transform;
+    $("#popup-layer").style.transform = transform;
   }
 
   function renderMapMarkers() {
@@ -279,7 +309,7 @@
       return `<button class="map-marker${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
     });
     $("#markers").innerHTML = markers.join("");
-    $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), true); }));
+    $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), false); const sensor = state.sensors.find((s) => s.id === Number(marker.dataset.id)); if (sensor) showPopup(sensor); }));
     updateMapTransform();
   }
 
@@ -331,6 +361,7 @@
   }
 
   function zoom(delta) {
+    hidePopup();
     state.zoom = Math.max(3, Math.min(17, state.zoom + delta));
     renderMap();
     scheduleViewChanged();
@@ -453,13 +484,16 @@
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
     if (event.key === "Escape" && !$("#settings-dialog").open) {
-      if (!$("#search-results").hidden) $("#search-results").hidden = true;
+      if (!$("#map-popup").hidden) hidePopup();
+      else if (!$("#search-results").hidden) $("#search-results").hidden = true;
       else if (!$("#detail-card").hidden) $("#detail-card").hidden = true;
       else $("#sensors-panel").hidden = true;
     }
   });
   $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
+  $("#popup-details").addEventListener("click", () => { $("#detail-card").hidden = false; renderDetail(); hidePopup(); });
+  $("#popup-favorite").addEventListener("click", () => { if (state.popupId !== null) { if (window.webkit?.messageHandlers?.airloom) bridge({ action: "favorite", id: state.popupId }); else { const sensor = state.sensors.find((s) => s.id === state.popupId); if (sensor) { sensor.favorite = !sensor.favorite; renderAll(); showPopup(sensor); } } } });
   $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); zoom(1); });
   $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); zoom(-1); });
   $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); flyTo(state.home.lat, state.home.lon); });
@@ -471,7 +505,7 @@
     legend.hidden = !legend.hidden;
     $("#legend-chip").setAttribute("aria-expanded", String(!legend.hidden));
   });
-  $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
+  $("#map-panel").addEventListener("pointerdown", (event) => { hidePopup(); if (event.target.closest("button, a, .map-popup")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
   $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
