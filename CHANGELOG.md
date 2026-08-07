@@ -2,7 +2,7 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
-## Unreleased
+## 0.2.3 — 2026-08-07
 
 - Fixed startup location detection on GNOME: the GeoClue request now waits until the app window has focus, so the system location-permission dialog can actually appear instead of crashing and reading as a denial (fresh installs were stuck on the shipped default location).
 - A location fix that arrives after the detection timeout (for example while the permission dialog is open) is now applied instead of being dropped for the session, and the timeout was raised from 10 to 45 seconds so the permission dialog can be answered calmly.

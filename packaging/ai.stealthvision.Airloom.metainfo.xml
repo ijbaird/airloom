@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.2.3" date="2026-08-07">
+      <description><p>Location detection now works on first launch: the permission request waits for the app window to gain focus so GNOME's location dialog can appear, a fix arriving after the detection timeout is still applied, and a failed first-run detection is reported honestly instead of showing the default area as a known location.</p></description>
+    </release>
     <release version="0.2.2" date="2026-08-06">
       <description><p>Small towns are now labeled by name rather than by their county.</p></description>
     </release>
