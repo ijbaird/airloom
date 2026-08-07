@@ -28,6 +28,7 @@ from .store import Store
 APP_ID = "ai.stealthvision.Airloom"
 RESOURCE_DIR = Path(__file__).parent / "resources"
 AUTO_REFRESH_SECONDS = 300
+LOCATOR_FOCUS_FALLBACK_SECONDS = 20
 
 
 class AirloomApplication(Adw.Application):
@@ -42,6 +43,8 @@ class AirloomApplication(Adw.Application):
         self.refreshing = False
         self.pending_fetch: tuple | None = None
         self.locator: GeoClueLocator | None = None
+        self._locator_focus_handler: int | None = None
+        self._locator_focus_fallback: int | None = None
         self.view_bounds: Bounds | None = None
         # Where the user is currently looking, stamped as one (bounds, center)
         # pair so the auto-refresh timer can never combine a stale half.
@@ -94,8 +97,46 @@ class AirloomApplication(Adw.Application):
         self.window.present()
         GLib.timeout_add_seconds(AUTO_REFRESH_SECONDS, self._auto_refresh)
         if self.store.data.get("home_mode") == "auto":
-            self.locator = GeoClueLocator()
-            self.locator.start(self._on_location_fix)
+            self._start_locator_when_focused()
+
+    def _start_locator(self) -> None:
+        self.locator = GeoClueLocator()
+        self.locator.start(self._on_location_fix)
+
+    def _start_locator_when_focused(self) -> None:
+        # GNOME Shell only shows the location-permission dialog for the
+        # focused app; a request fired before our window is focused crashes
+        # the dialog and comes back as a denial (gnome-shell#7548). Wait for
+        # focus so the dialog can attach to our window.
+        if self.window.is_active():
+            self._start_locator()
+            return
+        self._locator_focus_handler = self.window.connect(
+            "notify::is-active", self._on_window_active_for_locator
+        )
+        self._locator_focus_fallback = GLib.timeout_add_seconds(
+            LOCATOR_FOCUS_FALLBACK_SECONDS, self._on_locator_focus_fallback
+        )
+
+    def _on_window_active_for_locator(self, window, _pspec) -> None:
+        if not window.is_active():
+            return
+        self._clear_locator_focus_wait()
+        self._start_locator()
+
+    def _on_locator_focus_fallback(self) -> bool:
+        self._locator_focus_fallback = None
+        self._clear_locator_focus_wait()
+        self._start_locator()
+        return GLib.SOURCE_REMOVE
+
+    def _clear_locator_focus_wait(self) -> None:
+        if self._locator_focus_handler is not None:
+            self.window.disconnect(self._locator_focus_handler)
+            self._locator_focus_handler = None
+        if self._locator_focus_fallback is not None:
+            GLib.source_remove(self._locator_focus_fallback)
+            self._locator_focus_fallback = None
 
     def _auto_refresh(self) -> bool:
         # Refresh whatever the user is currently looking at, not home — a user
@@ -326,8 +367,9 @@ class AirloomApplication(Adw.Application):
             self.title.set_subtitle(self.store.data["location_name"])
         self._send("config", self.store.public_config())
         if home_mode == "auto" and previous_mode != "auto":
-            self.locator = GeoClueLocator()
-            self.locator.start(self._on_location_fix)
+            # The user just clicked Save in our UI, so the window is focused
+            # and the permission dialog (if any) can appear immediately.
+            self._start_locator()
         if home_mode == "fixed":
             # Glide the map to the newly pinned home instead of leaving it
             # wherever the user happened to be looking when they saved.
