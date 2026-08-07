@@ -51,8 +51,10 @@ class GeocodeTest(unittest.TestCase):
 
     def test_reverse_prefers_smallest_locality(self):
         payload = {"address": {"town": "Tahoe City", "county": "Placer County", "state": "California"}}
-        with mock.patch.object(geocode.urllib.request, "urlopen", return_value=fake_response(payload)):
+        with mock.patch.object(geocode.urllib.request, "urlopen", return_value=fake_response(payload)) as spy:
             self.assertEqual(reverse(39.1677, -120.1452), "Tahoe City")
+        # Town-level zoom: city-level (10) collapses small towns into counties.
+        self.assertIn("zoom=14", spy.call_args[0][0].full_url)
 
     def test_reverse_falls_back_to_coordinates(self):
         with mock.patch.object(geocode.urllib.request, "urlopen", return_value=fake_response({})):

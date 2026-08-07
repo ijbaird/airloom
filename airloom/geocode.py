@@ -46,9 +46,12 @@ def search(query: str, limit: int = 5, timeout: int = 10) -> list[Place]:
 
 
 def reverse(latitude: float, longitude: float, timeout: int = 10) -> str:
+    # Zoom 14 resolves small towns (village/town keys) that city-level zoom
+    # collapses into their county; the key preference below still favors the
+    # town/city name over broader divisions for urban areas.
     payload = _request(
         REVERSE_URL,
-        {"lat": f"{latitude:.6f}", "lon": f"{longitude:.6f}", "format": "jsonv2", "zoom": "10"},
+        {"lat": f"{latitude:.6f}", "lon": f"{longitude:.6f}", "format": "jsonv2", "zoom": "14"},
         timeout,
     )
     if isinstance(payload, dict):
