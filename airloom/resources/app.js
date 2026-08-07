@@ -15,6 +15,9 @@
     placeResults: [],
     homeSearchActive: false,
     positioned: false,
+    // Name of the area currently in view (reverse-geocoded by Python);
+    // overrides the configured home name on the summary chip until replaced.
+    viewName: null,
   };
 
   const bridge = (message) => {
@@ -31,6 +34,7 @@
       if (event === "error") toast(payload.message);
       if (event === "open-settings") openSettings(payload);
       if (event === "location") applyLocation(payload);
+      if (event === "view-name" && payload.name) { state.viewName = payload.name; stampPlaceName(); }
       if (event === "places") {
         if (state.homeSearchActive) {
           if (payload.query === $("#home-place-input").value.trim()) renderHomePlaceResults(payload.results || [], payload.error);
@@ -39,12 +43,20 @@
     },
   };
 
+  function stampPlaceName() {
+    $("#place-name").textContent = state.viewName || state.config.location_name;
+  }
+
   function applyLocation(payload) {
     const lat = Number(payload.latitude), lon = Number(payload.longitude);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
     state.home = { lat, lon };
     state.positioned = true;
-    if (payload.name) $("#place-name").textContent = payload.name;
+    // A location event re-homes the map, so the view label is the home label
+    // again; a later view-name event relabels it if the user navigates away.
+    state.viewName = null;
+    if (payload.name) state.config.location_name = payload.name;
+    stampPlaceName();
     if (payload.source === "geoclue" || payload.source === "fixed") flyTo(lat, lon);
   }
 
@@ -59,7 +71,7 @@
         state.positioned = true;
       }
     }
-    $("#place-name").textContent = state.config.location_name;
+    stampPlaceName();
     renderMap();
   }
 
@@ -68,7 +80,7 @@
     state.selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
     state.source = payload.source || "Demo data";
     state.config = { ...state.config, ...(payload.config || {}) };
-    $("#place-name").textContent = state.config.location_name;
+    stampPlaceName();
     $("#data-source").textContent = state.source;
     renderAll();
   }
@@ -381,7 +393,18 @@
     state.placeResults = places;
     box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
       if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true); }
-      else { const place = state.placeResults[Number(button.dataset.index)]; if (place) flyTo(place.latitude, place.longitude); }
+      else {
+        const place = state.placeResults[Number(button.dataset.index)];
+        if (place) {
+          // The query was a navigation target, not a sensor filter; leaving it
+          // set would hide every sensor fetched at the destination.
+          state.query = "";
+          $("#search").value = "";
+          renderLists();
+          renderMapMarkers();
+          flyTo(place.latitude, place.longitude);
+        }
+      }
       box.hidden = true;
     }));
   }

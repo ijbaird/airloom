@@ -50,6 +50,10 @@ class AirloomApplication(Adw.Application):
         # pair so the auto-refresh timer can never combine a stale half.
         self.current_view: tuple[Bounds, tuple[float, float]] | None = None
         self.view_fetched_at = 0.0
+        # Monotonic ticket for view-center reverse lookups: only the newest
+        # request may label the chip, so a slow lookup for a view the user
+        # already left can never overwrite a fresher name.
+        self._view_name_generation = 0
         self.connect("activate", self._on_activate)
 
     def _on_activate(self, _application) -> None:
@@ -327,6 +331,30 @@ class AirloomApplication(Adw.Application):
         if self.view_bounds is not None and fresh and bounds_contains(self.view_bounds, view):
             return
         self._start_fetch(view, center, include_favorites=False)
+        self._start_view_label(*center)
+
+    def _start_view_label(self, latitude: float, longitude: float) -> None:
+        """Label the summary chip with the area the user is now looking at."""
+        self._view_name_generation += 1
+        threading.Thread(
+            target=self._view_label_worker,
+            args=(latitude, longitude, self._view_name_generation),
+            name="airloom-viewgeo",
+            daemon=True,
+        ).start()
+
+    def _view_label_worker(self, latitude: float, longitude: float, generation: int) -> None:
+        try:
+            name = reverse_geocode(latitude, longitude)
+        except GeocodeError as exc:
+            print(f"Airloom: {exc}", file=sys.stderr)
+            name = f"{latitude:.2f}, {longitude:.2f}"
+        GLib.idle_add(self._apply_view_name, name, generation)
+
+    def _apply_view_name(self, name: str, generation: int) -> bool:
+        if generation == self._view_name_generation:
+            self._send("view-name", {"name": name})
+        return GLib.SOURCE_REMOVE
 
     def _on_place_search(self, message: dict) -> None:
         query = str(message.get("query") or "").strip()[:120]
