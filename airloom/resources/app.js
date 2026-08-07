@@ -667,7 +667,11 @@
   });
   $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button, a, .map-popup")) return; hideTransientOverlays(); state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
-  $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); renderMapMarkers(); });
+  // Rebuild (re-cull) markers only after an actual drag: rebuilding on every
+  // pointerup destroys a pressed marker between pointerup and click, so the
+  // click never fires and markers are unclickable. state.drag is never set
+  // for marker presses (pointerdown early-returns on buttons).
+  $("#map-panel").addEventListener("pointerup", (event) => { const dragged = state.drag !== null; state.drag = null; event.currentTarget.classList.remove("dragging"); if (dragged) renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
   $("#map-panel").addEventListener("wheel", (event) => {
     if (event.ctrlKey) return; // pinch path; the document-level handler owns it
