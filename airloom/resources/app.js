@@ -12,6 +12,9 @@
     zoom: 12,
     drag: null,
     query: "",
+    placeResults: [],
+    homeSearchActive: false,
+    positioned: false,
   };
 
   const bridge = (message) => {
@@ -27,8 +30,23 @@
       if (event === "loading") document.body.classList.toggle("loading", payload.active);
       if (event === "error") toast(payload.message);
       if (event === "open-settings") openSettings(payload);
+      if (event === "location") applyLocation(payload);
+      if (event === "places") {
+        if (state.homeSearchActive) {
+          if (payload.query === $("#home-place-input").value.trim()) renderHomePlaceResults(payload.results || [], payload.error);
+        } else if (payload.query === state.query.trim()) renderSearchResults(payload.results || [], payload.error);
+      }
     },
   };
+
+  function applyLocation(payload) {
+    const lat = Number(payload.latitude), lon = Number(payload.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    state.home = { lat, lon };
+    state.positioned = true;
+    if (payload.name) $("#place-name").textContent = payload.name;
+    if (payload.source === "geoclue" || payload.source === "fixed") flyTo(lat, lon);
+  }
 
   function applyConfig(config) {
     state.config = { ...state.config, ...config };
@@ -36,7 +54,10 @@
     const lon = Number(state.config.longitude);
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
       state.home = { lat, lon };
-      state.center = { ...state.home };
+      if (!state.positioned && Number.isFinite(state.home.lat) && Number.isFinite(state.home.lon)) {
+        state.center = { ...state.home };
+        state.positioned = true;
+      }
     }
     $("#place-name").textContent = state.config.location_name;
     renderMap();
@@ -67,14 +88,14 @@
       $("#summary-aqi").style.background = "";
       $("#summary-aqi").style.color = "";
       $("#summary-label").textContent = "No readings";
-      $("#summary-subtitle").textContent = "No sensors reporting in range";
+      $("#summary-chip").title = "No sensors reporting in range";
       return;
     }
     $("#summary-aqi").textContent = sensor.aqi;
     $("#summary-aqi").style.background = sensor.color;
     $("#summary-aqi").style.color = sensor.foreground;
     $("#summary-label").textContent = sensor.category;
-    $("#summary-subtitle").textContent = `${valid.length} outdoor sensors in range`;
+    $("#summary-chip").title = `${valid.length} sensors reporting`;
   }
 
   function visibleSensors() {
@@ -108,7 +129,7 @@
     renderLists();
     renderMapMarkers();
     renderDetail();
-    if (revealDetail) document.body.classList.add("show-detail");
+    if (revealDetail) $("#detail-card").hidden = false;
   }
 
   function selectedSensor() {
@@ -118,19 +139,7 @@
   function renderDetail() {
     const sensor = selectedSensor();
     if (!sensor) {
-      $("#sensor-name").textContent = "Choose a sensor";
-      $("#aqi-number").textContent = "—";
-      $("#aqi-number").style.color = "";
-      $("#aqi-category").textContent = "Unavailable";
-      $("#temperature").textContent = "—";
-      $("#humidity").textContent = "—";
-      $("#pm25").textContent = "—";
-      $("#pm10").textContent = "—";
-      $("#guidance").textContent = "Select a nearby sensor to see current guidance.";
-      $("#favorite-button").classList.remove("active");
-      $("#updated-time").textContent = "Waiting for data";
-      $("#chart").innerHTML = "";
-      $("#trend-direction").textContent = "—";
+      $("#detail-card").hidden = true;
       return;
     }
     $("#sensor-name").textContent = sensor.name;
@@ -189,58 +198,145 @@
     return { lat, lon };
   }
 
-  function renderMap() {
+  let tileLayer = { zoom: null, tiles: new Map() };
+
+  function mapViewport() {
     const panel = $("#map-panel");
-    if (!panel.clientWidth || !panel.clientHeight) return;
     const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
-    const left = center.x - panel.clientWidth / 2;
-    const top = center.y - panel.clientHeight / 2;
-    const tiles = [];
+    return {
+      panel,
+      left: center.x - panel.clientWidth / 2,
+      top: center.y - panel.clientHeight / 2,
+      width: panel.clientWidth,
+      height: panel.clientHeight,
+    };
+  }
+
+  function renderMap() {
+    const view = mapViewport();
+    if (!view.width || !view.height) return;
+    const layer = $("#tiles");
+    if (tileLayer.zoom !== state.zoom) {
+      layer.textContent = "";
+      tileLayer = { zoom: state.zoom, tiles: new Map() };
+    }
     const maxTile = 2 ** state.zoom;
-    for (let ty = Math.floor(top / 256); ty <= Math.floor((top + panel.clientHeight) / 256); ty++) {
+    const needed = new Set();
+    for (let ty = Math.floor(view.top / 256); ty <= Math.floor((view.top + view.height) / 256); ty++) {
       if (ty < 0 || ty >= maxTile) continue;
-      for (let tx = Math.floor(left / 256); tx <= Math.floor((left + panel.clientWidth) / 256); tx++) {
-        const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
-        tiles.push(`<img class="tile" draggable="false" alt="" src="https://tile.openstreetmap.org/${state.zoom}/${wrappedX}/${ty}.png" style="left:${tx * 256 - left}px;top:${ty * 256 - top}px">`);
+      for (let tx = Math.floor(view.left / 256); tx <= Math.floor((view.left + view.width) / 256); tx++) {
+        const key = `${tx}/${ty}`;
+        needed.add(key);
+        if (!tileLayer.tiles.has(key)) {
+          const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
+          const img = document.createElement("img");
+          img.className = "tile";
+          img.draggable = false;
+          img.alt = "";
+          img.src = `https://tile.openstreetmap.org/${state.zoom}/${wrappedX}/${ty}.png`;
+          img.style.left = `${tx * 256}px`;
+          img.style.top = `${ty * 256}px`;
+          layer.appendChild(img);
+          tileLayer.tiles.set(key, img);
+        }
       }
     }
-    $("#tiles").innerHTML = tiles.join("");
+    for (const [key, img] of tileLayer.tiles) {
+      if (!needed.has(key)) { img.remove(); tileLayer.tiles.delete(key); }
+    }
+    updateMapTransform();
     renderMapMarkers();
   }
 
+  function updateMapTransform() {
+    const view = mapViewport();
+    if (!view.width) return;
+    const transform = `translate(${-view.left}px, ${-view.top}px)`;
+    $("#tiles").style.transform = transform;
+    $("#markers").style.transform = transform;
+  }
+
   function renderMapMarkers() {
-    const panel = $("#map-panel");
-    if (!panel.clientWidth) return;
-    const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
+    const view = mapViewport();
+    if (!view.width) return;
+    const pad = 300; // generous cull margin so mid-pan gaps are rare
     const markers = visibleSensors().map((sensor) => {
       const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
-      const x = point.x - center.x + panel.clientWidth / 2;
-      const y = point.y - center.y + panel.clientHeight / 2;
-      if (x < -40 || y < -40 || x > panel.clientWidth + 40 || y > panel.clientHeight + 40) return "";
-      return `<button class="map-marker${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${x}px;top:${y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
+      if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
+          point.y < view.top - pad || point.y > view.top + view.height + pad) return "";
+      return `<button class="map-marker${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
     });
     $("#markers").innerHTML = markers.join("");
     document.querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), true); }));
+    updateMapTransform();
+  }
+
+  let viewTimer = null;
+  function scheduleViewChanged() {
+    clearTimeout(viewTimer);
+    viewTimer = setTimeout(sendViewChanged, 1200);
+  }
+  function sendViewChanged() {
+    const view = mapViewport();
+    if (!view.width) return;
+    const nw = inverseWorld(view.left, view.top, state.zoom);
+    const se = inverseWorld(view.left + view.width, view.top + view.height, state.zoom);
+    bridge({ action: "view-changed", north: nw.lat, west: nw.lon, south: se.lat, east: se.lon, lat: state.center.lat, lon: state.center.lon, zoom: state.zoom });
+  }
+
+  let flyGeneration = 0;
+  function flyTo(lat, lon, durationMs = 600) {
+    const from = { ...state.center };
+    const start = performance.now();
+    const gen = ++flyGeneration;
+    function step(now) {
+      if (gen !== flyGeneration) return;
+      const t = Math.min(1, (now - start) / durationMs);
+      const ease = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+      state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (lon - from.lon) * ease };
+      renderMap();
+      if (t < 1) requestAnimationFrame(step);
+      else scheduleViewChanged();
+    }
+    requestAnimationFrame(step);
   }
 
   function panBy(dx, dy) {
     const center = worldPoint(state.center.lat, state.center.lon, state.zoom);
     state.center = inverseWorld(center.x - dx, center.y - dy, state.zoom);
-    renderMap();
+    const view = mapViewport();
+    // Cheap per-frame path: move layers; only re-diff tiles when the view
+    // crosses outside the currently materialized tile ring.
+    updateMapTransform();
+    scheduleViewChanged();
+    const tx0 = Math.floor(view.left / 256), ty0 = Math.floor(view.top / 256);
+    const tx1 = Math.floor((view.left + view.width) / 256), ty1 = Math.floor((view.top + view.height) / 256);
+    for (let ty = ty0; ty <= ty1; ty++) {
+      for (let tx = tx0; tx <= tx1; tx++) {
+        if (!tileLayer.tiles.has(`${tx}/${ty}`) && ty >= 0 && ty < 2 ** state.zoom) { renderMap(); return; }
+      }
+    }
   }
 
   function zoom(delta) {
     state.zoom = Math.max(3, Math.min(17, state.zoom + delta));
     renderMap();
+    scheduleViewChanged();
   }
 
   function openSettings(config = state.config) {
     if ($("#settings-dialog").open) return;
     const form = $("#settings-form");
-    for (const field of ["location_name", "latitude", "longitude", "radius_km", "alert_threshold"]) form.elements[field].value = config[field];
+    for (const field of ["radius_km", "alert_threshold"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;
     form.elements.temperature_unit.value = config.temperature_unit || "F";
+    form.elements.home_mode.value = config.home_mode || "auto";
+    $("#home-place-row").hidden = form.elements.home_mode.value !== "fixed";
+    form.elements.home_lat.value = config.latitude;
+    form.elements.home_lon.value = config.longitude;
+    form.elements.location_name.value = config.location_name || "";
+    $("#home-place-status").textContent = config.home_mode === "fixed" ? `Fixed: ${config.location_name}` : "No fixed home chosen";
     $("#key-status").textContent = config.has_api_key ? `Saved key ${config.api_key_hint}` : "No key saved — demo mode";
     $("#settings-dialog").showModal();
   }
@@ -271,6 +367,41 @@
     return String(value).replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   }
 
+  function renderSearchResults(places, error) {
+    const box = $("#search-results");
+    const query = state.query.trim().toLowerCase();
+    const sensors = query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query)).slice(0, 4) : [];
+    if (!sensors.length && !places.length && !error) { box.hidden = true; box.innerHTML = ""; return; }
+    let html = "";
+    if (sensors.length) html += '<div class="group">Sensors</div>' + sensors.map((s) => `<button data-kind="sensor" data-id="${s.id}">${escapeHtml(s.name)} · AQI ${s.aqi ?? "—"}</button>`).join("");
+    if (places.length) html += '<div class="group">Places</div>' + places.map((p, i) => `<button data-kind="place" data-index="${i}">${escapeHtml(p.name)}</button>`).join("");
+    if (error) html += `<div class="group">${escapeHtml(error)}</div>`;
+    box.innerHTML = html;
+    box.hidden = false;
+    state.placeResults = places;
+    box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true); }
+      else { const place = state.placeResults[Number(button.dataset.index)]; if (place) flyTo(place.latitude, place.longitude); }
+      box.hidden = true;
+    }));
+  }
+
+  function renderHomePlaceResults(places, error) {
+    const box = $("#home-place-results");
+    box.innerHTML = error ? `<div class="group">${escapeHtml(error)}</div>` : places.map((p, i) => `<button type="button" data-index="${i}">${escapeHtml(p.name)}</button>`).join("");
+    box.hidden = false;
+    box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
+      const place = places[Number(button.dataset.index)];
+      const form = $("#settings-form");
+      form.elements.home_lat.value = place.latitude;
+      form.elements.home_lon.value = place.longitude;
+      form.elements.location_name.value = place.name.split(",")[0];
+      $("#home-place-status").textContent = `Fixed: ${place.name}`;
+      box.hidden = true;
+      state.homeSearchActive = false;
+    }));
+  }
+
   function browserPreviewData() {
     const readings = [18, 34, 47, 56, 72, 88, 109, 43, 63, 31, 81, 52];
     const names = ["Alberta Arts", "Laurelhurst Park", "Mount Tabor", "Sellwood Garden", "Buckman School", "Overlook Bluff", "St. Johns North", "Hawthorne Ridge", "Woodstock Library", "Council Crest", "Irvington Air", "Rose City Park"];
@@ -282,27 +413,57 @@
     });
   }
 
-  $("#search").addEventListener("input", (event) => { state.query = event.target.value; renderLists(); renderMapMarkers(); });
+  let placeTimer = null;
+  $("#search").addEventListener("input", (event) => {
+    state.query = event.target.value;
+    renderLists();
+    renderMapMarkers();
+    renderSearchResults([]);
+    clearTimeout(placeTimer);
+    if (state.query.trim().length >= 3) placeTimer = setTimeout(() => bridge({ action: "place-search", query: state.query.trim() }), 450);
+  });
+  $("#search").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && state.query.trim().length >= 2) bridge({ action: "place-search", query: state.query.trim() });
+  });
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
-    if (event.key === "Escape" && !$("#settings-dialog").open) document.body.classList.remove("show-detail");
+    if (event.key === "Escape" && !$("#settings-dialog").open) {
+      if (!$("#search-results").hidden) $("#search-results").hidden = true;
+      else if (!$("#detail-card").hidden) $("#detail-card").hidden = true;
+      else $("#sensors-panel").hidden = true;
+    }
   });
   $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
   $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); zoom(1); });
   $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); zoom(-1); });
-  $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); state.center = { ...state.home }; renderMap(); });
-  $("#show-map").addEventListener("click", () => { document.body.classList.add("show-map"); setTimeout(renderMap, 250); });
-  $("#show-list").addEventListener("click", (event) => { event.stopPropagation(); document.body.classList.remove("show-map"); });
-  $("#back-to-map").addEventListener("click", () => document.body.classList.remove("show-detail"));
+  $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); flyTo(state.home.lat, state.home.lon); });
+  $("#sensors-button").addEventListener("click", () => { $("#sensors-panel").hidden = !$("#sensors-panel").hidden; });
+  $("#close-sensors").addEventListener("click", () => { $("#sensors-panel").hidden = true; });
+  $("#close-detail").addEventListener("click", () => { $("#detail-card").hidden = true; });
+  $("#legend-chip").addEventListener("click", () => {
+    const legend = $("#legend");
+    legend.hidden = !legend.hidden;
+    $("#legend-chip").setAttribute("aria-expanded", String(!legend.hidden));
+  });
   $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button")) return; state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
-  $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
+  $("#map-panel").addEventListener("pointerup", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
   $("#map-panel").addEventListener("wheel", (event) => { event.preventDefault(); zoom(event.deltaY < 0 ? 1 : -1); }, { passive: false });
   $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
+  $("#settings-dialog").addEventListener("close", () => { state.homeSearchActive = false; });
+  document.querySelectorAll('input[name="home_mode"]').forEach((radio) => radio.addEventListener("change", () => {
+    $("#home-place-row").hidden = $("#settings-form").elements.home_mode.value !== "fixed";
+  }));
+  let homePlaceTimer = null;
+  $("#home-place-input").addEventListener("input", (event) => {
+    clearTimeout(homePlaceTimer);
+    const query = event.target.value.trim();
+    if (query.length >= 3) homePlaceTimer = setTimeout(() => { state.homeSearchActive = true; bridge({ action: "place-search", query }); }, 450);
+  });
   $("#settings-form").addEventListener("submit", (event) => {
     const submitter = event.submitter;
     if (!submitter || submitter.id !== "save-settings") return;
@@ -311,7 +472,7 @@
     bridge({
       action: "save-settings",
       api_key: form.get("api_key"), clear_api_key: form.get("clear_api_key") === "on",
-      location_name: form.get("location_name"), latitude: form.get("latitude"), longitude: form.get("longitude"),
+      home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
       radius_km: form.get("radius_km"), alert_threshold: form.get("alert_threshold"), temperature_unit: form.get("temperature_unit"),
     });
     $("#settings-dialog").close();

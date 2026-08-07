@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 import gi
@@ -17,8 +18,10 @@ from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 from . import __version__
 from .bridge import decode_message
 from .demo import demo_sensors
+from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
+from .location import GeoClueLocator
 from .models import Sensor
-from .purpleair import PurpleAirClient, PurpleAirError, bounds_around
+from .purpleair import Bounds, PurpleAirClient, PurpleAirError, bounds_around, bounds_contains
 from .store import Store
 
 
@@ -37,7 +40,11 @@ class AirloomApplication(Adw.Application):
         self.sensors: list[Sensor] = []
         self.selected_id: int | None = None
         self.refreshing = False
-        self.refresh_pending = False
+        self.pending_fetch: tuple | None = None
+        self.locator: GeoClueLocator | None = None
+        self.view_bounds: Bounds | None = None
+        self.view_center: tuple[float, float] | None = None
+        self.view_fetched_at = 0.0
         self.connect("activate", self._on_activate)
 
     def _on_activate(self, _application) -> None:
@@ -84,9 +91,19 @@ class AirloomApplication(Adw.Application):
         self.window.set_content(toolbar)
         self.window.present()
         GLib.timeout_add_seconds(AUTO_REFRESH_SECONDS, self._auto_refresh)
+        if self.store.data.get("home_mode") == "auto":
+            self.locator = GeoClueLocator()
+            self.locator.start(self._on_location_fix)
 
     def _auto_refresh(self) -> bool:
-        self.refresh()
+        # Refresh whatever the user is currently looking at, not home — a user
+        # who panned elsewhere shouldn't watch their markers get replaced by
+        # home-area sensors every 5 minutes. Favorites are still folded in so
+        # the alert check keeps covering starred sensors regardless of view.
+        if self.view_bounds is not None and self.view_center is not None:
+            self._start_fetch(self.view_bounds, self.view_center, include_favorites=True)
+        else:
+            self.refresh()
         return GLib.SOURCE_CONTINUE
 
     def _on_decide_policy(self, _webview, decision, decision_type) -> bool:
@@ -105,6 +122,56 @@ class AirloomApplication(Adw.Application):
         if uri.startswith(("http://", "https://")) and self.window:
             Gtk.UriLauncher.new(uri).launch(self.window, None, None)
         return True
+
+    def _on_location_fix(self, latitude, longitude) -> None:
+        if self.store.data.get("home_mode") != "auto":
+            # A delayed fix from a locator started under auto mode must not
+            # clobber coordinates the user has since pinned in fixed mode.
+            return
+        if latitude is None or longitude is None:
+            self._send(
+                "location",
+                {
+                    "latitude": self.store.data["latitude"],
+                    "longitude": self.store.data["longitude"],
+                    "name": self.store.data["location_name"],
+                    "source": "fallback",
+                },
+            )
+            self._send("error", {"message": "Using last known location."})
+            return
+        self.store.data.update({"latitude": float(latitude), "longitude": float(longitude)})
+        self.store.save()
+        self._send(
+            "location",
+            {
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+                "name": self.store.data["location_name"],
+                "source": "geoclue",
+            },
+        )
+        self.refresh()
+        threading.Thread(
+            target=self._reverse_label_worker, args=(float(latitude), float(longitude)), name="airloom-revgeo", daemon=True
+        ).start()
+
+    def _reverse_label_worker(self, latitude: float, longitude: float) -> None:
+        try:
+            name = reverse_geocode(latitude, longitude)
+        except GeocodeError as exc:
+            print(f"Airloom: {exc}", file=sys.stderr)
+            name = f"{latitude:.2f}, {longitude:.2f}"
+        GLib.idle_add(self._apply_location_name, name)
+
+    def _apply_location_name(self, name: str) -> bool:
+        if self.store.data.get("home_mode") == "auto":
+            self.store.data["location_name"] = name[:80]
+            self.store.save()
+            if self.title:
+                self.title.set_subtitle(name[:80])
+            self._send("config", self.store.public_config())
+        return GLib.SOURCE_REMOVE
 
     def _on_script_message(self, _manager, value) -> None:
         try:
@@ -139,6 +206,10 @@ class AirloomApplication(Adw.Application):
                 self._send_sensor_state()
         elif action == "save-settings":
             self._save_settings(message)
+        elif action == "view-changed":
+            self._on_view_changed(message)
+        elif action == "place-search":
+            self._on_place_search(message)
         else:
             print(f"Airloom: ignored unknown web action: {action!r}", file=sys.stderr)
 
@@ -150,28 +221,75 @@ class AirloomApplication(Adw.Application):
             print("Airloom: ignored web message with invalid sensor id", file=sys.stderr)
             return None
 
-    def _save_settings(self, message: dict) -> None:
+    def _on_view_changed(self, message: dict) -> None:
         try:
-            latitude = float(message["latitude"])
-            longitude = float(message["longitude"])
+            view = Bounds(
+                float(message["north"]), float(message["west"]),
+                float(message["south"]), float(message["east"]),
+            )
+            center = (float(message["lat"]), float(message["lon"]))
+        except (KeyError, TypeError, ValueError):
+            return
+        if not (
+            -90 <= view.south <= view.north <= 90
+            and -180 <= view.west <= 180
+            and -180 <= view.east <= 180
+            and view.west <= view.east
+        ):
+            return
+        self.view_center = center
+        fresh = (time.monotonic() - self.view_fetched_at) < AUTO_REFRESH_SECONDS
+        if self.view_bounds is not None and fresh and bounds_contains(self.view_bounds, view):
+            return
+        self._start_fetch(view, center, include_favorites=False)
+
+    def _on_place_search(self, message: dict) -> None:
+        query = str(message.get("query") or "").strip()[:120]
+        if not query:
+            return
+
+        def worker() -> None:
+            payload = {"query": query, "results": []}
+            try:
+                payload["results"] = [
+                    {"name": place.name, "latitude": place.latitude, "longitude": place.longitude}
+                    for place in place_search(query)
+                ]
+            except GeocodeError:
+                payload["error"] = "Place lookup unavailable."
+            GLib.idle_add(self._send_places, payload)
+
+        threading.Thread(target=worker, name="airloom-geocode", daemon=True).start()
+
+    def _send_places(self, payload: dict) -> bool:
+        self._send("places", payload)
+        return GLib.SOURCE_REMOVE
+
+    def _save_settings(self, message: dict) -> None:
+        previous_mode = self.store.data.get("home_mode")
+        try:
             radius = max(2.0, min(100.0, float(message["radius_km"])))
             threshold = max(1, min(500, int(message["alert_threshold"])))
-            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-                raise ValueError("Coordinates are outside their valid range.")
+            home_mode = "fixed" if message.get("home_mode") == "fixed" else "auto"
+            updates = {
+                "radius_km": radius,
+                "alert_threshold": threshold,
+                "home_mode": home_mode,
+                "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
+            }
+            if home_mode == "fixed":
+                latitude = float(message["home_lat"])
+                longitude = float(message["home_lon"])
+                if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                    raise ValueError("Coordinates are outside their valid range.")
+                updates["latitude"] = latitude
+                updates["longitude"] = longitude
+                updates["location_name"] = str(message.get("location_name") or "Custom location")[:80]
         except (KeyError, TypeError, ValueError) as exc:
             self._send("error", {"message": f"Could not save preferences: {exc}"})
             return
 
-        self.store.data.update(
-            {
-                "latitude": latitude,
-                "longitude": longitude,
-                "radius_km": radius,
-                "location_name": str(message.get("location_name") or "Custom location")[:80],
-                "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
-                "alert_threshold": threshold,
-            }
-        )
+        self.store.data.update(updates)
         api_key = str(message.get("api_key") or "").strip()
         if message.get("clear_api_key"):
             self.store.data["api_key"] = ""
@@ -181,15 +299,35 @@ class AirloomApplication(Adw.Application):
         if self.title:
             self.title.set_subtitle(self.store.data["location_name"])
         self._send("config", self.store.public_config())
+        if home_mode == "auto" and previous_mode != "auto":
+            self.locator = GeoClueLocator()
+            self.locator.start(self._on_location_fix)
+        if home_mode == "fixed":
+            # Glide the map to the newly pinned home instead of leaving it
+            # wherever the user happened to be looking when they saved.
+            self._send(
+                "location",
+                {
+                    "latitude": self.store.data["latitude"],
+                    "longitude": self.store.data["longitude"],
+                    "name": self.store.data["location_name"],
+                    "source": "fixed",
+                },
+            )
         self.refresh()
 
     def refresh(self) -> None:
+        """Home refresh: home bounds plus favorited sensors wherever they are."""
+        config = self.store.data
+        bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
+        self._start_fetch(bounds, (config["latitude"], config["longitude"]), include_favorites=True)
+
+    def _start_fetch(self, bounds: Bounds, center: tuple[float, float], include_favorites: bool) -> None:
         if not self.webview:
             return
         if self.refreshing:
-            # Re-run once the in-flight fetch lands so a settings change made
-            # mid-refresh is never silently dropped.
-            self.refresh_pending = True
+            # Coalesce: the newest request wins and runs when the current lands.
+            self.pending_fetch = (bounds, center, include_favorites)
             return
         self.refreshing = True
         self._send("loading", {"active": True})
@@ -203,24 +341,27 @@ class AirloomApplication(Adw.Application):
                 try:
                     if config.get("api_key"):
                         client = PurpleAirClient(config["api_key"])
-                        bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
-                        sensors = client.fetch_sensors(bounds)
+                        sensors = client.fetch_sensors(bounds=bounds)
                         source = "PurpleAir live"
+                        if include_favorites:
+                            missing = set(config.get("favorites", [])) - {s.sensor_id for s in sensors}
+                            if missing:
+                                sensors += client.fetch_sensors(show_only=sorted(missing))
                         if not sensors:
                             error = "No public outdoor sensors were found in this area."
                     else:
-                        sensors = demo_sensors(config["latitude"], config["longitude"])
+                        sensors = demo_sensors(center[0], center[1])
                 except PurpleAirError as exc:
-                    sensors = demo_sensors(config["latitude"], config["longitude"])
+                    sensors = demo_sensors(center[0], center[1])
                     error = f"{exc} Showing demo readings instead."
             except Exception as exc:  # noqa: BLE001 — a crashed worker must never wedge the refresh state
                 sensors = []
                 error = f"Refresh failed unexpectedly: {exc}"
-            GLib.idle_add(self._finish_refresh, sensors, source, error)
+            GLib.idle_add(self._finish_refresh, sensors, source, error, bounds)
 
         threading.Thread(target=worker, name="airloom-refresh", daemon=True).start()
 
-    def _finish_refresh(self, sensors: list[Sensor], source: str, error: str | None) -> bool:
+    def _finish_refresh(self, sensors: list[Sensor], source: str, error: str | None, bounds: Bounds) -> bool:
         favorites = set(self.store.data.get("favorites", []))
         for sensor in sensors:
             sensor.favorite = sensor.sensor_id in favorites
@@ -233,9 +374,14 @@ class AirloomApplication(Adw.Application):
         if error:
             self._send("error", {"message": error})
         self._check_alerts()
-        if self.refresh_pending:
-            self.refresh_pending = False
-            self.refresh()
+        if error is None:
+            # A transient live-API failure must not be remembered as fresh —
+            # that would suppress retries for AUTO_REFRESH_SECONDS.
+            self.view_bounds = bounds
+            self.view_fetched_at = time.monotonic()
+        if self.pending_fetch is not None:
+            pending, self.pending_fetch = self.pending_fetch, None
+            self._start_fetch(*pending)
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:

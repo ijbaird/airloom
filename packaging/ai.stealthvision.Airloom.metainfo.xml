@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.2.0" date="2026-08-06">
+      <description><p>Automatic location detection, place search, and redesigned map-first interface with persistent tile rendering and independent alert timers.</p></description>
+    </release>
     <release version="0.1.1" date="2026-08-06">
       <description><p>Hardening release: resilient refreshes, safer external-link handling, private config storage, the full piecewise EPA smoke correction, and automatic background refresh for alerts.</p></description>
     </release>

@@ -2,6 +2,17 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.2.0 — 2026-08-06
+
+Major UI redesign and automatic location detection.
+
+- Automatic location detection via GeoClue on every launch, with a Fixed-home option in Preferences to disable queries and use a saved location.
+- Place search and reverse-geocoded location labels via OpenStreetMap Nominatim; location appears in the header and search uses place-name prefix matching.
+- Redesigned map-first interface: full-window map with floating search card, area AQI chip, collapsible sensors panel, detail card overlay, and toggle-able legend.
+- Reworked tile renderer: persistent tile cache with transform-based panning eliminates redundant requests and smooths interaction across pan, zoom, and window resize.
+- Sensors auto-load for the current map viewport on pan and zoom; demo mode generates new labeled sensors for panned areas without an API key.
+- Background refresh now covers home sensors plus any favorited sensors wherever they are located, firing every 5 minutes with independent timers for AQI alerts.
+
 ## 0.1.1 — 2026-08-06
 
 Hardening and bug-fix release.

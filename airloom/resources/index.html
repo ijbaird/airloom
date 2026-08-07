@@ -9,123 +9,89 @@
     <link rel="stylesheet" href="app.css">
   </head>
   <body>
-    <main class="shell">
-      <aside class="sidebar">
-        <section class="place-block">
-          <div>
-            <p class="eyebrow">AIR NEAR YOU</p>
-            <h1 id="place-name">Portland, Oregon</h1>
-          </div>
-          <button class="icon-button mobile-detail-toggle" id="show-map" title="Show map" aria-label="Show map">
-            <svg viewBox="0 0 24 24"><path d="m15 19-6-2-5 2V5l5-2 6 2 5-2v14l-5 2Zm0-2.2 3-1V5.9l-3 1v9.9Zm-2 .1V6.7l-3-1.3v10.2l3 1.3ZM6 16.1l2-.7V5.6l-2 .7v9.8Z"/></svg>
-          </button>
-        </section>
-
-        <section class="summary-card" id="summary-card">
-          <div class="summary-score" id="summary-aqi">—</div>
-          <div class="summary-copy">
-            <strong id="summary-label">Loading readings</strong>
-            <span id="summary-subtitle">Finding nearby sensors…</span>
-          </div>
-          <div class="pulse" id="loading-pulse"></div>
-        </section>
-
-        <label class="search-box">
-          <svg viewBox="0 0 24 24"><path d="m21 20-5.2-5.2a7 7 0 1 0-1 1L20 21l1-1ZM5 10.5a5.5 5.5 0 1 1 11 0 5.5 5.5 0 0 1-11 0Z"/></svg>
-          <input id="search" type="search" placeholder="Find a sensor" autocomplete="off">
-          <kbd>Ctrl K</kbd>
-        </label>
-
-        <div class="section-heading">
-          <h2>Favorites</h2>
-          <span id="favorite-count">0</span>
-        </div>
-        <div class="sensor-list compact" id="favorites-list">
-          <div class="empty-state small">Star a sensor to keep it close.</div>
-        </div>
-
-        <div class="section-heading nearby-heading">
-          <h2>Nearby</h2>
-          <span id="sensor-count">0</span>
-        </div>
-        <div class="sensor-list" id="sensor-list">
-          <div class="sensor-skeleton"></div>
-          <div class="sensor-skeleton"></div>
-          <div class="sensor-skeleton"></div>
-        </div>
-
-        <footer class="sidebar-footer">
-          <span class="status-dot"></span>
-          <span id="data-source">Starting Airloom</span>
-          <button id="footer-refresh">Refresh</button>
-        </footer>
-      </aside>
-
+    <main class="map-shell">
       <section class="map-panel" id="map-panel" aria-label="Air quality sensor map">
         <div id="tiles" class="tile-layer"></div>
         <div id="markers" class="marker-layer"></div>
-        <div class="map-grain"></div>
-        <button class="map-back" id="show-list" aria-label="Show sensor list">
-          <svg viewBox="0 0 24 24"><path d="m14.7 5.3-1.4-1.4L5.2 12l8.1 8.1 1.4-1.4-5.7-5.7h11v-2H9l5.7-5.7Z"/></svg>
-          <span>Sensors</span>
-        </button>
-        <div class="map-controls">
-          <button id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
-          <button id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
-          <button id="recenter" title="Recenter map" aria-label="Recenter map">
-            <svg viewBox="0 0 24 24"><path d="M11 2h2v3.1A7 7 0 0 1 18.9 11H22v2h-3.1a7 7 0 0 1-5.9 5.9V22h-2v-3.1A7 7 0 0 1 5.1 13H2v-2h3.1A7 7 0 0 1 11 5.1V2Zm1 5a5 5 0 1 0 0 10 5 5 0 0 0 0-10Zm0 3a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z"/></svg>
-          </button>
-        </div>
-        <div class="legend" aria-label="AQI color legend">
-          <div><i style="--c:#35b779"></i><span>Good</span><b>0–50</b></div>
-          <div><i style="--c:#f6c945"></i><span>Moderate</span><b>51–100</b></div>
-          <div><i style="--c:#f39c3d"></i><span>Sensitive</span><b>101–150</b></div>
-          <div><i style="--c:#e65b65"></i><span>Unhealthy</span><b>151+</b></div>
-        </div>
-        <div class="attribution">© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors</div>
       </section>
 
-      <aside class="detail-panel" id="detail-panel">
+      <div class="overlay search-overlay">
+        <label class="search-pill">
+          <svg viewBox="0 0 24 24"><path d="m21 20-5.2-5.2a7 7 0 1 0-1 1L20 21l1-1ZM5 10.5a5.5 5.5 0 1 1 11 0 5.5 5.5 0 0 1-11 0Z"/></svg>
+          <input id="search" type="search" placeholder="Search sensors or places" autocomplete="off">
+          <kbd>Ctrl K</kbd>
+        </label>
+        <div id="search-results" class="search-results" hidden></div>
+      </div>
+
+      <button class="overlay summary-chip" id="summary-chip" title="Area air quality">
+        <span class="summary-score" id="summary-aqi">—</span>
+        <span class="summary-copy">
+          <strong id="place-name">Locating…</strong>
+          <small id="summary-label">Loading readings</small>
+        </span>
+        <span class="pulse" id="loading-pulse"></span>
+      </button>
+
+      <div class="overlay corner-buttons">
+        <button id="sensors-button">☰ Sensors <span class="count" id="sensor-count">0</span></button>
+        <button id="legend-chip" aria-expanded="false">AQI</button>
+      </div>
+      <div class="legend" id="legend" aria-label="AQI color legend" hidden>
+        <div><i style="--c:#35b779"></i><span>Good</span><b>0–50</b></div>
+        <div><i style="--c:#f6c945"></i><span>Moderate</span><b>51–100</b></div>
+        <div><i style="--c:#f39c3d"></i><span>Sensitive</span><b>101–150</b></div>
+        <div><i style="--c:#e65b65"></i><span>Unhealthy</span><b>151+</b></div>
+      </div>
+
+      <div class="overlay map-controls">
+        <button id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+        <button id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+        <button id="recenter" title="Back to home" aria-label="Back to home">
+          <svg viewBox="0 0 24 24"><path d="M11 2h2v3.1A7 7 0 0 1 18.9 11H22v2h-3.1a7 7 0 0 1-5.9 5.9V22h-2v-3.1A7 7 0 0 1 5.1 13H2v-2h3.1A7 7 0 0 1 11 5.1V2Zm1 5a5 5 0 1 0 0 10 5 5 0 0 0 0-10Zm0 3a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z"/></svg>
+        </button>
+      </div>
+
+      <aside class="sensors-panel" id="sensors-panel" aria-label="Sensor list" hidden>
+        <header><h2>Sensors</h2><button class="icon-button" id="close-sensors" aria-label="Close sensor list">×</button></header>
+        <div class="section-heading"><h3>Favorites</h3><span id="favorite-count">0</span></div>
+        <div class="sensor-list compact" id="favorites-list"></div>
+        <div class="section-heading"><h3>Nearby</h3></div>
+        <div class="sensor-list" id="sensor-list"></div>
+        <footer class="panel-footer"><span class="status-dot"></span><span id="data-source">Starting Airloom</span><button id="footer-refresh">Refresh</button></footer>
+      </aside>
+
+      <aside class="detail-card" id="detail-card" aria-label="Sensor detail" hidden>
         <div class="detail-topbar">
-          <button class="icon-button mobile-detail-toggle" id="back-to-map" aria-label="Back to map">
-            <svg viewBox="0 0 24 24"><path d="m14.7 5.3-1.4-1.4L5.2 12l8.1 8.1 1.4-1.4-5.7-5.7h11v-2H9l5.7-5.7Z"/></svg>
-          </button>
           <span id="updated-time">Waiting for data</span>
-          <button class="favorite-button" id="favorite-button" title="Favorite this sensor" aria-label="Favorite this sensor">
-            <svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Zm0-2.3 3.5 2-.8-3.9 3-2.7-4.1-.5L12 6.2l-1.6 3.7-4.1.5 3 2.7-.8 3.9 3.5-2Z"/></svg>
-          </button>
+          <span class="detail-actions">
+            <button class="favorite-button" id="favorite-button" title="Favorite this sensor" aria-label="Favorite this sensor">
+              <svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Zm0-2.3 3.5 2-.8-3.9 3-2.7-4.1-.5L12 6.2l-1.6 3.7-4.1.5 3 2.7-.8 3.9 3.5-2Z"/></svg>
+            </button>
+            <button class="icon-button" id="close-detail" aria-label="Close detail">×</button>
+          </span>
         </div>
-
-        <div class="reading-hero">
-          <p class="sensor-name" id="sensor-name">Choose a sensor</p>
-          <div class="aqi-row">
-            <span class="aqi-number" id="aqi-number">—</span>
-            <div><span class="aqi-unit">US AQI</span><strong id="aqi-category">Unavailable</strong></div>
-          </div>
+        <p class="sensor-name" id="sensor-name">Choose a sensor</p>
+        <div class="aqi-row">
+          <span class="aqi-number" id="aqi-number">—</span>
+          <div><span class="aqi-unit">US AQI</span><strong id="aqi-category">Unavailable</strong></div>
         </div>
-
         <section class="chart-card">
-          <div class="chart-heading">
-            <div><span>Air quality trend</span><strong id="trend-direction">—</strong></div>
-            <span class="chart-period">Rolling averages</span>
-          </div>
+          <div class="chart-heading"><div><span>Air quality trend</span><strong id="trend-direction">—</strong></div><span class="chart-period">Rolling averages</span></div>
           <div class="chart" id="chart"></div>
         </section>
-
         <section class="metrics-grid">
-          <article><span>Temperature</span><strong id="temperature">—</strong><small>Ambient estimate</small></article>
-          <article><span>Humidity</span><strong id="humidity">—</strong><small>Relative humidity</small></article>
-          <article><span>PM2.5</span><strong id="pm25">—</strong><small>µg/m³ · EPA corrected</small></article>
-          <article><span>PM10</span><strong id="pm10">—</strong><small>µg/m³ · raw</small></article>
+          <article><span>Temperature</span><strong id="temperature">—</strong></article>
+          <article><span>Humidity</span><strong id="humidity">—</strong></article>
+          <article><span>PM2.5</span><strong id="pm25">—</strong></article>
+          <article><span>PM10</span><strong id="pm10">—</strong></article>
         </section>
-
         <section class="guidance-card" id="guidance-card">
-          <div class="guidance-icon">
-            <svg viewBox="0 0 24 24"><path d="M12 2 2.8 6v6c0 5.1 3.9 9.8 9.2 10 5.3-.2 9.2-4.9 9.2-10V6L12 2Zm0 2.2 7.2 3.1V12c0 4-3 7.6-7.2 8-4.2-.4-7.2-4-7.2-8V7.3L12 4.2Zm-1 4v5.3h2V8.2h-2Zm0 7v2h2v-2h-2Z"/></svg>
-          </div>
           <div><span>Health guidance</span><p id="guidance">Select a nearby sensor to see current guidance.</p></div>
         </section>
       </aside>
+
+      <div class="attribution">© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors</div>
     </main>
 
     <div class="toast-stack" id="toast-stack"></div>
@@ -140,14 +106,21 @@
         <div class="form-grid">
           <label class="wide"><span>PurpleAir read key</span><input name="api_key" type="password" placeholder="Paste a new key"></label>
           <label class="checkbox wide"><input name="clear_api_key" type="checkbox"><span>Remove the saved key</span><small id="key-status">No key saved</small></label>
-          <label class="wide"><span>Location label</span><input name="location_name" required maxlength="80"></label>
-          <label><span>Latitude</span><input name="latitude" type="number" step="0.000001" min="-90" max="90" required></label>
-          <label><span>Longitude</span><input name="longitude" type="number" step="0.000001" min="-180" max="180" required></label>
+          <fieldset class="wide"><legend>Home location</legend>
+            <label><input name="home_mode" type="radio" value="auto" checked><span>Detect automatically</span></label>
+            <label><input name="home_mode" type="radio" value="fixed"><span>Fixed home</span></label>
+          </fieldset>
+          <label class="wide" id="home-place-row" hidden><span>Fixed home place</span>
+            <input id="home-place-input" type="search" placeholder="Search for a town or address" autocomplete="off">
+            <small id="home-place-status">No fixed home chosen</small>
+            <div id="home-place-results" class="search-results" hidden></div>
+          </label>
+          <input type="hidden" name="home_lat"><input type="hidden" name="home_lon"><input type="hidden" name="location_name">
           <label><span>Map radius (km)</span><input name="radius_km" type="number" step="1" min="2" max="100" required></label>
           <label><span>Alert at AQI</span><input name="alert_threshold" type="number" step="1" min="1" max="500" required></label>
           <fieldset class="wide"><legend>Temperature</legend><label><input name="temperature_unit" type="radio" value="F"><span>Fahrenheit</span></label><label><input name="temperature_unit" type="radio" value="C"><span>Celsius</span></label></fieldset>
         </div>
-        <p class="privacy-note">Your key and favorites stay in a private local config file. Map tiles are loaded from OpenStreetMap as you browse the map, and your location is sent to PurpleAir as map bounds only when live data is enabled.</p>
+        <p class="privacy-note">Your key and favorites stay in a private local config file. Location detection uses your system's GeoClue service; place search and labels use OpenStreetMap Nominatim; map tiles load from OpenStreetMap; your coordinates go to PurpleAir only as map bounds when live data is enabled.</p>
         <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
       </form>
     </dialog>

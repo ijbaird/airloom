@@ -27,8 +27,8 @@ Two halves connected by a JSON message bridge:
 - **Web UI** (`airloom/resources/index.html` + `app.js` + `app.css`): rendered in an embedded `WebKit.WebView`; draws the map, lists, detail pane, and settings dialog from state pushed by Python.
 
 **Bridge protocol** — the pair of functions to know:
-- JS → Python: `bridge()` in `app.js` posts a JSON string to the `airloom` script-message handler; `_on_script_message` in `app.py` dispatches on `action` (`ready`, `refresh`, `select`, `favorite`, `save-settings`). Note the quirk: JSC's `to_json()` wraps a posted string in an extra JSON encoding layer, so Python decodes twice (covered by `tests/test_bridge.py`).
-- Python → JS: `_send(event, payload)` evaluates `window.Airloom.receive(event, payload)` in the webview; events are `config`, `sensors`, `loading`, `error`, `open-settings`.
+- JS → Python: `bridge()` in `app.js` posts a JSON string to the `airloom` script-message handler; `_on_script_message` in `app.py` dispatches on `action` (`ready`, `refresh`, `select`, `favorite`, `save-settings`, `view-changed`, `place-search`). Note the quirk: JSC's `to_json()` wraps a posted string in an extra JSON encoding layer, so Python decodes twice (covered by `tests/test_bridge.py`).
+- Python → JS: `_send(event, payload)` evaluates `window.Airloom.receive(event, payload)` in the webview; events are `config`, `sensors`, `loading`, `error`, `open-settings`, `location`, `places`.
 
 **Threading**: network fetches run in a daemon thread; results re-enter the GTK main loop via `GLib.idle_add` (`refresh()` → `_finish_refresh()`). Never touch GTK/WebKit from a worker thread.
 
