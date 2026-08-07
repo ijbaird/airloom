@@ -505,6 +505,10 @@ class AirloomApplication(Adw.Application):
                     else:
                         sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
                 except PurpleAirError as exc:
+                    # The area fetch may already have flipped source to live
+                    # before a later favorites fetch failed; what we deliver
+                    # is demo data either way, so label (and cache) it as such.
+                    source = "Demo data"
                     sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
                     error = f"{exc} Showing demo readings instead."
             except Exception as exc:  # noqa: BLE001 — a crashed worker must never wedge the refresh state
