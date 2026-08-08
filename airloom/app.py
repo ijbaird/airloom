@@ -437,8 +437,6 @@ class AirloomApplication(Adw.Application):
         if action == "ready":
             self._send("config", self.store.public_config())
             self.refresh()
-            if self.debug_mode:
-                self._send("debug-mode", {"active": True})
         elif action == "refresh":
             self.refresh()
         elif action == "select":
@@ -763,7 +761,12 @@ class AirloomApplication(Adw.Application):
             reply({"ok": False, "error": error})
             return
         if cmd == "ping":
-            reply({"ok": True, "result": {"pong": True, "version": __version__, "pid": os.getpid()}})
+            reply(
+                {
+                    "ok": True,
+                    "result": {"pong": True, "version": __version__, "pid": os.getpid(), "debug": True},
+                }
+            )
         elif cmd == "version":
             self._debug_version(reply)
         elif cmd == "state":
@@ -849,9 +852,11 @@ class AirloomApplication(Adw.Application):
 
         This is webview content only — the WebKit snapshot API has no
         notion of the surrounding GTK header bar/window chrome, so a
-        screenshot can never be used to confirm the debug-mode red header;
-        use `state` + the in-page DEBUG badge (window.Airloom.debugState())
-        for that instead.
+        screenshot can never be used to confirm the debug-mode red header
+        or "Airloom · DEBUG" window title; those are visible signals for a
+        human looking at the window, not something a screenshot or `eval`
+        can assert on. `ping`/`version` reporting `"debug": true` is the
+        machine-checkable equivalent.
         """
         if not self.webview:
             reply({"ok": False, "error": "webview not available"})

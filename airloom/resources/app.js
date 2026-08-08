@@ -37,7 +37,6 @@
       if (event === "location") applyLocation(payload);
       if (event === "view-name" && payload.name) { state.viewName = payload.name; stampPlaceName(); }
       if (event === "pinch") nativePinch(payload);
-      if (event === "debug-mode" && payload.active) showDebugBadge();
       if (event === "places") {
         if (state.homeSearchActive) {
           if (payload.query === $("#home-place-input").value.trim()) renderHomePlaceResults(payload.results || [], payload.error);
@@ -85,18 +84,6 @@
       return { tag: el.tagName, id: el.id || null, className: el.className || null };
     },
   };
-
-  function showDebugBadge() {
-    if (document.getElementById("debug-badge")) return;
-    const badge = document.createElement("div");
-    badge.id = "debug-badge";
-    badge.textContent = "DEBUG";
-    badge.style.cssText =
-      "position:fixed;top:0;left:50%;transform:translateX(-50%);background:#b3261e;color:#fff;" +
-      "z-index:99;padding:2px 10px;font:700 11px/1.6 sans-serif;letter-spacing:.05em;" +
-      "border-radius:0 0 6px 6px;pointer-events:none;";
-    document.body.appendChild(badge);
-  }
 
   function stampPlaceName() {
     $("#place-name").textContent = state.viewName || state.config.location_name;
