@@ -44,10 +44,15 @@ done
 
 [[ -n "$(ostree refs --repo="${repo}")" ]] || { echo "no app refs were pulled — refusing to publish an empty repo" >&2; exit 1; }
 
+if ! merged_refs="$(ostree refs --repo="${repo}")"; then
+  echo "failed to list refs in merged repo: ${repo}" >&2
+  exit 1
+fi
+
 while IFS= read -r ref; do
   commit="$(ostree rev-parse --repo="${repo}" "${ref}")"
   ostree gpg-sign --repo="${repo}" --gpg-homedir="${GNUPGHOME}" "${commit}" "${GPG_KEY_ID}"
-done < <(ostree refs --repo="${repo}")
+done <<< "${merged_refs}"
 
 flatpak build-update-repo \
   --gpg-sign="${GPG_KEY_ID}" \
