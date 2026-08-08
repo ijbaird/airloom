@@ -26,16 +26,24 @@ a crash or a dropped connection.
 
 This module implements only the framing/transport, so it can be unit
 tested without importing GTK (see tests/test_debugport.py). The actual
-command handlers (``ping``, ``eval``, ``pinch``, ...) are supplied by the
-caller as a ``dispatcher(command: dict, reply: Callable[[dict], None])``
-callable — see ``airloom/app.py`` for the real dispatcher, which marshals
-onto the GTK main loop via ``GLib.idle_add`` because GTK/WebKit must never
-be touched from this module's own accept/serve thread.
+command handlers (``ping``, ``eval``, ``pinch``, ``version``, ``tap``,
+``search``, ``key``, ``state``, ``screenshot``, ``quit``, ...) are
+supplied by the caller as a
+``dispatcher(command: dict, reply: Callable[[dict], None])`` callable —
+see ``airloom/app.py`` for the real dispatcher, which marshals onto the
+GTK main loop via ``GLib.idle_add`` because GTK/WebKit must never be
+touched from this module's own accept/serve thread.
+
+Payload validation for every command (beyond ``eval``'s own ad hoc check
+and ``pinch``'s, which predate this module's validator table) lives in
+``validate_command`` below, table-driven and GTK-free, so its rules are
+exercised by plain ``unittest`` without a display.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import threading
@@ -158,3 +166,82 @@ class DebugPort:
         out.update(result_box)
         out.setdefault("ok", False)
         return out
+
+
+# -- Command validation -----------------------------------------------------
+# GTK-free by construction: each validator only reads the request dict and
+# returns either (normalized_params, None) or (None, error_message). app.py's
+# dispatcher calls validate_command() before doing anything GTK-touching, so
+# a malformed request never reaches a widget or the webview.
+
+
+def _validate_no_params(_command: dict) -> tuple[dict, None]:
+    return {}, None
+
+
+def _validate_tap(command: dict) -> tuple[dict | None, str | None]:
+    try:
+        x = float(command["x"])
+        y = float(command["y"])
+    except (KeyError, TypeError, ValueError):
+        return None, "tap requires numeric 'x' and 'y' fields"
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None, "tap requires finite 'x' and 'y' fields"
+    return {"x": x, "y": y}, None
+
+
+def _validate_search(command: dict) -> tuple[dict | None, str | None]:
+    query = command.get("query")
+    if not isinstance(query, str):
+        return None, "search requires a string 'query' field"
+    return {"query": query}, None
+
+
+def _validate_key(command: dict) -> tuple[dict | None, str | None]:
+    key = command.get("key")
+    if not isinstance(key, str) or not key:
+        return None, "key requires a non-empty string 'key' field"
+    return {"key": key}, None
+
+
+def _validate_screenshot(command: dict) -> tuple[dict | None, str | None]:
+    path = command.get("path")
+    if path is None:
+        return {"path": None}, None
+    if not isinstance(path, str) or not path:
+        return None, "screenshot 'path', if given, must be a non-empty string"
+    if not os.path.isabs(path):
+        return None, "screenshot 'path' must be an absolute path"
+    return {"path": path}, None
+
+
+# Commands whose handlers are implemented directly in app.py's dispatcher
+# using their own pre-existing validation (`eval`, `pinch`) are deliberately
+# absent from this table — app.py routes those before consulting it. Every
+# other known command, including ones with no parameters, is listed
+# explicitly so an unrecognized `cmd` always fails closed.
+_VALIDATORS: dict[str, Callable[[dict], "tuple[dict | None, str | None]"]] = {
+    "ping": _validate_no_params,
+    "version": _validate_no_params,
+    "state": _validate_no_params,
+    "quit": _validate_no_params,
+    "tap": _validate_tap,
+    "search": _validate_search,
+    "key": _validate_key,
+    "screenshot": _validate_screenshot,
+}
+
+
+def validate_command(command: dict) -> tuple[dict | None, str | None]:
+    """Validate and normalize a decoded debug command's parameters.
+
+    Returns ``(normalized_params, None)`` on success — an empty dict for
+    parameter-less commands — or ``(None, error_message)`` if `command`
+    is missing/invalid fields or names a `cmd` this table doesn't know
+    about (which includes `eval`/`pinch`; callers must route those before
+    falling back to this function).
+    """
+    validator = _VALIDATORS.get(command.get("cmd"))
+    if validator is None:
+        return None, f"unknown cmd: {command.get('cmd')!r}"
+    return validator(command)

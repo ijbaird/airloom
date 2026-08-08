@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Stdlib CLI client for Airloom's debug port.
+
+Usage:
+    debug-client [--socket PATH] CMD [JSON_ARGS]
+
+Sends one ``{"id": 1, "cmd": CMD, **JSON_ARGS}`` request over the debug
+socket and prints the JSON response, pretty-printed. JSON_ARGS, if given,
+must be a JSON object literal merged into the request, e.g.::
+
+    debug-client tap '{"x": 100, "y": 200}'
+    debug-client search '{"query": "park"}'
+    debug-client ping
+
+For ``screenshot``, pass ``--out FILE`` to decode the response's base64
+PNG straight to a local file instead of printing the (large) base64 blob
+inline.
+
+Exits non-zero if the response has ``"ok": false``, including when the
+socket can't be reached at all or the connection drops before a full
+response arrives.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import socket
+import sys
+
+# Same default AIRLOOM_DEBUG_SOCKET path scripts/debug-run picks when the
+# caller doesn't set one, so a plain `debug-client ping` just works after a
+# plain `debug-run` in the common case.
+DEFAULT_SOCKET = f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/airloom-debug.sock"
+
+
+def _request(sock_path: str, request: dict) -> dict:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    sock.connect(sock_path)
+    try:
+        sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("connection closed before a full response arrived")
+            buf += chunk
+        line, _rest = buf.split(b"\n", 1)
+    finally:
+        sock.close()
+    return json.loads(line.decode("utf-8"))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="debug-client", description=__doc__.splitlines()[0])
+    parser.add_argument("--socket", default=os.environ.get("AIRLOOM_DEBUG_SOCKET", DEFAULT_SOCKET))
+    parser.add_argument("--out", help="screenshot only: write the decoded PNG here instead of printing base64")
+    parser.add_argument("cmd", help="debug command, e.g. ping, version, state, tap, search, key, screenshot, quit, eval, pinch")
+    parser.add_argument("json_args", nargs="?", default="{}", help='JSON object of extra request fields, e.g. \'{"x": 10, "y": 20}\'')
+    args = parser.parse_args(argv)
+
+    try:
+        extra = json.loads(args.json_args)
+    except json.JSONDecodeError as exc:
+        print(f"debug-client: JSON_ARGS is not valid JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(extra, dict):
+        print("debug-client: JSON_ARGS must be a JSON object", file=sys.stderr)
+        return 2
+
+    request = {"id": 1, "cmd": args.cmd, **extra}
+
+    try:
+        response = _request(args.socket, request)
+    except (OSError, ConnectionError) as exc:
+        print(f"debug-client: {exc} ({args.socket})", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"debug-client: malformed response: {exc}", file=sys.stderr)
+        return 1
+
+    ok = bool(response.get("ok"))
+    printable = response
+
+    if args.cmd == "screenshot" and args.out and ok:
+        result = response.get("result") or {}
+        b64 = result.get("png_base64")
+        if b64 is not None:
+            try:
+                with open(args.out, "wb") as handle:
+                    handle.write(base64.b64decode(b64))
+            except (OSError, ValueError) as exc:
+                print(f"debug-client: failed to write {args.out}: {exc}", file=sys.stderr)
+                return 1
+            # Report what landed on disk rather than dumping the blob.
+            printable = {**response, "result": {**result, "png_base64": f"<written to {args.out}>"}}
+
+    print(json.dumps(printable, indent=2))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

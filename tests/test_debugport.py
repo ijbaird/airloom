@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from airloom.debugport import DebugPort
+from airloom.debugport import DebugPort, validate_command
 
 
 def _echo_dispatcher(message: dict, reply) -> None:
@@ -166,6 +166,200 @@ class DebugPortTest(unittest.TestCase):
             response = client.request({"id": request_id, "cmd": "ping"})
             self.assertEqual(response["id"], request_id)
             self.assertTrue(response["ok"])
+
+
+class ValidateCommandTest(unittest.TestCase):
+    """GTK-free coverage of every command's payload validation — see the
+    table in airloom/debugport.py. app.py's dispatcher trusts these results
+    completely (including for unknown `cmd`s), so this is the load-bearing
+    test for "malformed input never reaches a GTK/WebKit call".
+    """
+
+    # -- No-parameter commands --------------------------------------------
+
+    def test_no_param_commands_normalize_to_empty_dict(self):
+        for cmd in ("ping", "version", "state", "quit"):
+            with self.subTest(cmd=cmd):
+                normalized, error = validate_command({"id": 1, "cmd": cmd})
+                self.assertIsNone(error)
+                self.assertEqual(normalized, {})
+
+    def test_no_param_commands_ignore_extra_fields(self):
+        normalized, error = validate_command({"id": 1, "cmd": "ping", "junk": "ignored"})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {})
+
+    # -- Unknown / malformed cmd --------------------------------------------
+
+    def test_unknown_cmd_is_an_error(self):
+        normalized, error = validate_command({"id": 1, "cmd": "not-a-real-command"})
+        self.assertIsNone(normalized)
+        self.assertIn("unknown cmd", error)
+
+    def test_missing_cmd_is_an_error(self):
+        normalized, error = validate_command({"id": 1})
+        self.assertIsNone(normalized)
+        self.assertIn("unknown cmd", error)
+
+    def test_eval_and_pinch_are_not_in_the_table(self):
+        # app.py routes these to their own (pre-existing) validation before
+        # ever calling validate_command(); this table must not shadow that.
+        for cmd in ("eval", "pinch"):
+            with self.subTest(cmd=cmd):
+                normalized, error = validate_command({"id": 1, "cmd": cmd})
+                self.assertIsNone(normalized)
+                self.assertIn("unknown cmd", error)
+
+    # -- tap -----------------------------------------------------------------
+
+    def test_tap_valid(self):
+        normalized, error = validate_command({"cmd": "tap", "x": 12, "y": 34.5})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"x": 12.0, "y": 34.5})
+
+    def test_tap_accepts_numeric_strings(self):
+        # float() coerces "12" the same way JSON would if a client sent
+        # numbers as strings; no reason to reject that.
+        normalized, error = validate_command({"cmd": "tap", "x": "12", "y": "34"})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"x": 12.0, "y": 34.0})
+
+    def test_tap_missing_field(self):
+        normalized, error = validate_command({"cmd": "tap", "x": 1})
+        self.assertIsNone(normalized)
+        self.assertIn("'x' and 'y'", error)
+
+    def test_tap_non_numeric_field(self):
+        normalized, error = validate_command({"cmd": "tap", "x": "abc", "y": 1})
+        self.assertIsNone(normalized)
+        self.assertIn("'x' and 'y'", error)
+
+    def test_tap_rejects_non_finite(self):
+        normalized, error = validate_command({"cmd": "tap", "x": float("nan"), "y": 1})
+        self.assertIsNone(normalized)
+        self.assertIn("finite", error)
+
+    # -- search ----------------------------------------------------------
+
+    def test_search_valid(self):
+        normalized, error = validate_command({"cmd": "search", "query": "park"})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"query": "park"})
+
+    def test_search_allows_empty_string(self):
+        # An empty query is how a client clears the search box; must not be
+        # rejected as "missing".
+        normalized, error = validate_command({"cmd": "search", "query": ""})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"query": ""})
+
+    def test_search_requires_string(self):
+        normalized, error = validate_command({"cmd": "search", "query": 5})
+        self.assertIsNone(normalized)
+        self.assertIn("string 'query'", error)
+
+    def test_search_missing_query(self):
+        normalized, error = validate_command({"cmd": "search"})
+        self.assertIsNone(normalized)
+        self.assertIn("string 'query'", error)
+
+    # -- key -------------------------------------------------------------
+
+    def test_key_valid(self):
+        normalized, error = validate_command({"cmd": "key", "key": "Escape"})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"key": "Escape"})
+
+    def test_key_rejects_empty_string(self):
+        normalized, error = validate_command({"cmd": "key", "key": ""})
+        self.assertIsNone(normalized)
+        self.assertIn("non-empty", error)
+
+    def test_key_requires_string(self):
+        normalized, error = validate_command({"cmd": "key", "key": 27})
+        self.assertIsNone(normalized)
+        self.assertIn("non-empty", error)
+
+    # -- screenshot --------------------------------------------------------
+
+    def test_screenshot_no_path(self):
+        normalized, error = validate_command({"cmd": "screenshot"})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"path": None})
+
+    def test_screenshot_absolute_path(self):
+        normalized, error = validate_command({"cmd": "screenshot", "path": "/tmp/shot.png"})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"path": "/tmp/shot.png"})
+
+    def test_screenshot_relative_path_rejected(self):
+        normalized, error = validate_command({"cmd": "screenshot", "path": "shot.png"})
+        self.assertIsNone(normalized)
+        self.assertIn("absolute", error)
+
+    def test_screenshot_non_string_path_rejected(self):
+        normalized, error = validate_command({"cmd": "screenshot", "path": 5})
+        self.assertIsNone(normalized)
+        self.assertIn("non-empty string", error)
+
+    def test_screenshot_empty_path_rejected(self):
+        normalized, error = validate_command({"cmd": "screenshot", "path": ""})
+        self.assertIsNone(normalized)
+        self.assertIn("non-empty string", error)
+
+
+class ProtocolRegressionTest(unittest.TestCase):
+    """Extra protocol-layer regressions beyond DebugPortTest's coverage,
+    exercised against the real (validate_command-aware) shape of requests
+    the new commands will actually send.
+    """
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.path = str(Path(self._tempdir.name) / "airloom-debug.sock")
+
+    def _dispatcher(self, message: dict, reply) -> None:
+        normalized, error = validate_command(message)
+        if error is not None:
+            reply({"ok": False, "error": error})
+            return
+        reply({"ok": True, "result": normalized})
+
+    def _start(self) -> DebugPort:
+        port = DebugPort(self.path, self._dispatcher, reply_timeout=2.0)
+        port.start()
+        self.addCleanup(port.stop)
+        return port
+
+    def _client(self) -> _ClientSession:
+        client = _ClientSession(self.path)
+        self.addCleanup(client.close)
+        return client
+
+    def test_tap_round_trip_through_the_wire(self):
+        self._start()
+        client = self._client()
+        response = client.request({"id": 1, "cmd": "tap", "x": 10, "y": 20})
+        self.assertEqual(response, {"id": 1, "ok": True, "result": {"x": 10.0, "y": 20.0}})
+
+    def test_invalid_tap_round_trip_reports_error_not_crash(self):
+        self._start()
+        client = self._client()
+        response = client.request({"id": 1, "cmd": "tap", "x": "nope"})
+        self.assertFalse(response["ok"])
+        self.assertIn("error", response)
+        # The connection survives a validation error, same as any other.
+        response = client.request({"id": 2, "cmd": "ping"})
+        self.assertEqual(response, {"id": 2, "ok": True, "result": {}})
+
+    def test_quit_and_version_and_state_accept_no_params_over_the_wire(self):
+        self._start()
+        client = self._client()
+        for cmd in ("quit", "version", "state"):
+            with self.subTest(cmd=cmd):
+                response = client.request({"id": 1, "cmd": cmd})
+                self.assertEqual(response, {"id": 1, "ok": True, "result": {}})
 
 
 if __name__ == "__main__":

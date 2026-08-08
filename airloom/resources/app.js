@@ -37,16 +37,66 @@
       if (event === "location") applyLocation(payload);
       if (event === "view-name" && payload.name) { state.viewName = payload.name; stampPlaceName(); }
       if (event === "pinch") nativePinch(payload);
+      if (event === "debug-mode" && payload.active) showDebugBadge();
       if (event === "places") {
         if (state.homeSearchActive) {
           if (payload.query === $("#home-place-input").value.trim()) renderHomePlaceResults(payload.results || [], payload.error);
         } else if (payload.query === state.query.trim()) renderSearchResults(payload.results || [], payload.error);
       }
     },
-    // Small, legitimate debug accessor used by the debug-port self-test to
-    // read map state without reaching into module-private variables.
-    debugState: () => ({ zoom: state.zoom, center: state.center }),
+    // Small, legitimate debug accessors used by the debug port (see
+    // airloom/debugport.py and app.py's _debug_* handlers) to read and
+    // drive page state without reaching into module-private variables.
+    debugState: () => ({
+      zoom: state.zoom,
+      center: state.center,
+      sensorCount: state.sensors.length,
+      visibleCount: visibleSensors().length,
+      selectedId: state.selectedId,
+      popupId: state.popupId,
+      popupHidden: $("#map-popup").hidden,
+      location_filter: state.config.location_filter,
+      source: state.source,
+      viewportScale: window.visualViewport ? window.visualViewport.scale : null,
+    }),
+    debugSearch(query) {
+      const input = $("#search");
+      input.value = query;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return visibleSensors().length;
+    },
+    debugKey(key) {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    },
+    debugTap(x, y) {
+      const el = document.elementFromPoint(x, y);
+      if (!el) return null;
+      const init = { bubbles: true, cancelable: true, composed: true, isPrimary: true, button: 0, clientX: x, clientY: y };
+      el.dispatchEvent(new PointerEvent("pointerdown", init));
+      el.dispatchEvent(new PointerEvent("pointerup", init));
+      // Real trackpad/touch input on GNOME resolves to a synthesized click
+      // after pointerup, and most of our listeners (marker taps, buttons)
+      // are bound to "click" rather than the pointer events, so pointer
+      // events alone wouldn't trigger them. Call .click() too, but only if
+      // pointerup didn't already remove the element from the document
+      // (e.g. closing a popup it belonged to) — clicking a detached node
+      // is a no-op at best and an error in some engines at worst.
+      if (el.isConnected) el.click();
+      return { tag: el.tagName, id: el.id || null, className: el.className || null };
+    },
   };
+
+  function showDebugBadge() {
+    if (document.getElementById("debug-badge")) return;
+    const badge = document.createElement("div");
+    badge.id = "debug-badge";
+    badge.textContent = "DEBUG";
+    badge.style.cssText =
+      "position:fixed;top:0;left:50%;transform:translateX(-50%);background:#b3261e;color:#fff;" +
+      "z-index:99;padding:2px 10px;font:700 11px/1.6 sans-serif;letter-spacing:.05em;" +
+      "border-radius:0 0 6px 6px;pointer-events:none;";
+    document.body.appendChild(badge);
+  }
 
   function stampPlaceName() {
     $("#place-name").textContent = state.viewName || state.config.location_name;
