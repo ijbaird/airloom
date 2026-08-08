@@ -5,7 +5,7 @@
   const state = {
     sensors: [],
     selectedId: null,
-    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "", location_filter: "outdoor" },
+    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "", location_filter: "outdoor" },
     source: "Starting Airloom",
     center: { lat: 45.5152, lon: -122.6784 },
     home: { lat: 45.5152, lon: -122.6784 },
@@ -51,6 +51,8 @@
       center: state.center,
       sensorCount: state.sensors.length,
       visibleCount: visibleSensors().length,
+      heatmapActive: heatmapActive(),
+      viewportKm: viewportWidthKm(),
       selectedId: state.selectedId,
       popupId: state.popupId,
       popupHidden: $("#map-popup").hidden,
@@ -82,6 +84,13 @@
       // is a no-op at best and an error in some engines at worst.
       if (el.isConnected) el.click();
       return { tag: el.tagName, id: el.id || null, className: el.className || null };
+    },
+    debugZoomTo(zoom) {
+      cancelZoomAnimation();
+      applyZoom(Number(zoom), centerAnchor());
+      renderMapMarkers();
+      scheduleViewChanged();
+      return state.zoom;
     },
   };
 
@@ -305,6 +314,121 @@
     return { lat, lon };
   }
 
+  // --- Heat map mode (spec: docs/superpowers/specs/2026-08-07-heatmap-mode-design.md) ---
+  const EARTH_CIRCUMFERENCE_KM = 40075.016686;
+  const HEATMAP_CELL = 8;        // CSS px per field-grid cell
+  const HEATMAP_RADIUS = 90;     // screen-px influence radius per sensor
+  const HEATMAP_MAX_ALPHA = 0.55;
+  let heatmapWasActive = false;
+
+  function viewportWidthKm() {
+    const panel = $("#map-panel");
+    if (!panel.clientWidth) return 0;
+    return panel.clientWidth / (256 * 2 ** state.zoom) * EARTH_CIRCUMFERENCE_KM *
+      Math.cos(clampLat(state.center.lat) * Math.PI / 180);
+  }
+
+  function heatmapActive() {
+    return viewportWidthKm() > Number(state.config.heatmap_threshold_km || 40);
+  }
+
+  // Same buckets as the legend and demo.py; interpolated AQI values take the
+  // color of the bucket they land in, so every on-screen color is in the legend.
+  function aqiBucketColor(aqi) {
+    if (aqi <= 50) return [53, 183, 121];   // #35b779 Good
+    if (aqi <= 100) return [246, 201, 69];  // #f6c945 Moderate
+    if (aqi <= 150) return [243, 156, 61];  // #f39c3d Sensitive
+    return [230, 91, 101];                  // #e65b65 Unhealthy
+  }
+
+  // Re-render markers exactly once per threshold crossing; a marker popup
+  // cannot survive into heat-map mode.
+  function syncHeatmapMode() {
+    const active = heatmapActive();
+    if (active === heatmapWasActive) return active;
+    heatmapWasActive = active;
+    if (active) hidePopup();
+    renderMapMarkers();
+    return active;
+  }
+
+  function clearHeatmap() {
+    const canvas = $("#heatmap");
+    if (canvas.hidden) return;
+    canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+    canvas.hidden = true;
+  }
+
+  function renderHeatmap(view) {
+    const canvas = $("#heatmap");
+    const cols = Math.max(1, Math.ceil(view.width / HEATMAP_CELL));
+    const rows = Math.max(1, Math.ceil(view.height / HEATMAP_CELL));
+    if (canvas.width !== cols || canvas.height !== rows) { canvas.width = cols; canvas.height = rows; }
+    const ctx = canvas.getContext("2d");
+    const image = ctx.createImageData(cols, rows);
+    const pad = HEATMAP_RADIUS + HEATMAP_CELL;
+    const points = [];
+    for (const sensor of visibleSensors()) {
+      if (!Number.isFinite(sensor.aqi)) continue;
+      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+      const x = point.x - view.left, y = point.y - view.top;
+      if (x < -pad || x > view.width + pad || y < -pad || y > view.height + pad) continue;
+      points.push({ x, y, aqi: sensor.aqi });
+    }
+    const radius2 = HEATMAP_RADIUS * HEATMAP_RADIUS;
+    // Scatter instead of gather: each sensor only touches the cell bounding
+    // box within HEATMAP_RADIUS (~23x23 cells), not every cell on screen.
+    // Points are still visited in array order and, within a cell, each
+    // point's contribution is added in that same order — identical
+    // summation order to the old gather loop, so weightSum/aqiSum/nearest2
+    // land on the exact same floating-point values per cell.
+    const cellCount = cols * rows;
+    const weightSum = points.length ? new Float64Array(cellCount) : null;
+    const aqiSum = points.length ? new Float64Array(cellCount) : null;
+    const nearest2 = points.length ? new Float64Array(cellCount).fill(radius2) : null;
+    for (const point of points) {
+      const gxMin = Math.max(0, Math.floor((point.x - HEATMAP_RADIUS) / HEATMAP_CELL) - 1);
+      const gxMax = Math.min(cols - 1, Math.ceil((point.x + HEATMAP_RADIUS) / HEATMAP_CELL) + 1);
+      const gyMin = Math.max(0, Math.floor((point.y - HEATMAP_RADIUS) / HEATMAP_CELL) - 1);
+      const gyMax = Math.min(rows - 1, Math.ceil((point.y + HEATMAP_RADIUS) / HEATMAP_CELL) + 1);
+      for (let gy = gyMin; gy <= gyMax; gy++) {
+        const cy = (gy + 0.5) * HEATMAP_CELL;
+        const rowOffset = gy * cols;
+        for (let gx = gxMin; gx <= gxMax; gx++) {
+          const cx = (gx + 0.5) * HEATMAP_CELL;
+          const dx = cx - point.x, dy = cy - point.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > radius2) continue;
+          const idx = rowOffset + gx;
+          const w = 1 / (d2 + 4); // +4 keeps the weight finite directly over a sensor
+          weightSum[idx] += w;
+          aqiSum[idx] += point.aqi * w;
+          if (d2 < nearest2[idx]) nearest2[idx] = d2;
+        }
+      }
+    }
+    for (let gy = 0; points.length && gy < rows; gy++) {
+      const rowOffset = gy * cols;
+      for (let gx = 0; gx < cols; gx++) {
+        const idx = rowOffset + gx;
+        const ws = weightSum[idx];
+        if (!ws) continue;
+        const [r, g, b] = aqiBucketColor(aqiSum[idx] / ws);
+        // Feather toward the influence edge so blobs fade out instead of
+        // ending in a hard circle.
+        const edge = 1 - Math.sqrt(nearest2[idx]) / HEATMAP_RADIUS;
+        const alpha = HEATMAP_MAX_ALPHA * Math.min(1, edge * 1.6);
+        const offset = idx * 4;
+        image.data[offset] = r;
+        image.data[offset + 1] = g;
+        image.data[offset + 2] = b;
+        image.data[offset + 3] = Math.round(alpha * 255);
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    canvas.hidden = false;
+  }
+
   let tileLayer = { zoom: null, tiles: new Map(), pending: 0 };
   let retireTimer = null;
   const MARKER_CULL_PAD = 300; // generous cull margin so mid-pan gaps are rare
@@ -416,6 +540,8 @@
       old.style.transform = `translate(${-view.left}px, ${-view.top}px) scale(${oldScale})`;
     }
     layoutMarkers(view);
+    if (syncHeatmapMode()) renderHeatmap(view);
+    else clearHeatmap();
   }
 
   function layoutMarkers(view = mapViewport()) {
@@ -505,6 +631,7 @@
   function renderMapMarkers() {
     const view = mapViewport();
     if (!view.width) return;
+    if (heatmapActive()) { $("#markers").innerHTML = ""; markerDriftX = markerDriftY = 0; renderHeatmap(view); return; }
     markerDriftX = markerDriftY = 0;
     const pad = MARKER_CULL_PAD;
     const markers = visibleSensors().map((sensor) => {
@@ -564,7 +691,7 @@
   function openSettings(config = state.config) {
     if ($("#settings-dialog").open) return;
     const form = $("#settings-form");
-    for (const field of ["radius_km", "alert_threshold"]) form.elements[field].value = config[field];
+    for (const field of ["radius_km", "alert_threshold", "heatmap_threshold_km"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;
     form.elements.temperature_unit.value = config.temperature_unit || "F";
@@ -824,7 +951,7 @@
       action: "save-settings",
       api_key: form.get("api_key"), clear_api_key: form.get("clear_api_key") === "on",
       home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
-      radius_km: form.get("radius_km"), alert_threshold: form.get("alert_threshold"), temperature_unit: form.get("temperature_unit"),
+      radius_km: form.get("radius_km"), heatmap_threshold_km: form.get("heatmap_threshold_km"), alert_threshold: form.get("alert_threshold"), temperature_unit: form.get("temperature_unit"),
     });
     $("#settings-dialog").close();
   });

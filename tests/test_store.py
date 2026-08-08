@@ -137,6 +137,24 @@ class StoreTest(unittest.TestCase):
             path.write_text(json.dumps({"location_filter": "underwater"}), encoding="utf-8")
             self.assertEqual(Store(path).data["location_filter"], "outdoor")
 
+    def test_heatmap_threshold_defaults_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            self.assertEqual(store.data["heatmap_threshold_km"], 40.0)
+            self.assertEqual(store.public_config()["heatmap_threshold_km"], 40.0)
+            store.data["heatmap_threshold_km"] = 120.0
+            store.save()
+            self.assertEqual(Store(path).data["heatmap_threshold_km"], 120.0)
+
+    def test_heatmap_threshold_invalid_values_fall_back(self):
+        for bad in ("wide", 4, 1001, float("inf"), True):
+            with self.subTest(bad=bad):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    path.write_text(json.dumps({"heatmap_threshold_km": bad}), encoding="utf-8")
+                    self.assertEqual(Store(path).data["heatmap_threshold_km"], 40.0)
+
 
 if __name__ == "__main__":
     unittest.main()

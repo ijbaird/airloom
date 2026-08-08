@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
     "longitude": -122.6784,
     "location_name": "Portland, Oregon",
     "radius_km": 22.0,
+    "heatmap_threshold_km": 40.0,
     "temperature_unit": "F",
     "home_mode": "auto",
     "location_filter": "outdoor",
@@ -43,6 +44,7 @@ def _sanitize(data: dict) -> dict:
     number("latitude", -90.0, 90.0)
     number("longitude", -180.0, 180.0)
     number("radius_km", 2.0, 100.0)
+    number("heatmap_threshold_km", 5.0, 1000.0)
     number("alert_threshold", 1, 500)
     clean["alert_threshold"] = int(clean["alert_threshold"])
     if isinstance(data.get("api_key"), str):
@@ -103,6 +105,7 @@ class Store:
             "longitude": self.data["longitude"],
             "location_name": self.data["location_name"],
             "radius_km": self.data["radius_km"],
+            "heatmap_threshold_km": self.data["heatmap_threshold_km"],
             "temperature_unit": self.data["temperature_unit"],
             "home_mode": self.data["home_mode"],
             "location_filter": self.data["location_filter"],
