@@ -23,11 +23,23 @@ repo="${out}/repo"
 ostree init --repo="${repo}" --mode=archive
 
 for src in "$@"; do
+  # Capture and check refs outside of a process substitution: a failing
+  # producer inside `< <(...)` does NOT trip set -e/pipefail in the
+  # enclosing script, so a bad path/empty/corrupt source would otherwise
+  # silently contribute zero refs with no error.
+  if ! src_refs="$(ostree refs --repo="${src}")"; then
+    echo "failed to list refs in source repo: ${src}" >&2
+    exit 1
+  fi
+
   # Publish app refs only: flatpak-builder's export can also carry
   # .Debug/.Sources refs that would bloat the repo for no client benefit.
+  app_refs="$(printf '%s\n' "${src_refs}" | grep '^app/' | grep -v -e '\.Debug' -e '\.Sources' || true)"
+  [[ -n "${app_refs}" ]] || { echo "source repo contributed no app refs: ${src}" >&2; exit 1; }
+
   while IFS= read -r ref; do
     ostree pull-local --repo="${repo}" "${src}" "${ref}"
-  done < <(ostree refs --repo="${src}" | grep '^app/' | grep -v -e '\.Debug' -e '\.Sources')
+  done <<< "${app_refs}"
 done
 
 [[ -n "$(ostree refs --repo="${repo}")" ]] || { echo "no app refs were pulled — refusing to publish an empty repo" >&2; exit 1; }
