@@ -2,6 +2,10 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.4.2 — 2026-08-08
+
+- No application changes. Confirms the automatic-update pipeline introduced in 0.4.1 end to end: this release was delivered to an installed copy via `flatpak update` from the signed repository.
+
 ## 0.4.1 — 2026-08-08
 
 - Installed copies now update automatically: releases are published to a signed Flatpak repository on GitHub Pages, and bundles are preconfigured with it as their update source. Existing bundle installs pick this up by reinstalling once from a current bundle (see README).

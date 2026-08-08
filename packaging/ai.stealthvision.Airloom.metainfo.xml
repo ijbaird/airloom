@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.4.2" date="2026-08-08">
+      <description><p>No application changes; confirms the automatic-update pipeline end to end.</p></description>
+    </release>
     <release version="0.4.1" date="2026-08-08">
       <description><p>Installed copies now update automatically through a signed Flatpak repository; new bundles come preconfigured with it as their update source.</p></description>
     </release>
