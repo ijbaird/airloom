@@ -369,27 +369,49 @@
       points.push({ x, y, aqi: sensor.aqi });
     }
     const radius2 = HEATMAP_RADIUS * HEATMAP_RADIUS;
-    for (let gy = 0; points.length && gy < rows; gy++) {
-      const cy = (gy + 0.5) * HEATMAP_CELL;
-      for (let gx = 0; gx < cols; gx++) {
-        const cx = (gx + 0.5) * HEATMAP_CELL;
-        let weightSum = 0, aqiSum = 0, nearest2 = radius2;
-        for (const point of points) {
+    // Scatter instead of gather: each sensor only touches the cell bounding
+    // box within HEATMAP_RADIUS (~23x23 cells), not every cell on screen.
+    // Points are still visited in array order and, within a cell, each
+    // point's contribution is added in that same order — identical
+    // summation order to the old gather loop, so weightSum/aqiSum/nearest2
+    // land on the exact same floating-point values per cell.
+    const cellCount = cols * rows;
+    const weightSum = points.length ? new Float64Array(cellCount) : null;
+    const aqiSum = points.length ? new Float64Array(cellCount) : null;
+    const nearest2 = points.length ? new Float64Array(cellCount).fill(radius2) : null;
+    for (const point of points) {
+      const gxMin = Math.max(0, Math.floor((point.x - HEATMAP_RADIUS) / HEATMAP_CELL) - 1);
+      const gxMax = Math.min(cols - 1, Math.ceil((point.x + HEATMAP_RADIUS) / HEATMAP_CELL) + 1);
+      const gyMin = Math.max(0, Math.floor((point.y - HEATMAP_RADIUS) / HEATMAP_CELL) - 1);
+      const gyMax = Math.min(rows - 1, Math.ceil((point.y + HEATMAP_RADIUS) / HEATMAP_CELL) + 1);
+      for (let gy = gyMin; gy <= gyMax; gy++) {
+        const cy = (gy + 0.5) * HEATMAP_CELL;
+        const rowOffset = gy * cols;
+        for (let gx = gxMin; gx <= gxMax; gx++) {
+          const cx = (gx + 0.5) * HEATMAP_CELL;
           const dx = cx - point.x, dy = cy - point.y;
           const d2 = dx * dx + dy * dy;
           if (d2 > radius2) continue;
+          const idx = rowOffset + gx;
           const w = 1 / (d2 + 4); // +4 keeps the weight finite directly over a sensor
-          weightSum += w;
-          aqiSum += point.aqi * w;
-          if (d2 < nearest2) nearest2 = d2;
+          weightSum[idx] += w;
+          aqiSum[idx] += point.aqi * w;
+          if (d2 < nearest2[idx]) nearest2[idx] = d2;
         }
-        if (!weightSum) continue;
-        const [r, g, b] = aqiBucketColor(aqiSum / weightSum);
+      }
+    }
+    for (let gy = 0; points.length && gy < rows; gy++) {
+      const rowOffset = gy * cols;
+      for (let gx = 0; gx < cols; gx++) {
+        const idx = rowOffset + gx;
+        const ws = weightSum[idx];
+        if (!ws) continue;
+        const [r, g, b] = aqiBucketColor(aqiSum[idx] / ws);
         // Feather toward the influence edge so blobs fade out instead of
         // ending in a hard circle.
-        const edge = 1 - Math.sqrt(nearest2) / HEATMAP_RADIUS;
+        const edge = 1 - Math.sqrt(nearest2[idx]) / HEATMAP_RADIUS;
         const alpha = HEATMAP_MAX_ALPHA * Math.min(1, edge * 1.6);
-        const offset = (gy * cols + gx) * 4;
+        const offset = idx * 4;
         image.data[offset] = r;
         image.data[offset + 1] = g;
         image.data[offset + 2] = b;
