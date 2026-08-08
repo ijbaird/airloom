@@ -2,6 +2,10 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## Unreleased
+
+- Zooming out past a configurable view width (default 40 km, new "Heat map beyond (km)" preference) now merges the sensor dots into a translucent heat map of interpolated AQI in the legend's colors; zooming back in restores the individual markers.
+
 ## 0.3.4 — 2026-08-07
 
 - The close button on the sensor detail card (and the sensors panel and preferences dialog) is easier to see: the × glyph was rendering at body-text size inside its 34px hit area and now matches the neighboring icons.
