@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.4.0" date="2026-08-08">
+      <description><p>Zooming out past a configurable distance now merges the sensor dots into a heat map of interpolated air quality; zooming back in restores the individual markers. A new "Heat map beyond (km)" preference controls the switch point.</p></description>
+    </release>
     <release version="0.3.4" date="2026-08-07">
       <description><p>The close button on the sensor detail card is larger and easier to see.</p></description>
     </release>
