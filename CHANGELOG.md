@@ -2,6 +2,10 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.3.4 — 2026-08-07
+
+- The close button on the sensor detail card (and the sensors panel and preferences dialog) is easier to see: the × glyph was rendering at body-text size inside its 34px hit area and now matches the neighboring icons.
+
 ## 0.3.3 — 2026-08-07
 
 - The developer debug facility (introduced in 0.3.2) is now excluded from release builds entirely: the module is stripped from Flatpak bundles, and debug mode refuses to activate inside an installed Flatpak even if requested. Development checkouts are unaffected.

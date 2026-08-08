@@ -115,6 +115,7 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .detail-topbar { display: flex; align-items: center; justify-content: space-between; min-height: 32px; color: var(--muted); font-size: 10px; }
 .detail-actions { display: flex; align-items: center; gap: 4px; }
 .favorite-button, .icon-button { width: 34px; height: 34px; display: grid; place-items: center; border: 0; border-radius: 9px; background: transparent; cursor: pointer; }
+.icon-button { font-size: 22px; line-height: 1; }
 .favorite-button:hover, .icon-button:hover { background: var(--soft); }
 .favorite-button.active { color: #d18d12; background: rgba(246,201,69,.16); }
 .favorite-button.active svg path { d: path("m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"); }
@@ -161,7 +162,6 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .settings-dialog form { padding: 22px; overflow-y: auto; }
 .dialog-heading { display: flex; align-items: center; justify-content: space-between; }
 .dialog-heading h2 { color: var(--ink); font-size: 23px; text-transform: none; letter-spacing: -.03em; }
-.dialog-heading .icon-button { font-size: 22px; }
 .dialog-intro { margin: 9px 0 18px; color: var(--muted); line-height: 1.45; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
 .form-grid > label:not(.checkbox) { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; }
