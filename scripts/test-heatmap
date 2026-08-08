@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""End-to-end test for heat map mode, driven over the debug port.
+
+Launches the app via scripts/debug-run on a private socket, waits for
+sensors, then uses window.Airloom.debugZoomTo (through `eval`) to cross
+the heat-map threshold in both directions, asserting that markers and the
+heat map canvas swap correctly. Requires GTK and a display; not part of
+`make test`. Exits 0 on success.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+PROJECT = Path(__file__).resolve().parent.parent
+
+PAINTED_CELLS_JS = """
+(() => {
+  const canvas = document.querySelector("#heatmap");
+  if (canvas.hidden || !canvas.width) return 0;
+  const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+  let painted = 0;
+  for (let i = 3; i < data.length; i += 4) if (data[i] > 0) painted++;
+  return painted;
+})()
+"""
+
+
+def request(sock_path: str, cmd: str, **fields):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    try:
+        sock.connect(sock_path)
+        sock.sendall(json.dumps({"id": 1, "cmd": cmd, **fields}).encode("utf-8") + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("connection closed before a full response")
+            buf += chunk
+    finally:
+        sock.close()
+    response = json.loads(buf.split(b"\n", 1)[0])
+    if not response.get("ok"):
+        raise AssertionError(f"debug command {cmd!r} failed: {response}")
+    return response.get("result")
+
+
+def eval_js(sock_path: str, js: str):
+    return request(sock_path, "eval", js=js)
+
+
+def wait_for(probe, timeout_s: float, what: str):
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            value = probe()
+            if value is not None:
+                return value
+        except (OSError, ConnectionError, AssertionError) as exc:
+            last_error = exc
+        time.sleep(0.4)
+    raise AssertionError(f"timed out after {timeout_s}s waiting for {what} (last error: {last_error})")
+
+
+def check(condition: bool, message: str):
+    if not condition:
+        raise AssertionError(message)
+    print(f"  ok: {message}")
+
+
+def main() -> int:
+    workdir = Path(tempfile.mkdtemp(prefix="airloom-heatmap-test-"))
+    sock_path = str(workdir / "debug.sock")
+    env = {**os.environ, "AIRLOOM_DEBUG_SOCKET": sock_path}
+    print(f"work dir (screenshots): {workdir}")
+    app = subprocess.Popen([str(PROJECT / "scripts" / "debug-run")], env=env)
+    try:
+        wait_for(lambda: request(sock_path, "ping") or True, 25, "debug socket")
+        wait_for(
+            lambda: (request(sock_path, "state").get("sensorCount", 0) > 0) or None,
+            30,
+            "sensors to load",
+        )
+
+        print("— markers mode (zoom 14) —")
+        eval_js(sock_path, "window.Airloom.debugZoomTo(14)")
+        state = request(sock_path, "state")
+        check(state["viewportKm"] < 40, f"viewport {state['viewportKm']:.1f} km is under the 40 km default")
+        check(state["heatmapActive"] is False, "heatmapActive is false when zoomed in")
+        markers = eval_js(sock_path, "document.querySelectorAll('.map-marker').length")
+        check(markers > 0, f"{markers} markers rendered when zoomed in")
+        check(eval_js(sock_path, PAINTED_CELLS_JS) == 0, "heat map canvas is blank when zoomed in")
+        request(sock_path, "screenshot", path=str(workdir / "1-markers.png"))
+
+        print("— heat map mode (zoom 8) —")
+        eval_js(sock_path, "window.Airloom.debugZoomTo(8)")
+        state = request(sock_path, "state")
+        check(state["viewportKm"] > 40, f"viewport {state['viewportKm']:.1f} km exceeds the 40 km default")
+        check(state["heatmapActive"] is True, "heatmapActive is true when zoomed out")
+        markers = eval_js(sock_path, "document.querySelectorAll('.map-marker').length")
+        check(markers == 0, "no markers rendered in heat map mode")
+        painted = eval_js(sock_path, PAINTED_CELLS_JS)
+        check(painted > 0, f"heat map canvas has {painted} painted cells")
+        check(eval_js(sock_path, "document.querySelector('#map-popup').hidden") is True,
+              "marker popup is closed in heat map mode")
+        request(sock_path, "screenshot", path=str(workdir / "2-heatmap.png"))
+
+        print("— back to markers (zoom 14) —")
+        eval_js(sock_path, "window.Airloom.debugZoomTo(14)")
+        state = request(sock_path, "state")
+        check(state["heatmapActive"] is False, "heatmapActive is false again after zooming back in")
+        markers = eval_js(sock_path, "document.querySelectorAll('.map-marker').length")
+        check(markers > 0, f"{markers} markers restored after zooming back in")
+        check(eval_js(sock_path, PAINTED_CELLS_JS) == 0, "heat map canvas cleared after zooming back in")
+        request(sock_path, "screenshot", path=str(workdir / "3-markers-again.png"))
+
+        print("PASS")
+        return 0
+    finally:
+        try:
+            request(sock_path, "quit")
+            app.wait(timeout=10)
+        except (AssertionError, OSError, ConnectionError, subprocess.TimeoutExpired):
+            app.kill()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except AssertionError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        raise SystemExit(1)
