@@ -85,6 +85,13 @@
       if (el.isConnected) el.click();
       return { tag: el.tagName, id: el.id || null, className: el.className || null };
     },
+    debugZoomTo(zoom) {
+      cancelZoomAnimation();
+      applyZoom(Number(zoom), centerAnchor());
+      renderMapMarkers();
+      scheduleViewChanged();
+      return state.zoom;
+    },
   };
 
   function stampPlaceName() {
