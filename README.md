@@ -43,6 +43,21 @@ The default prefix is `/usr/local`; package builds can set `PREFIX` and `DESTDIR
 
 ## Flatpak
 
+### Install (recommended — auto-updating)
+
+    flatpak install --user https://ijbaird.github.io/airloom/airloom.flatpakref
+
+Updates then arrive automatically through GNOME Software, or manually with
+`flatpak update`.
+
+Already installed from a downloaded bundle? Reinstall once from any current
+bundle (`flatpak install --user --reinstall ./Airloom-x86_64.flatpak`) or add
+the remote directly (`flatpak remote-add --user airloom
+https://ijbaird.github.io/airloom/airloom.flatpakrepo`) — after that you're
+on automatic updates too.
+
+### Build from source (offline)
+
 The manifest at `packaging/ai.stealthvision.Airloom.yml` targets the GNOME 50 runtime used by Fedora 44. Build it from the repository root after installing the matching runtime and SDK:
 
 ```bash
