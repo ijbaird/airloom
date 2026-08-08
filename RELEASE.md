@@ -10,7 +10,7 @@ To publish a release:
 
 The `Flatpak` workflow downloads both architecture artifacts, generates `SHA256SUMS`, creates the GitHub release with generated notes, and attaches the bundles and checksums.
 
-The tag push also publishes the signed flatpak update repository to GitHub Pages (https://ijbaird.github.io/airloom/), which is how installed copies auto-update. If the Pages deploy fails or needs re-running, trigger the `Flatpak` workflow manually (workflow_dispatch) from the release tag — the publish job is idempotent. The repo signing key lives in the `FLATPAK_GPG_PRIVATE_KEY` Actions secret (backup: `~/.airloom-flatpak-signing` on the maintainer's machine).
+The tag push also publishes the signed flatpak update repository to GitHub Pages (https://ijbaird.github.io/airloom/), which is how installed copies auto-update. If the Pages deploy fails or needs re-running, trigger the `Flatpak` workflow manually (workflow_dispatch) from the release tag — the publish job is idempotent. The repo signing key lives in the `FLATPAK_GPG_PRIVATE_KEY` Actions secret; the canonical copy is the 1Password item "Airloom Flatpak Signing Key" (personal vault), which can re-set the secret via `op document get "Airloom Flatpak Signing Key" | gh secret set FLATPAK_GPG_PRIVATE_KEY`.
 
 Install a downloaded bundle with:
 
