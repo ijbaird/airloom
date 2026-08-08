@@ -1,7 +1,21 @@
+"""Airloom's Adw.Application shell.
+
+Debug-instance signaling: when ``AIRLOOM_DEBUG_SOCKET`` is set, GNOME/Wayland
+gives an agent-launched instance no reliably distinct taskbar icon — the
+dock/switcher follow the app-id's desktop entry regardless of what
+``Gtk.Window.set_icon_name`` is told at runtime, so this module does not
+fight that. The **reliable** signals that a window belongs to a debug
+instance are the window title (``"Airloom · DEBUG"``) and the red header bar
+CSS (see ``_apply_debug_chrome``); the best-effort icon override is applied
+too but is not something to depend on.
+"""
+
 from __future__ import annotations
 
+import base64
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -18,7 +32,7 @@ from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 
 from . import __version__
 from .bridge import decode_message
-from .debugport import DebugPort
+from .debugport import DebugPort, validate_command
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
 from .location import GeoClueLocator, is_coarse_fix
@@ -29,6 +43,11 @@ from .store import Store
 # How long a debug-port `eval` command waits for evaluate_javascript to
 # call back before giving up and returning a timeout error to the client.
 DEBUG_EVAL_TIMEOUT_SECONDS = 5
+# Same idea for `screenshot`'s get_snapshot round-trip.
+DEBUG_SCREENSHOT_TIMEOUT_SECONDS = 10
+# `git describe` should return almost instantly; this is a backstop against
+# a wedged/misconfigured git rather than a realistic expectation.
+DEBUG_BUILD_ID_TIMEOUT_SECONDS = 2
 
 
 APP_ID = "ai.stealthvision.Airloom"
@@ -50,7 +69,21 @@ def _no_sensors_message(mode: str) -> str:
 
 class AirloomApplication(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        # Decided once, up front: every debug-instance signal (window
+        # title/color, GApplication uniqueness, the in-page badge, the new
+        # debug commands) reads this single flag rather than re-checking the
+        # environment.
+        self.debug_mode = bool(os.environ.get("AIRLOOM_DEBUG_SOCKET"))
+        # With the default (unique) GApplication flags, a second launch just
+        # activates the already-running instance instead of starting a new
+        # one — fatal for a debug launch, which must always be its own
+        # process so an agent can find and quit it independently of whatever
+        # instance the user has open.
+        flags = Gio.ApplicationFlags.NON_UNIQUE if self.debug_mode else Gio.ApplicationFlags.DEFAULT_FLAGS
+        super().__init__(application_id=APP_ID, flags=flags)
+        # `git describe` once at startup, not per `version` call — see
+        # _compute_build_id.
+        self._debug_build_id: str | None = self._compute_build_id() if self.debug_mode else None
         self.store = Store()
         self.window: Adw.ApplicationWindow | None = None
         self.webview: WebKit.WebView | None = None
@@ -85,13 +118,16 @@ class AirloomApplication(Adw.Application):
             return
 
         Notify.init("Airloom")
-        self.window = Adw.ApplicationWindow(application=self, title="Airloom")
+        window_title = "Airloom · DEBUG" if self.debug_mode else "Airloom"
+        self.window = Adw.ApplicationWindow(application=self, title=window_title)
         self.window.set_default_size(1240, 780)
         self.window.set_size_request(760, 540)
+        if self.debug_mode:
+            self._apply_debug_chrome()
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        self.title = Adw.WindowTitle(title="Airloom", subtitle=self.store.data["location_name"])
+        self.title = Adw.WindowTitle(title=window_title, subtitle=self.store.data["location_name"])
         header.set_title_widget(self.title)
 
         refresh_button = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh readings")
@@ -146,6 +182,50 @@ class AirloomApplication(Adw.Application):
             self._debug_port = DebugPort(debug_socket_path, self._dispatch_debug_command)
             self._debug_port.start()
             print(f"Airloom: debug port listening on {debug_socket_path}", file=sys.stderr)
+
+    def _apply_debug_chrome(self) -> None:
+        """Make a debug-mode window impossible to mistake for a normal one.
+
+        Adds the `airloom-debug` CSS class to the window and installs an
+        application-priority CssProvider that paints the header bar red —
+        see the module docstring for why this (plus the window title) is
+        the reliable signal rather than the taskbar icon.
+        """
+        self.window.add_css_class("airloom-debug")
+        provider = Gtk.CssProvider()
+        provider.load_from_string(
+            ".airloom-debug headerbar { background: #b3261e; color: #ffffff; }"
+            ".airloom-debug headerbar windowtitle .subtitle { color: #ffd8d4; }"
+        )
+        Gtk.StyleContext.add_provider_for_display(
+            self.window.get_display(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        # Best-effort only — see module docstring.
+        if hasattr(self.window, "set_icon_name"):
+            self.window.set_icon_name("applications-engineering-symbolic")
+
+    @staticmethod
+    def _compute_build_id() -> str | None:
+        """`git describe --always --dirty` for the checkout this package runs
+        from, computed once at startup (see __init__) since it never changes
+        for the life of the process. Returns None on any failure (git
+        missing, not a checkout, e.g. inside a Flatpak/installed build) —
+        this is a debug nicety, never load-bearing.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "describe", "--always", "--dirty"],
+                cwd=str(Path(__file__).resolve().parent),
+                capture_output=True,
+                text=True,
+                timeout=DEBUG_BUILD_ID_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 — any failure means "no build id", not a crash
+            return None
+        if result.returncode != 0:
+            return None
+        build = result.stdout.strip()
+        return build or None
 
     def _start_locator(self) -> None:
         if self.locator is not None:
@@ -665,14 +745,42 @@ class AirloomApplication(Adw.Application):
 
     def _handle_debug_command(self, message: dict, reply) -> None:
         cmd = message.get("cmd")
-        if cmd == "ping":
-            reply({"ok": True, "result": {"pong": True}})
-        elif cmd == "eval":
+        # `eval` and `pinch` predate the validate_command() table and keep
+        # their own inline validation; every other command's parameters are
+        # validated there before any handler below sees them, so an
+        # unrecognized `cmd` (or bad params) always fails closed without a
+        # handler ever running.
+        if cmd == "eval":
             self._debug_eval(message, reply)
-        elif cmd == "pinch":
+            return
+        if cmd == "pinch":
             self._debug_pinch(message, reply)
-        else:
-            reply({"ok": False, "error": f"unknown cmd: {cmd!r}"})
+            return
+        params, error = validate_command(message)
+        if error is not None:
+            reply({"ok": False, "error": error})
+            return
+        if cmd == "ping":
+            reply(
+                {
+                    "ok": True,
+                    "result": {"pong": True, "version": __version__, "pid": os.getpid(), "debug": True},
+                }
+            )
+        elif cmd == "version":
+            self._debug_version(reply)
+        elif cmd == "state":
+            self._debug_state(reply)
+        elif cmd == "tap":
+            self._debug_tap(params, reply)
+        elif cmd == "search":
+            self._debug_search(params, reply)
+        elif cmd == "key":
+            self._debug_key(params, reply)
+        elif cmd == "screenshot":
+            self._debug_screenshot(params, reply)
+        elif cmd == "quit":
+            self._debug_quit(reply)
 
     def _debug_pinch(self, message: dict, reply) -> None:
         phase = message.get("phase")
@@ -699,6 +807,113 @@ class AirloomApplication(Adw.Application):
         if not isinstance(js, str):
             reply({"ok": False, "error": "eval requires a string 'js' field"})
             return
+        self._debug_evaluate(js, reply)
+
+    def _debug_version(self, reply) -> None:
+        reply(
+            {
+                "ok": True,
+                "result": {
+                    "version": __version__,
+                    "build": self._debug_build_id,
+                    "pid": os.getpid(),
+                    "debug": True,
+                },
+            }
+        )
+
+    def _debug_state(self, reply) -> None:
+        # window.Airloom.debugState() (app.js) is the single source of truth
+        # for page state; this command is just eval's plumbing pointed at it
+        # so a client gets one round-trip instead of composing its own JS.
+        self._debug_evaluate("window.Airloom.debugState()", reply)
+
+    def _debug_tap(self, params: dict, reply) -> None:
+        js = f"window.Airloom.debugTap({json.dumps(params['x'])}, {json.dumps(params['y'])})"
+        self._debug_evaluate(js, reply)
+
+    def _debug_search(self, params: dict, reply) -> None:
+        js = f"window.Airloom.debugSearch({json.dumps(params['query'])})"
+        self._debug_evaluate(js, reply)
+
+    def _debug_key(self, params: dict, reply) -> None:
+        js = f"window.Airloom.debugKey({json.dumps(params['key'])})"
+        self._debug_evaluate(js, reply)
+
+    def _debug_quit(self, reply) -> None:
+        # Reply before quitting so the client sees {"ok": true} rather than
+        # a connection drop — the 50ms delay just needs to be long enough
+        # for DebugPort's sendall() to flush ahead of the process exiting.
+        reply({"ok": True})
+        GLib.timeout_add(50, lambda: (self.quit(), GLib.SOURCE_REMOVE)[1])
+
+    def _debug_screenshot(self, params: dict, reply) -> None:
+        """`{"path": "/abs/path.png"}` (or no path) → PNG of the webview.
+
+        This is webview content only — the WebKit snapshot API has no
+        notion of the surrounding GTK header bar/window chrome, so a
+        screenshot can never be used to confirm the debug-mode red header
+        or "Airloom · DEBUG" window title; those are visible signals for a
+        human looking at the window, not something a screenshot or `eval`
+        can assert on. `ping`/`version` reporting `"debug": true` is the
+        machine-checkable equivalent.
+        """
+        if not self.webview:
+            reply({"ok": False, "error": "webview not available"})
+            return
+        path = params.get("path")
+
+        done = False
+        timeout_id: list[int | None] = [None]
+
+        def finish(response: dict) -> None:
+            nonlocal done
+            if done:
+                return
+            done = True
+            if timeout_id[0] is not None:
+                GLib.source_remove(timeout_id[0])
+                timeout_id[0] = None
+            reply(response)
+
+        def on_timeout() -> bool:
+            timeout_id[0] = None
+            finish({"ok": False, "error": "screenshot timed out"})
+            return GLib.SOURCE_REMOVE
+
+        timeout_id[0] = GLib.timeout_add_seconds(DEBUG_SCREENSHOT_TIMEOUT_SECONDS, on_timeout)
+
+        def on_result(webview, task, _data) -> None:
+            try:
+                texture = webview.get_snapshot_finish(task)
+            except GLib.Error as exc:
+                finish({"ok": False, "error": str(exc)})
+                return
+            try:
+                data = texture.save_to_png_bytes().get_data()
+            except Exception as exc:  # noqa: BLE001 — genuinely unencodable texture
+                finish({"ok": False, "error": f"failed to encode png: {exc}"})
+                return
+            if path:
+                try:
+                    with open(path, "wb") as handle:
+                        handle.write(data)
+                except OSError as exc:
+                    finish({"ok": False, "error": f"failed to write {path}: {exc}"})
+                    return
+                finish({"ok": True, "result": {"path": path, "bytes": len(data)}})
+            else:
+                finish({"ok": True, "result": {"png_base64": base64.b64encode(data).decode("ascii")}})
+
+        self.webview.get_snapshot(
+            WebKit.SnapshotRegion.VISIBLE, WebKit.SnapshotOptions.NONE, None, on_result, None
+        )
+
+    def _debug_evaluate(self, js: str, reply) -> None:
+        """Evaluate `js` in the webview and reply with its JSON-decoded
+        result. Shared by `eval` itself and every other debug command that
+        drives or reads page state through a window.Airloom.debug* helper.
+        """
         if not self.webview:
             reply({"ok": False, "error": "webview not available"})
             return
