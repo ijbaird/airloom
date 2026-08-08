@@ -43,6 +43,23 @@ The default prefix is `/usr/local`; package builds can set `PREFIX` and `DESTDIR
 
 ## Flatpak
 
+### Install (recommended — auto-updating)
+
+    flatpak install --user https://ijbaird.github.io/airloom/airloom.flatpakref
+
+Updates then arrive automatically through GNOME Software, or manually with
+`flatpak update`.
+
+Already installed from a downloaded bundle? Reinstall once from any current
+bundle (`flatpak install --user --reinstall ./Airloom-x86_64.flatpak`) or add
+the remote and reinstall from it (`flatpak remote-add --user airloom
+https://ijbaird.github.io/airloom/airloom.flatpakrepo && flatpak install
+--user --reinstall airloom ai.stealthvision.Airloom`) — either way rebinds
+the app's origin to the remote, so after that you're on automatic updates
+too.
+
+### Build from source (offline)
+
 The manifest at `packaging/ai.stealthvision.Airloom.yml` targets the GNOME 50 runtime used by Fedora 44. Build it from the repository root after installing the matching runtime and SDK:
 
 ```bash
@@ -55,7 +72,7 @@ The bundle is written to `dist/Airloom-<version>-<architecture>.flatpak` with a 
 flatpak install --user ./dist/Airloom-0.1.0-x86_64.flatpak
 ```
 
-GitHub Actions builds x86_64 and aarch64 bundles for every pull request and push. Tagged versions (`vX.Y.Z`) automatically become GitHub releases containing both bundles and `SHA256SUMS`; see [RELEASE.md](RELEASE.md).
+GitHub Actions builds x86_64 and aarch64 bundles for every pull request and push. Tagged versions (`vX.Y.Z`) automatically become GitHub releases containing both bundles and `SHA256SUMS`, and also publish the auto-update Flatpak repository above to GitHub Pages; see [RELEASE.md](RELEASE.md).
 
 ## Data and privacy
 
