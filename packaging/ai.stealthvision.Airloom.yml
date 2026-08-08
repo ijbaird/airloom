@@ -16,7 +16,7 @@ modules:
     buildsystem: simple
     build-commands:
       - install -d /app/share/airloom
-      - tar --exclude='__pycache__' --exclude='*.pyc' -cf - airloom | tar -xf - -C /app/share/airloom
+      - tar --exclude='__pycache__' --exclude='*.pyc' --exclude='airloom/debugport.py' -cf - airloom | tar -xf - -C /app/share/airloom
       - install -Dm755 run-flatpak /app/bin/airloom
       - install -Dm644 packaging/ai.stealthvision.Airloom.desktop /app/share/applications/ai.stealthvision.Airloom.desktop
       - install -Dm644 packaging/ai.stealthvision.Airloom.metainfo.xml /app/share/metainfo/ai.stealthvision.Airloom.metainfo.xml

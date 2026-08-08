@@ -32,7 +32,13 @@ from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 
 from . import __version__
 from .bridge import decode_message
-from .debugport import DebugPort, validate_command
+# Release bundles strip airloom/debugport.py (see packaging/*.yml), so debug
+# support degrades to "absent" rather than erroring when the module is gone.
+try:
+    from .debugport import DebugPort, validate_command
+except ImportError:  # pragma: no cover — only true in stripped release builds
+    DebugPort = None
+    validate_command = None
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
 from .location import GeoClueLocator, is_coarse_fix
@@ -70,10 +76,20 @@ def _no_sensors_message(mode: str) -> str:
 class AirloomApplication(Adw.Application):
     def __init__(self):
         # Decided once, up front: every debug-instance signal (window
-        # title/color, GApplication uniqueness, the in-page badge, the new
-        # debug commands) reads this single flag rather than re-checking the
-        # environment.
-        self.debug_mode = bool(os.environ.get("AIRLOOM_DEBUG_SOCKET"))
+        # title/color, GApplication uniqueness, the new debug commands)
+        # reads this single flag rather than re-checking the environment.
+        # Debug mode requires all three: the env var opting in, the module
+        # actually present (release bundles strip it), and NOT running from
+        # an installed Flatpak (/.flatpak-info exists inside the sandbox) —
+        # a release artifact must stay inert even if someone sets the env
+        # var, and even in a hand-rolled bundle that forgot the strip.
+        self.debug_mode = (
+            bool(os.environ.get("AIRLOOM_DEBUG_SOCKET"))
+            and DebugPort is not None
+            and not os.path.exists("/.flatpak-info")
+        )
+        if os.environ.get("AIRLOOM_DEBUG_SOCKET") and not self.debug_mode:
+            print("Airloom: debug support is not available in this build", file=sys.stderr)
         # With the default (unique) GApplication flags, a second launch just
         # activates the already-running instance instead of starting a new
         # one — fatal for a debug launch, which must always be its own
@@ -178,7 +194,7 @@ class AirloomApplication(Adw.Application):
             self._start_locator_when_focused()
 
         debug_socket_path = os.environ.get("AIRLOOM_DEBUG_SOCKET")
-        if debug_socket_path:
+        if debug_socket_path and self.debug_mode:
             self._debug_port = DebugPort(debug_socket_path, self._dispatch_debug_command)
             self._debug_port.start()
             print(f"Airloom: debug port listening on {debug_socket_path}", file=sys.stderr)
