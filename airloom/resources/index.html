@@ -134,6 +134,7 @@
           </label>
           <input type="hidden" name="home_lat"><input type="hidden" name="home_lon"><input type="hidden" name="location_name">
           <label><span>Map radius (km)</span><input name="radius_km" type="number" step="1" min="2" max="100" required></label>
+          <label><span>Heat map beyond (km)</span><input name="heatmap_threshold_km" type="number" step="1" min="5" max="1000" required></label>
           <label><span>Alert at AQI</span><input name="alert_threshold" type="number" step="1" min="1" max="500" required></label>
           <fieldset class="wide"><legend>Temperature</legend><label><input name="temperature_unit" type="radio" value="F"><span>Fahrenheit</span></label><label><input name="temperature_unit" type="radio" value="C"><span>Celsius</span></label></fieldset>
         </div>

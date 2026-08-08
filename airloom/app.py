@@ -572,10 +572,12 @@ class AirloomApplication(Adw.Application):
         previous_mode = self.store.data.get("home_mode")
         try:
             radius = max(2.0, min(100.0, float(message["radius_km"])))
+            heatmap = max(5.0, min(1000.0, float(message["heatmap_threshold_km"])))
             threshold = max(1, min(500, int(message["alert_threshold"])))
             home_mode = "fixed" if message.get("home_mode") == "fixed" else "auto"
             updates = {
                 "radius_km": radius,
+                "heatmap_threshold_km": heatmap,
                 "alert_threshold": threshold,
                 "home_mode": home_mode,
                 "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
