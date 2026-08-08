@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.3.3" date="2026-08-07">
+      <description><p>Hardening release: development debugging support is now fully excluded from installed builds.</p></description>
+    </release>
     <release version="0.3.2" date="2026-08-07">
       <description><p>Trackpad pinch now zooms the map around your fingers instead of scaling the whole window: the gesture is intercepted before the web engine can apply its internal page zoom.</p></description>
     </release>

@@ -2,6 +2,11 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.3.3 — 2026-08-07
+
+- The developer debug facility (introduced in 0.3.2) is now excluded from release builds entirely: the module is stripped from Flatpak bundles, and debug mode refuses to activate inside an installed Flatpak even if requested. Development checkouts are unaffected.
+- Developer tooling: richer debug commands (version/build identity, tap, search, key, state snapshot, PNG screenshots over the wire, quit), `scripts/debug-run`/`scripts/debug-client`, and unmistakable debug-instance chrome (red header bar, "Airloom · DEBUG" title, non-unique instance).
+
 ## 0.3.2 — 2026-08-07
 
 - Fixed trackpad pinch really this time: WebKitGTK consumes touchpad pinch internally as page-scale zoom before the page ever sees it, so 0.3.0's in-page handlers never ran. The gesture is now intercepted at the GTK layer (capture-phase claim) and forwarded to the map, which zooms smoothly around the pinch point; the interface chrome stays put.
