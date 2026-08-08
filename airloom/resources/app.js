@@ -631,7 +631,7 @@
   function renderMapMarkers() {
     const view = mapViewport();
     if (!view.width) return;
-    if (heatmapActive()) { $("#markers").innerHTML = ""; return; }
+    if (heatmapActive()) { $("#markers").innerHTML = ""; markerDriftX = markerDriftY = 0; renderHeatmap(view); return; }
     markerDriftX = markerDriftY = 0;
     const pad = MARKER_CULL_PAD;
     const markers = visibleSensors().map((sensor) => {

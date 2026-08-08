@@ -81,6 +81,7 @@ def main() -> int:
     workdir = Path(tempfile.mkdtemp(prefix="airloom-heatmap-test-"))
     sock_path = str(workdir / "debug.sock")
     env = {**os.environ, "AIRLOOM_DEBUG_SOCKET": sock_path}
+    env["XDG_CONFIG_HOME"] = str(workdir / "config")
     print(f"work dir (screenshots): {workdir}")
     app = subprocess.Popen([str(PROJECT / "scripts" / "debug-run")], env=env)
     try:
@@ -131,6 +132,10 @@ def main() -> int:
             app.wait(timeout=10)
         except (AssertionError, OSError, ConnectionError, subprocess.TimeoutExpired):
             app.kill()
+            try:
+                app.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 if __name__ == "__main__":
