@@ -25,6 +25,22 @@ when the visible map width exceeds N kilometers, the heat map is shown.
 - No hysteresis: the comparison is deterministic and cheap; crossing the
   boundary mid-pinch just swaps layers on the next frame.
 
+### Choosing the 40 km default
+
+Three independent estimates converge on ~40 km:
+
+1. **Marker collision.** Markers are ~28 px circles that overlap below ~32 px
+   spacing. Dense urban PurpleAir coverage runs about one sensor per 1–2 km;
+   on a typical ~1200 px panel, 1 km ≈ 34 px when the viewport is 35 km wide.
+   So city-core dots start colliding at roughly a 35–40 km view width.
+2. **Zoom mapping.** At 1200 px and mid-latitudes (~39°N), viewport width is
+   ≈ 18 km at zoom 13, 36 km at zoom 12, 71 km at zoom 11. A 40 km threshold
+   flips between zoom 12 and 11: markers persist at neighborhood scale, the
+   field view takes over at metro scale and beyond.
+3. **Data extent.** The default fetch radius is 22 km, so the sensor field
+   spans ~44 km. Once the viewport is wider than the data, dots are just a
+   clump in the middle; a ~40 km threshold switches modes right there.
+
 ## Rendering (approach A: interpolated AQI field)
 
 - A `<canvas id="heatmap">` element sits in the map panel between the tile
