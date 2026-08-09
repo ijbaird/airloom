@@ -23,6 +23,9 @@
               <button class="icon-button popup-star" id="popup-favorite" title="Favorite this sensor" aria-label="Favorite this sensor">
                 <svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg>
               </button>
+              <button class="icon-button popup-star" id="popup-hide" title="Hide this sensor" aria-label="Hide this sensor">
+                <svg viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5c0 .65-.13 1.26-.36 1.83l2.92 2.92A11.8 11.8 0 0 0 22.99 12C21.26 7.61 17 4.5 12 4.5c-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7ZM2 4.27l2.74 2.74C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84L19.73 22 21 20.73 3.27 3 2 4.27ZM7.53 9.8l1.55 1.55a3 3 0 0 0 3.57 3.57l1.55 1.55A5 5 0 0 1 7.53 9.8Zm4.31-.78 3.13 3.13.03-.15a3 3 0 0 0-3-3l-.16.02Z"/></svg>
+              </button>
             </div>
             <div class="popup-actions">
               <button id="popup-details" class="popup-action">Details</button>
@@ -86,6 +89,9 @@
             <button class="favorite-button" id="favorite-button" title="Favorite this sensor" aria-label="Favorite this sensor">
               <svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Zm0-2.3 3.5 2-.8-3.9 3-2.7-4.1-.5L12 6.2l-1.6 3.7-4.1.5 3 2.7-.8 3.9 3.5-2Z"/></svg>
             </button>
+            <button class="icon-button" id="hide-button" title="Hide this sensor" aria-label="Hide this sensor">
+              <svg viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5c0 .65-.13 1.26-.36 1.83l2.92 2.92A11.8 11.8 0 0 0 22.99 12C21.26 7.61 17 4.5 12 4.5c-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7ZM2 4.27l2.74 2.74C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84L19.73 22 21 20.73 3.27 3 2 4.27ZM7.53 9.8l1.55 1.55a3 3 0 0 0 3.57 3.57l1.55 1.55A5 5 0 0 1 7.53 9.8Zm4.31-.78 3.13 3.13.03-.15a3 3 0 0 0-3-3l-.16.02Z"/></svg>
+            </button>
             <button class="icon-button" id="close-detail" aria-label="Close detail">×</button>
           </span>
         </div>
@@ -138,6 +144,10 @@
           <label><span>Heat map beyond (km)</span><input name="heatmap_threshold_km" type="number" step="1" min="5" max="1000" required></label>
           <label><span>Alert at AQI</span><input name="alert_threshold" type="number" step="1" min="1" max="500" required></label>
           <fieldset class="wide"><legend>Temperature</legend><label><input name="temperature_unit" type="radio" value="F"><span>Fahrenheit</span></label><label><input name="temperature_unit" type="radio" value="C"><span>Celsius</span></label></fieldset>
+          <fieldset class="wide hidden-fieldset"><legend>Hidden sensors</legend>
+            <div class="hidden-list" id="hidden-list"></div>
+            <button type="button" id="unhide-all" class="unhide-button" hidden>Unhide all</button>
+          </fieldset>
         </div>
         <p class="privacy-note">Your key and favorites stay in a private local config file. Location detection uses your system's GeoClue service; place search and labels use OpenStreetMap Nominatim; map tiles load from OpenStreetMap; your coordinates go to PurpleAir only as map bounds when live data is enabled.</p>
         <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>

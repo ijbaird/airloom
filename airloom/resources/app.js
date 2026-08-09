@@ -5,7 +5,8 @@
   const state = {
     sensors: [],
     selectedId: null,
-    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "", location_filter: "outdoor" },
+    previewHidden: [],
+    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "", location_filter: "outdoor", hidden: [] },
     source: "Starting Airloom",
     center: { lat: 45.5152, lon: -122.6784 },
     home: { lat: 45.5152, lon: -122.6784 },
@@ -57,6 +58,7 @@
       popupId: state.popupId,
       popupHidden: $("#map-popup").hidden,
       location_filter: state.config.location_filter,
+      hiddenCount: (state.config.hidden || []).length,
       source: state.source,
       viewportScale: window.visualViewport ? window.visualViewport.scale : null,
     }),
@@ -142,6 +144,7 @@
     $("#data-source").textContent = state.source;
     renderAll();
     reconcilePopup();
+    if ($("#settings-dialog").open) renderHiddenList();
   }
 
   function renderAll() {
@@ -702,7 +705,48 @@
     form.elements.location_name.value = config.location_name || "";
     $("#home-place-status").textContent = config.home_mode === "fixed" ? `Fixed: ${config.location_name}` : "No fixed home chosen";
     $("#key-status").textContent = config.has_api_key ? `Saved key ${config.api_key_hint}` : "No key saved — demo mode";
+    renderHiddenList();
     $("#settings-dialog").showModal();
+  }
+
+  function renderHiddenList() {
+    const items = state.config.hidden || [];
+    $("#hidden-list").innerHTML = items.length
+      ? items.map((item) => `<div class="hidden-row"><span>${escapeHtml(item.name || `Sensor ${item.id}`)}</span><button type="button" class="unhide-button" data-id="${item.id}">Unhide</button></div>`).join("")
+      : '<div class="empty-state small">No hidden sensors.</div>';
+    const all = $("#unhide-all");
+    all.hidden = !items.length;
+    all.textContent = `Unhide all (${items.length})`;
+    document.querySelectorAll("#hidden-list .unhide-button").forEach((button) => button.addEventListener("click", () => requestUnhide(Number(button.dataset.id))));
+  }
+
+  // Bridge mode: Python owns hiding and answers with a fresh sensors payload.
+  // Preview mode: emulate it locally so the UI stays explorable in a browser.
+  function requestHide(id) {
+    if (window.webkit?.messageHandlers?.airloom) { bridge({ action: "hide", id }); return; }
+    const index = state.sensors.findIndex((s) => s.id === id);
+    if (index < 0) return;
+    const [sensor] = state.sensors.splice(index, 1);
+    state.previewHidden.push(sensor);
+    previewSyncHidden();
+  }
+
+  function requestUnhide(id) {
+    if (window.webkit?.messageHandlers?.airloom) { bridge({ action: "unhide", id }); return; }
+    const index = state.previewHidden.findIndex((s) => s.id === id);
+    if (index < 0) return;
+    state.sensors.push(...state.previewHidden.splice(index, 1));
+    previewSyncHidden();
+  }
+
+  function previewSyncHidden() {
+    state.config.hidden = state.previewHidden
+      .map((s) => ({ id: s.id, name: s.name }))
+      .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || a.id - b.id);
+    if (!state.sensors.some((s) => s.id === state.selectedId)) state.selectedId = state.sensors[0]?.id ?? null;
+    renderAll();
+    reconcilePopup();
+    if ($("#settings-dialog").open) renderHiddenList();
   }
 
   function toast(message) {
@@ -814,8 +858,25 @@
   });
   $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
+  $("#hide-button").addEventListener("click", () => {
+    if (state.selectedId === null) return;
+    const id = state.selectedId;
+    $("#detail-card").hidden = true; // deterministic close; the resend reselects another sensor
+    requestHide(id);
+  });
   $("#popup-details").addEventListener("click", () => { $("#detail-card").hidden = false; renderDetail(); hidePopup(); });
   $("#popup-favorite").addEventListener("click", () => { if (state.popupId !== null) { if (window.webkit?.messageHandlers?.airloom) bridge({ action: "favorite", id: state.popupId }); else { const sensor = state.sensors.find((s) => s.id === state.popupId); if (sensor) { sensor.favorite = !sensor.favorite; renderAll(); showPopup(sensor); } } } });
+  $("#popup-hide").addEventListener("click", () => {
+    if (state.popupId === null) return;
+    const id = state.popupId;
+    hidePopup();
+    requestHide(id);
+  });
+  $("#unhide-all").addEventListener("click", () => {
+    if (window.webkit?.messageHandlers?.airloom) { bridge({ action: "unhide-all" }); return; }
+    state.sensors.push(...state.previewHidden.splice(0));
+    previewSyncHidden();
+  });
   $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) + 1, centerAnchor()); });
   $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) - 1, centerAnchor()); });
   $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); flyTo(state.home.lat, state.home.lon); });
@@ -959,5 +1020,11 @@
   bridge({ action: "ready" });
   // Makes the interface directly previewable in an ordinary browser while the
   // desktop build continues to receive its state from the Python bridge.
-  if (!window.webkit?.messageHandlers?.airloom) setTimeout(() => applySensors({ items: browserPreviewData(), selected_id: 8000, source: "Browser preview · Demo data", config: state.config }), 30);
+  if (!window.webkit?.messageHandlers?.airloom) setTimeout(() => {
+    const preview = browserPreviewData();
+    // Two sensors start hidden so the Settings section is explorable in preview.
+    state.previewHidden = preview.splice(10, 2);
+    state.config.hidden = state.previewHidden.map((s) => ({ id: s.id, name: s.name }));
+    applySensors({ items: preview, selected_id: 8000, source: "Browser preview · Demo data", config: state.config });
+  }, 30);
 })();
