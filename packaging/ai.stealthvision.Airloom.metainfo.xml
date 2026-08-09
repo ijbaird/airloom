@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.11.0" date="2026-08-08">
+      <description><p>Live PurpleAir data is now cached locally, cutting API credit usage dramatically: map areas are reused within a configurable refresh interval (new Refresh interval preference, default 2 minutes), repeat polls fetch only sensors that changed, trend charts load per sensor on demand, and very wide map views cap the fetched area. The header refresh button always forces a fresh poll, and if PurpleAir is unreachable your cached readings are shown instead of demo data.</p></description>
+    </release>
     <release version="0.10.0" date="2026-08-08">
       <description><p>Sensors can now be hidden (for erroneous units) via eye-off buttons on the detail pane and map popup; a new Preferences section lists hidden sensors with per-sensor Unhide and Unhide all. Hidden sensors are excluded everywhere, including alerts; favorites keep their star across hide and unhide.</p></description>
     </release>

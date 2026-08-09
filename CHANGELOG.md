@@ -2,7 +2,7 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
-## Unreleased
+## 0.11.0 — 2026-08-08
 
 - Live PurpleAir data is now cached in a local SQLite database, cutting API point
   usage dramatically: map areas are reused within a configurable refresh interval
@@ -10,8 +10,8 @@ All notable changes to Airloom are documented here. The project follows semantic
   send `modified_since` so only changed sensors are billed, trend charts load
   per-sensor on demand instead of for every sensor on the map, and very wide map
   views cap the fetched area at 200 km. The header refresh button always forces a
-  poll. If PurpleAir is unreachable, Airloom now shows your cached readings (with
-  their age) instead of demo data.
+  poll. If PurpleAir is unreachable, Airloom now shows your cached readings
+  instead of demo data.
 
 ## 0.10.0 — 2026-08-08
 
