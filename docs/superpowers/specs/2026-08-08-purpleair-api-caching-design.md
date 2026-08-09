@@ -110,7 +110,7 @@ missing/stale ones enter the `show_only` call.
 
 ## Settings
 
-New `refresh_minutes` config key in `store.py`: default **5**, allowed {2, 5, 10, 30},
+New `refresh_minutes` config key in `store.py`: default **2**, allowed {2, 5, 10, 30},
 sanitized like other numeric keys, exposed via `public_config()`. The settings dialog
 gains a "Refresh interval" dropdown; `save-settings` persists it and re-arms the
 auto-refresh timer. The same value is the cache TTL — one knob, both behaviors.
