@@ -26,6 +26,7 @@ MAP_FIELDS = (
     "pm1.0",
     "pm2.5_cf_1",
     "pm10.0",
+    "confidence",
 )
 DATA_FIELDS = (
     "sensor_index",
@@ -35,6 +36,7 @@ DATA_FIELDS = (
     "pm1.0",
     "pm2.5_cf_1",
     "pm10.0",
+    "confidence",
 )
 TREND_FETCH_FIELDS = (
     "sensor_index",
@@ -211,6 +213,7 @@ def sensor_from_values(values: dict) -> Sensor | None:
         humidity=_rounded(humidity),
         pm1=_rounded(_number(values.get("pm1.0"))),
         pm10=_rounded(_number(values.get("pm10.0"))),
+        confidence=_integer(values.get("confidence")),
         last_seen=_integer(values.get("last_seen")),
         trend=[],
         indoor=_integer(values.get("location_type")) == 1,

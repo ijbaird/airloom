@@ -702,6 +702,9 @@
     for (const field of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;
+    // "!== false" so the box is checked in browser preview, where config has
+    // no confidence_filter key — matching the Python default of on.
+    form.elements.confidence_filter.checked = config.confidence_filter !== false;
     form.elements.temperature_unit.value = config.temperature_unit || "F";
     form.elements.home_mode.value = config.home_mode || "auto";
     $("#home-place-row").hidden = form.elements.home_mode.value !== "fixed";
@@ -1016,6 +1019,7 @@
     bridge({
       action: "save-settings",
       api_key: form.get("api_key"), clear_api_key: form.get("clear_api_key") === "on",
+      confidence_filter: form.get("confidence_filter") === "on",
       home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
       radius_km: form.get("radius_km"), heatmap_threshold_km: form.get("heatmap_threshold_km"), alert_threshold: form.get("alert_threshold"), refresh_minutes: form.get("refresh_minutes"), temperature_unit: form.get("temperature_unit"),
     });

@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "location_filter": "outdoor",
     "alert_threshold": 101,
     "refresh_minutes": 2,
+    "confidence_filter": True,
     "favorites": [],
     "alert_states": {},
     "hidden": {},
@@ -61,6 +62,8 @@ def _sanitize(data: dict) -> dict:
         clean["location_filter"] = data["location_filter"]
     if data.get("refresh_minutes") in (2, 5, 10, 30) and not isinstance(data.get("refresh_minutes"), bool):
         clean["refresh_minutes"] = int(data["refresh_minutes"])
+    if isinstance(data.get("confidence_filter"), bool):
+        clean["confidence_filter"] = data["confidence_filter"]
     favorites = data.get("favorites")
     if isinstance(favorites, list):
         clean["favorites"] = sorted(
@@ -122,6 +125,7 @@ class Store:
             "location_filter": self.data["location_filter"],
             "alert_threshold": self.data["alert_threshold"],
             "refresh_minutes": self.data["refresh_minutes"],
+            "confidence_filter": self.data["confidence_filter"],
             "has_api_key": has_key,
             "api_key_hint": f"••••{api_key[-4:]}" if has_key and len(api_key) >= 8 else "",
             "hidden": sorted(

@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover — only true in stripped release builds
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
 from .location import GeoClueLocator, is_coarse_fix
-from .models import Sensor
+from .models import Sensor, passes_confidence
 from .purpleair import (
     TREND_FETCH_FIELDS,
     Bounds,
@@ -626,6 +626,7 @@ class AirloomApplication(Adw.Application):
                 "alert_threshold": threshold,
                 "home_mode": home_mode,
                 "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
+                "confidence_filter": bool(message.get("confidence_filter")),
             }
             minutes = int(message["refresh_minutes"])
             if minutes not in (2, 5, 10, 30):
@@ -813,7 +814,11 @@ class AirloomApplication(Adw.Application):
 
     def _send_sensor_state(self, source: str | None = None) -> None:
         hidden = self.store.hidden_ids()
-        visible = [sensor for sensor in self.sensors if sensor.sensor_id not in hidden]
+        confidence_on = bool(self.store.data.get("confidence_filter", True))
+        visible = [
+            sensor for sensor in self.sensors
+            if sensor.sensor_id not in hidden and passes_confidence(sensor, confidence_on)
+        ]
         # Hiding the selected sensor must not leave a dangling selection —
         # same reconciliation rule _finish_refresh applies after a fetch.
         if self.selected_id not in {sensor.sensor_id for sensor in visible}:
@@ -838,8 +843,11 @@ class AirloomApplication(Adw.Application):
             del states[stale_key]
             changed = True
         hidden = self.store.hidden_ids()
+        confidence_on = bool(self.store.data.get("confidence_filter", True))
         for sensor in self.sensors:
             if not sensor.favorite or sensor.aqi is None or sensor.sensor_id in hidden:
+                continue
+            if not passes_confidence(sensor, confidence_on):
                 continue
             key = str(sensor.sensor_id)
             was_high = bool(states.get(key, False))

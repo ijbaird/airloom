@@ -2,6 +2,14 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## Unreleased
+
+- Sensors with poor A/B channel agreement (PurpleAir confidence below 90%) are
+  now hidden by default, with a "Hide low-confidence sensors" preference to show
+  them again. Sensors without a confidence score (e.g. demo data) stay visible.
+- The sensor cache is now schema-versioned and clears itself on upgrade, so
+  newly requested fields are never missing from previously cached readings.
+
 ## 0.11.0 — 2026-08-08
 
 - Live PurpleAir data is now cached in a local SQLite database, cutting API point
