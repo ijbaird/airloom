@@ -2,7 +2,7 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
-## Unreleased
+## 0.12.1 — 2026-08-08
 
 - Fixed: Save & refresh no longer replaces the map's sensors with the home
   area's while you're browsing somewhere else — preferences saves now refetch

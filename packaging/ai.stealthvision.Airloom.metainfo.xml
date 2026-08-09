@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.12.1" date="2026-08-08">
+      <description><p>Fixed: saving preferences no longer jumps the sensor data back to your home area while you are browsing somewhere else on the map — saves now refresh the area you are looking at. Choosing a new fixed home still moves the map there.</p></description>
+    </release>
     <release version="0.12.0" date="2026-08-08">
       <description><p>Sensors with poor agreement between their two laser channels (PurpleAir confidence below 90 percent) are now hidden by default, with a new Hide low-confidence sensors preference to show them again; sensors without a confidence score stay visible. The local sensor cache is now schema-versioned and clears itself once on upgrade so every cached reading carries the new field.</p></description>
     </release>
