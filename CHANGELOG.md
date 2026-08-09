@@ -2,6 +2,17 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## Unreleased
+
+- Live PurpleAir data is now cached in a local SQLite database, cutting API point
+  usage dramatically: map areas are reused within a configurable refresh interval
+  (new "Refresh interval" preference: 2/5/10/30 minutes, default 2), repeat polls
+  send `modified_since` so only changed sensors are billed, trend charts load
+  per-sensor on demand instead of for every sensor on the map, and very wide map
+  views cap the fetched area at 200 km. The header refresh button always forces a
+  poll. If PurpleAir is unreachable, Airloom now shows your cached readings (with
+  their age) instead of demo data.
+
 ## 0.10.0 — 2026-08-08
 
 - Sensors can now be hidden — useful for erroneous units reporting bogus readings. A new eye-off button in the sensor detail pane and the map popup removes the sensor from the map, lists, heat map, counts, and alerts. Preferences gains a "Hidden sensors" section listing hidden sensors by name with per-sensor Unhide and an "Unhide all" action; unhiding restores a sensor instantly, and a hidden favorite keeps its star for when it returns.
