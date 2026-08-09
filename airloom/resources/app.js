@@ -6,7 +6,7 @@
     sensors: [],
     selectedId: null,
     previewHidden: [],
-    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, has_api_key: false, api_key_hint: "", location_filter: "outdoor", hidden: [] },
+    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", hidden: [] },
     source: "Starting Airloom",
     center: { lat: 45.5152, lon: -122.6784 },
     home: { lat: 45.5152, lon: -122.6784 },
@@ -278,7 +278,12 @@
 
   function renderChart(sensor) {
     const points = (sensor.trend || []).filter((point) => Number.isFinite(point.aqi));
-    if (!points.length) { $("#chart").innerHTML = '<div class="empty-state">No trend available</div>'; $("#trend-direction").textContent = "—"; return; }
+    if (!points.length) {
+      const message = state.config.has_api_key ? "Loading trend…" : "No trend available";
+      $("#chart").innerHTML = `<div class="empty-state">${message}</div>`;
+      $("#trend-direction").textContent = "—";
+      return;
+    }
     const width = 300, height = 104, padX = 8, padTop = 9, padBottom = 20;
     const max = Math.max(60, ...points.map((point) => point.aqi)) * 1.12;
     const coordinates = points.map((point, index) => ({
@@ -694,7 +699,7 @@
   function openSettings(config = state.config) {
     if ($("#settings-dialog").open) return;
     const form = $("#settings-form");
-    for (const field of ["radius_km", "alert_threshold", "heatmap_threshold_km"]) form.elements[field].value = config[field];
+    for (const field of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;
     form.elements.temperature_unit.value = config.temperature_unit || "F";
@@ -1012,7 +1017,7 @@
       action: "save-settings",
       api_key: form.get("api_key"), clear_api_key: form.get("clear_api_key") === "on",
       home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
-      radius_km: form.get("radius_km"), heatmap_threshold_km: form.get("heatmap_threshold_km"), alert_threshold: form.get("alert_threshold"), temperature_unit: form.get("temperature_unit"),
+      radius_km: form.get("radius_km"), heatmap_threshold_km: form.get("heatmap_threshold_km"), alert_threshold: form.get("alert_threshold"), refresh_minutes: form.get("refresh_minutes"), temperature_unit: form.get("temperature_unit"),
     });
     $("#settings-dialog").close();
   });

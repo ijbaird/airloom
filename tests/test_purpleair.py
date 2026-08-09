@@ -1,7 +1,9 @@
+import io
 import json
 import unittest
 from unittest import mock
 
+from airloom import purpleair
 from airloom.purpleair import PurpleAirClient, PurpleAirError, Bounds, bounds_around, bounds_contains, parse_sensor_payload
 
 
@@ -156,6 +158,95 @@ class PurpleAirTest(unittest.TestCase):
         self.assertFalse(sensors[2].indoor)
         self.assertFalse(sensors[3].indoor)
         self.assertTrue(sensors[1].to_dict()["indoor"])
+
+
+class FieldListTest(unittest.TestCase):
+    def test_map_fields_exclude_trend_averages(self):
+        for field in purpleair.MAP_FIELDS:
+            self.assertNotIn("minute", field)
+            self.assertNotIn("hour", field)
+            self.assertNotIn("week", field)
+
+    def test_data_fields_exclude_metadata(self):
+        for field in ("name", "latitude", "longitude", "location_type"):
+            self.assertNotIn(field, purpleair.DATA_FIELDS)
+        self.assertIn("sensor_index", purpleair.DATA_FIELDS)
+        self.assertIn("pm2.5_cf_1", purpleair.DATA_FIELDS)
+
+    def test_trend_fetch_fields_carry_humidity_for_epa_correction(self):
+        self.assertIn("humidity", purpleair.TREND_FETCH_FIELDS)
+        self.assertIn("pm2.5_1week", purpleair.TREND_FETCH_FIELDS)
+
+
+class FetchRowsTest(unittest.TestCase):
+    def _fetch_rows_with_payload(self, payload, **kwargs):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            return mock.MagicMock(
+                __enter__=lambda s: io.StringIO(json.dumps(payload)),
+                __exit__=lambda s, *a: False,
+            )
+
+        with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen):
+            result = PurpleAirClient("key").fetch_rows(**kwargs)
+        return captured["url"], result
+
+    def test_modified_since_and_fields_in_query(self):
+        payload = {"fields": ["sensor_index", "pm2.5_cf_1"], "data": [], "time_stamp": 1754680000}
+        url, result = self._fetch_rows_with_payload(
+            payload,
+            bounds=Bounds(46.0, -123.0, 45.0, -122.0),
+            fields=purpleair.DATA_FIELDS,
+            modified_since=1754670000,
+        )
+        self.assertIn("modified_since=1754670000", url)
+        self.assertIn("pm2.5_cf_1", url)
+        self.assertNotIn("latitude", url.split("fields=")[1].split("&")[0])
+        self.assertEqual(result.time_stamp, 1754680000)
+        self.assertEqual(result.rows, [])
+
+    def test_rows_are_raw_value_dicts(self):
+        payload = {
+            "fields": ["sensor_index", "pm2.5_cf_1", "humidity"],
+            "data": [[7, 4.0, 40], [8, 9.0, 55]],
+            "time_stamp": 1754680000,
+        }
+        _, result = self._fetch_rows_with_payload(payload, bounds=Bounds(46.0, -123.0, 45.0, -122.0))
+        self.assertEqual(result.rows[0]["sensor_index"], 7)
+        self.assertEqual(result.rows[1]["humidity"], 55)
+
+
+class SensorFromValuesTest(unittest.TestCase):
+    def test_builds_sensor_and_skips_partial_rows(self):
+        full = {"sensor_index": 7, "name": "Deck", "latitude": 45.5, "longitude": -122.6,
+                "pm2.5_cf_1": 4.0, "humidity": 40}
+        sensor = purpleair.sensor_from_values(full)
+        self.assertEqual(sensor.sensor_id, 7)
+        self.assertIsNotNone(sensor.aqi)
+        self.assertIsNone(purpleair.sensor_from_values({"sensor_index": 7, "pm2.5_cf_1": 4.0}))
+
+    def test_trend_from_values_produces_seven_points(self):
+        values = {"sensor_index": 7, "humidity": 40, "pm2.5_cf_1": 4.0,
+                  "pm2.5_10minute": 4.2, "pm2.5_30minute": 4.4, "pm2.5_60minute": 4.6,
+                  "pm2.5_6hour": 5.0, "pm2.5_24hour": 6.0, "pm2.5_1week": 5.5}
+        trend = purpleair.trend_from_values(values)
+        self.assertEqual([point["label"] for point in trend],
+                         ["1w", "1d", "6h", "1h", "30m", "10m", "Now"])
+        self.assertTrue(all(isinstance(point["aqi"], int) for point in trend))
+
+
+class CapBoundsTest(unittest.TestCase):
+    def test_small_view_passes_through(self):
+        bounds = purpleair.bounds_around(45.5, -122.6, 20.0)
+        self.assertEqual(purpleair.cap_bounds(bounds, (45.5, -122.6)), bounds)
+
+    def test_huge_view_is_capped_around_center(self):
+        bounds = purpleair.Bounds(49.0, -130.0, 32.0, -114.0)  # ~1900 km tall
+        capped = purpleair.cap_bounds(bounds, (40.0, -120.0))
+        self.assertEqual(capped, purpleair.bounds_around(40.0, -120.0, 100.0))
+        self.assertTrue(purpleair.bounds_contains(bounds, capped))
 
 
 if __name__ == "__main__":

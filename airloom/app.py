@@ -32,6 +32,7 @@ from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 
 from . import __version__
 from .bridge import decode_message
+from .cache import SensorCache, fetch_area, fetch_favorites
 # Release bundles strip airloom/debugport.py (see packaging/*.yml), so debug
 # support degrades to "absent" rather than erroring when the module is gone.
 try:
@@ -43,7 +44,17 @@ from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
 from .location import GeoClueLocator, is_coarse_fix
 from .models import Sensor
-from .purpleair import Bounds, PurpleAirClient, PurpleAirError, bounds_around, bounds_contains
+from .purpleair import (
+    TREND_FETCH_FIELDS,
+    Bounds,
+    PurpleAirClient,
+    PurpleAirError,
+    bounds_around,
+    bounds_contains,
+    cap_bounds,
+    sensor_from_values,
+    trend_from_values,
+)
 from .store import Store
 
 # How long a debug-port `eval` command waits for evaluate_javascript to
@@ -58,7 +69,6 @@ DEBUG_BUILD_ID_TIMEOUT_SECONDS = 2
 
 APP_ID = "ai.stealthvision.Airloom"
 RESOURCE_DIR = Path(__file__).parent / "resources"
-AUTO_REFRESH_SECONDS = 300
 LOCATOR_FOCUS_FALLBACK_SECONDS = 20
 
 
@@ -71,6 +81,10 @@ def _filter_demo(sensors: list[Sensor], mode: str) -> list[Sensor]:
 def _no_sensors_message(mode: str) -> str:
     kind = {"outdoor": "outdoor ", "indoor": "indoor "}.get(mode, "")
     return f"No public {kind}sensors were found in this area."
+
+
+def _age_label(seconds: float) -> str:
+    return "just now" if seconds < 90 else f"{int(seconds // 60)} min ago"
 
 
 class AirloomApplication(Adw.Application):
@@ -101,6 +115,8 @@ class AirloomApplication(Adw.Application):
         # _compute_build_id.
         self._debug_build_id: str | None = self._compute_build_id() if self.debug_mode else None
         self.store = Store()
+        self.cache = SensorCache()
+        self._auto_refresh_id: int | None = None
         self.window: Adw.ApplicationWindow | None = None
         self.webview: WebKit.WebView | None = None
         self.title: Adw.WindowTitle | None = None
@@ -147,7 +163,7 @@ class AirloomApplication(Adw.Application):
         header.set_title_widget(self.title)
 
         refresh_button = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh readings")
-        refresh_button.connect("clicked", lambda *_: self.refresh())
+        refresh_button.connect("clicked", lambda *_: self.refresh(force=True))
         header.pack_start(refresh_button)
 
         settings_button = Gtk.Button(icon_name="preferences-system-symbolic", tooltip_text="Preferences")
@@ -189,7 +205,7 @@ class AirloomApplication(Adw.Application):
         toolbar.set_content(self.webview)
         self.window.set_content(toolbar)
         self.window.present()
-        GLib.timeout_add_seconds(AUTO_REFRESH_SECONDS, self._auto_refresh)
+        self._arm_auto_refresh()
         if self.store.data.get("home_mode") == "auto":
             self._start_locator_when_focused()
 
@@ -286,10 +302,18 @@ class AirloomApplication(Adw.Application):
             GLib.source_remove(self._locator_focus_fallback)
             self._locator_focus_fallback = None
 
+    def _refresh_seconds(self) -> int:
+        return int(self.store.data.get("refresh_minutes", 2)) * 60
+
+    def _arm_auto_refresh(self) -> None:
+        if self._auto_refresh_id is not None:
+            GLib.source_remove(self._auto_refresh_id)
+        self._auto_refresh_id = GLib.timeout_add_seconds(self._refresh_seconds(), self._auto_refresh)
+
     def _auto_refresh(self) -> bool:
         # Refresh whatever the user is currently looking at, not home — a user
         # who panned elsewhere shouldn't watch their markers get replaced by
-        # home-area sensors every 5 minutes. Favorites are still folded in so
+        # home-area sensors on every refresh tick. Favorites are still folded in so
         # the alert check keeps covering starred sensors regardless of view.
         if self.current_view is not None:
             bounds, center = self.current_view
@@ -452,13 +476,15 @@ class AirloomApplication(Adw.Application):
         action = message.get("action")
         if action == "ready":
             self._send("config", self.store.public_config())
+            self._paint_cached_home()
             self.refresh()
         elif action == "refresh":
-            self.refresh()
+            self.refresh(force=True)
         elif action == "select":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None:
                 self.selected_id = sensor_id
+                self._ensure_trend(sensor_id)
         elif action == "favorite":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None and any(sensor.sensor_id == sensor_id for sensor in self.sensors):
@@ -522,7 +548,7 @@ class AirloomApplication(Adw.Application):
         ):
             return
         self.current_view = (view, center)
-        fresh = (time.monotonic() - self.view_fetched_at) < AUTO_REFRESH_SECONDS
+        fresh = (time.monotonic() - self.view_fetched_at) < self._refresh_seconds()
         if self.view_bounds is not None and fresh and bounds_contains(self.view_bounds, view):
             return
         self._start_fetch(view, center, include_favorites=False)
@@ -601,6 +627,10 @@ class AirloomApplication(Adw.Application):
                 "home_mode": home_mode,
                 "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
             }
+            minutes = int(message["refresh_minutes"])
+            if minutes not in (2, 5, 10, 30):
+                minutes = 2
+            updates["refresh_minutes"] = minutes
             if home_mode == "fixed":
                 latitude = float(message["home_lat"])
                 longitude = float(message["home_lon"])
@@ -620,6 +650,7 @@ class AirloomApplication(Adw.Application):
         elif api_key:
             self.store.data["api_key"] = api_key
         self.store.save()
+        self._arm_auto_refresh()
         if self.title:
             self.title.set_subtitle(self.store.data["location_name"])
         self._send("config", self.store.public_config())
@@ -641,22 +672,38 @@ class AirloomApplication(Adw.Application):
             )
         self.refresh()
 
-    def refresh(self) -> None:
+    def _paint_cached_home(self) -> None:
+        """First paint from the cache so launch never blocks on the network.
+        The refresh that follows replaces it under the normal TTL rules."""
+        if self.sensors or not self.store.data.get("api_key"):
+            return
+        config = self.store.data
+        bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
+        cached = [s for s in map(sensor_from_values, self.cache.sensors_in(bounds)) if s is not None]
+        if cached:
+            self.sensors = cached
+            self._send_sensor_state("PurpleAir · cached")
+
+    def refresh(self, force: bool = False) -> None:
         """Home refresh: home bounds plus favorited sensors wherever they are."""
         config = self.store.data
         bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
-        self._start_fetch(bounds, (config["latitude"], config["longitude"]), include_favorites=True)
+        self._start_fetch(bounds, (config["latitude"], config["longitude"]),
+                          include_favorites=True, force=force)
 
-    def _start_fetch(self, bounds: Bounds, center: tuple[float, float], include_favorites: bool) -> None:
+    def _start_fetch(self, bounds: Bounds, center: tuple[float, float],
+                     include_favorites: bool, force: bool = False) -> None:
         if not self.webview:
             return
         if self.refreshing:
             # Coalesce: the newest request wins and runs when the current lands.
-            self.pending_fetch = (bounds, center, include_favorites)
+            self.pending_fetch = (bounds, center, include_favorites, force)
             return
         self.refreshing = True
+        bounds = cap_bounds(bounds, center)
         self._send("loading", {"active": True})
         config = dict(self.store.data)
+        ttl = self._refresh_seconds()
 
         def worker() -> None:
             source = "Demo data"
@@ -664,26 +711,35 @@ class AirloomApplication(Adw.Application):
             sensors: list[Sensor] = []
             mode = config.get("location_filter", "outdoor")
             try:
-                try:
-                    if config.get("api_key"):
-                        client = PurpleAirClient(config["api_key"])
-                        sensors = client.fetch_sensors(bounds=bounds, location_filter=mode)
-                        source = "PurpleAir live"
+                if config.get("api_key"):
+                    client = PurpleAirClient(config["api_key"])
+                    try:
+                        area = fetch_area(client, self.cache, bounds, mode, ttl, force)
+                        rows = list(area.rows)
                         if include_favorites:
-                            missing = set(config.get("favorites", [])) - {s.sensor_id for s in sensors}
-                            if missing:
-                                sensors += client.fetch_sensors(show_only=sorted(missing))
+                            have = {r.get("sensor_index") for r in rows}
+                            rows += fetch_favorites(client, self.cache,
+                                                    config.get("favorites", []), have, ttl, force)
+                        sensors = [s for s in map(sensor_from_values, rows) if s is not None]
+                        source = "PurpleAir live" if area.polled else \
+                            f"PurpleAir · cached {_age_label(area.age)}"
                         if not sensors:
                             error = _no_sensors_message(mode)
-                    else:
-                        sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
-                except PurpleAirError as exc:
-                    # The area fetch may already have flipped source to live
-                    # before a later favorites fetch failed; what we deliver
-                    # is demo data either way, so label (and cache) it as such.
-                    source = "Demo data"
+                    except PurpleAirError as exc:
+                        stale = [s for s in map(sensor_from_values, self.cache.sensors_in(bounds))
+                                 if s is not None]
+                        if stale:
+                            # Stale real readings beat fake ones; demo only when
+                            # the cache has nothing for this area.
+                            sensors = stale
+                            source = "PurpleAir · cached"
+                            error = f"{exc} Showing cached readings."
+                        else:
+                            sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
+                            source = "Demo data"
+                            error = f"{exc} Showing demo readings instead."
+                else:
                     sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
-                    error = f"{exc} Showing demo readings instead."
             except Exception as exc:  # noqa: BLE001 — a crashed worker must never wedge the refresh state
                 sensors = []
                 error = f"Refresh failed unexpectedly: {exc}"
@@ -707,12 +763,52 @@ class AirloomApplication(Adw.Application):
         self._check_alerts()
         if error is None:
             # A transient live-API failure must not be remembered as fresh —
-            # that would suppress retries for AUTO_REFRESH_SECONDS.
+            # that would suppress retries for the refresh interval.
             self.view_bounds = bounds
             self.view_fetched_at = time.monotonic()
+        if self.selected_id is not None:
+            self._ensure_trend(self.selected_id)
         if self.pending_fetch is not None:
             pending, self.pending_fetch = self.pending_fetch, None
             self._start_fetch(*pending)
+        return GLib.SOURCE_REMOVE
+
+    def _ensure_trend(self, sensor_id: int) -> None:
+        """Attach a trend to the selected sensor: cached if fresh, else one
+        cheap single-row fetch. Demo sensors already carry trends inline."""
+        if not self.store.data.get("api_key"):
+            return
+        sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
+        if sensor is None:
+            return
+        cached = self.cache.get_trend(sensor_id, self._refresh_seconds())
+        if cached is not None:
+            if sensor.trend != cached:
+                sensor.trend = cached
+                self._send_sensor_state()
+            return
+        api_key = self.store.data["api_key"]
+
+        def worker() -> None:
+            trend = None
+            try:
+                result = PurpleAirClient(api_key).fetch_rows(
+                    show_only=[sensor_id], fields=TREND_FETCH_FIELDS)
+                if result.rows:
+                    trend = trend_from_values(result.rows[0])
+            except PurpleAirError:
+                trend = None  # chart keeps its loading/empty state; next select retries
+            GLib.idle_add(self._finish_trend, sensor_id, trend)
+
+        threading.Thread(target=worker, name="airloom-trend", daemon=True).start()
+
+    def _finish_trend(self, sensor_id: int, trend: list | None) -> bool:
+        if trend:
+            self.cache.store_trend(sensor_id, trend)
+            sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
+            if sensor is not None:
+                sensor.trend = trend
+                self._send_sensor_state()
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:

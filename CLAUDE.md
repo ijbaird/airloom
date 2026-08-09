@@ -17,7 +17,7 @@ make check                               # tests + compileall + node --check on 
 ./scripts/build-flatpak.sh               # Flatpak bundle → dist/ (needs GNOME 50 runtime/SDK)
 ```
 
-Tests are pure stdlib `unittest` and only cover the GUI-free modules (`aqi`, `purpleair`, `store`, bridge encoding); they run without GTK installed.
+Tests are pure stdlib `unittest` and only cover the GUI-free modules (`aqi`, `purpleair`, `store`, `cache`, bridge encoding); they run without GTK installed.
 
 ## Architecture
 
@@ -32,7 +32,7 @@ Two halves connected by a JSON message bridge:
 
 **Threading**: network fetches run in a daemon thread; results re-enter the GTK main loop via `GLib.idle_add` (`refresh()` → `_finish_refresh()`). Never touch GTK/WebKit from a worker thread.
 
-**Data flow**: with an API key, `purpleair.py` queries the PurpleAir REST API within `bounds_around()` the configured center; without one (or on any `PurpleAirError`), `demo.py` generates deterministic labeled demo sensors. `aqi.py` holds the US EPA 2024 PM2.5 breakpoints and the EPA wildfire-smoke correction for PurpleAir CF=1 data — changes to AQI/data behavior need tests (per CONTRIBUTING.md). `store.py` persists config/favorites/alert state atomically to `~/.config/airloom/config.json` with mode 0600; the API key never leaves `public_config()` except as a masked hint.
+**Data flow**: with an API key, `purpleair.py` queries the PurpleAir REST API within `bounds_around()` the configured center; without one (or on any `PurpleAirError`), `demo.py` generates deterministic labeled demo sensors. `cache.py` sits between them: a SQLite cache (`~/.cache/airloom/cache.db`, GTK-free, thread-safe) of raw sensor field values plus fetched-region records. Area fetches are served from cache inside the `refresh_minutes` TTL, delta-polled via `modified_since` when stale (only changed rows are returned and billed), and fully fetched only for new regions; views wider than 200 km are capped (`cap_bounds`). Trend averages are not part of area fetches — they're fetched lazily per sensor on selection and cached. The header refresh button forces a poll (`refresh(force=True)`) but still delta-polls. On API failure, stale cached readings are shown before demo data. Demo data is never cached. `aqi.py` holds the US EPA 2024 PM2.5 breakpoints and the EPA wildfire-smoke correction for PurpleAir CF=1 data — changes to AQI/data behavior need tests (per CONTRIBUTING.md). `store.py` persists config/favorites/alert state atomically to `~/.config/airloom/config.json` with mode 0600; the API key never leaves `public_config()` except as a masked hint.
 
 `app.js` also has a browser-preview fallback (bottom of file): opening `index.html` in a plain browser renders demo data without the bridge, useful for UI iteration.
 

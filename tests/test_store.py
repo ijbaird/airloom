@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from airloom import store
 from airloom.store import Store, _default_config_dir
 
 
@@ -246,6 +247,24 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(store.data["hidden"]["5"], "padded")
             store.hide(6, "y" * 200)
             self.assertEqual(store.data["hidden"]["6"], "y" * 80)
+
+
+class RefreshMinutesTest(unittest.TestCase):
+    def test_defaults_to_two(self):
+        self.assertEqual(store._sanitize({})["refresh_minutes"], 2)
+
+    def test_accepts_allowed_values(self):
+        for minutes in (2, 5, 10, 30):
+            self.assertEqual(store._sanitize({"refresh_minutes": minutes})["refresh_minutes"], minutes)
+
+    def test_rejects_everything_else(self):
+        for bad in (7, 0, -5, 2.5, "10", True, None, [10]):
+            self.assertEqual(store._sanitize({"refresh_minutes": bad})["refresh_minutes"], 2)
+
+    def test_appears_in_public_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = store.Store(Path(tmp) / "config.json")
+            self.assertEqual(s.public_config()["refresh_minutes"], 2)
 
 
 if __name__ == "__main__":
