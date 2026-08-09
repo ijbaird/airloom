@@ -150,6 +150,7 @@
             <option value="30">Every 30 minutes</option>
           </select></label>
           <fieldset class="wide"><legend>Temperature</legend><label><input name="temperature_unit" type="radio" value="F"><span>Fahrenheit</span></label><label><input name="temperature_unit" type="radio" value="C"><span>Celsius</span></label></fieldset>
+          <label class="checkbox wide"><input name="confidence_filter" type="checkbox"><span>Hide low-confidence sensors</span><small>Below 90% agreement between the sensor's two channels</small></label>
           <fieldset class="wide hidden-fieldset"><legend>Hidden sensors</legend>
             <div class="hidden-list" id="hidden-list"></div>
             <button type="button" id="unhide-all" class="unhide-button" hidden>Unhide all</button>
