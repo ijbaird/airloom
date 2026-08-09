@@ -31,6 +31,33 @@ class CacheBase(unittest.TestCase):
         self.cache = cache.SensorCache(Path(self.tmp.name) / "cache.db", clock=self.clock)
 
 
+class SchemaVersionTest(CacheBase):
+    def _user_version(self):
+        return self.cache._db.execute("PRAGMA user_version").fetchone()[0]
+
+    def test_fresh_database_is_stamped_with_current_version(self):
+        self.assertEqual(self._user_version(), cache.SCHEMA_VERSION)
+
+    def test_stale_version_clears_all_tables(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        self.cache.store_trend(1, [{"label": "Now", "aqi": 40}])
+        self.cache._db.execute("PRAGMA user_version = 0")  # simulate pre-feature DB
+        self.cache._db.commit()
+        reopened = cache.SensorCache(Path(self.tmp.name) / "cache.db", clock=self.clock)
+        self.assertEqual(reopened.sensors_in(bounds), [])
+        self.assertIsNone(reopened.covering_region(bounds, "outdoor"))
+        self.assertIsNone(reopened.get_trend(1, max_age=3600))
+        self.assertEqual(reopened._db.execute("PRAGMA user_version").fetchone()[0],
+                         cache.SCHEMA_VERSION)
+
+    def test_current_version_keeps_rows_across_reconnect(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        reopened = cache.SensorCache(Path(self.tmp.name) / "cache.db", clock=self.clock)
+        self.assertEqual(len(reopened.sensors_in(bounds)), 1)
+
+
 class StoreFetchTest(CacheBase):
     def test_round_trips_sensors_in_bounds(self):
         bounds = bounds_around(45.5, -122.6, 20.0)

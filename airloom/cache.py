@@ -22,6 +22,11 @@ from .purpleair import Bounds, bounds_contains, DATA_FIELDS, MAP_FIELDS, _intege
 MAX_REGIONS = 50
 SENSOR_MAX_AGE = 24 * 3600.0
 
+# Bump when cached rows become unusable (e.g. a newly-requested field that
+# delta polls would never backfill for unchanged sensors); a mismatched
+# cache is cleared on connect and simply refetched.
+SCHEMA_VERSION = 1
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sensors (
     sensor_index INTEGER PRIMARY KEY,
@@ -71,15 +76,24 @@ class SensorCache:
     def _connect(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            self._db = sqlite3.connect(self.path, check_same_thread=False)
-            self._db.executescript(_SCHEMA)
-            self._db.commit()
+            self._open_and_migrate()
         except sqlite3.Error:
             # It's only a cache: a corrupt file is deleted, never repaired.
             self.path.unlink(missing_ok=True)
-            self._db = sqlite3.connect(self.path, check_same_thread=False)
-            self._db.executescript(_SCHEMA)
-            self._db.commit()
+            self._open_and_migrate()
+
+    def _open_and_migrate(self) -> None:
+        self._db = sqlite3.connect(self.path, check_same_thread=False)
+        self._db.executescript(_SCHEMA)
+        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+        if version != SCHEMA_VERSION:
+            self._db.execute("DELETE FROM sensors")
+            self._db.execute("DELETE FROM regions")
+            self._db.execute("DELETE FROM trends")
+            # PRAGMA does not take bound parameters; SCHEMA_VERSION is a
+            # module constant int, never user input.
+            self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        self._db.commit()
 
     def upsert_rows(self, rows: list[dict]) -> list[int]:
         with self._lock:
