@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from airloom import cache
-from airloom.purpleair import Bounds, bounds_around
+from airloom.purpleair import Bounds, bounds_around, DATA_FIELDS, MAP_FIELDS, FetchResult
 
 
 def row(sensor_id, lat=45.5, lon=-122.6, **extra):
@@ -151,3 +151,89 @@ class PruneTest(CacheBase):
         self.cache.store_fetch(bounds, "outdoor", [row(2)], 1754770000)
         self.assertEqual([r["sensor_index"] for r in self.cache.sensors_in(bounds)], [2])
         self.assertIsNone(self.cache.get_trend(1, max_age=cache.SENSOR_MAX_AGE * 2))
+
+
+class FakeClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def fetch_rows(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+class FetchAreaTest(CacheBase):
+    def setUp(self):
+        super().setUp()
+        self.bounds = bounds_around(45.5, -122.6, 20.0)
+
+    def test_miss_full_fetches_and_stores(self):
+        client = FakeClient([FetchResult([row(1)], 1754680000)])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertTrue(result.polled)
+        self.assertEqual([r["sensor_index"] for r in result.rows], [1])
+        self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
+        self.assertNotIn("modified_since", {k: v for k, v in client.calls[0].items() if v is not None})
+        self.assertIsNotNone(self.cache.covering_region(self.bounds, "outdoor", max_age=120))
+
+    def test_fresh_hit_makes_no_calls(self):
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1)], 1754680000)
+        client = FakeClient([])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertFalse(result.polled)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(len(result.rows), 1)
+        self.assertGreaterEqual(result.age, 0.0)
+
+    def test_stale_hit_delta_polls_with_region_bounds(self):
+        big = bounds_around(45.5, -122.6, 50.0)
+        self.cache.store_fetch(big, "outdoor", [row(1, humidity=40)], 1754680000)
+        self.clock.now += 300
+        client = FakeClient([FetchResult([{"sensor_index": 1, "humidity": 60}], 1754680300)])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertTrue(result.polled)
+        call = client.calls[0]
+        self.assertEqual(call["fields"], DATA_FIELDS)
+        self.assertEqual(call["modified_since"], 1754680000)
+        self.assertEqual(call["bounds"], big)  # re-poll the whole region it serves
+        self.assertEqual(result.rows[0]["humidity"], 60)
+        self.assertEqual(result.rows[0]["name"], "S1")
+
+    def test_unknown_delta_ids_trigger_followup_full_fetch(self):
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1)], 1754680000)
+        self.clock.now += 300
+        client = FakeClient([
+            FetchResult([{"sensor_index": 2, "pm2.5_cf_1": 9.0}], 1754680300),
+            FetchResult([row(2, lat=45.52)], 1754680301),
+        ])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual(client.calls[1]["show_only"], [2])
+        self.assertEqual(sorted(r["sensor_index"] for r in result.rows), [1, 2])
+
+    def test_force_polls_even_when_fresh(self):
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1)], 1754680000)
+        client = FakeClient([FetchResult([], 1754680060)])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120, force=True)
+        self.assertTrue(result.polled)
+        self.assertEqual(client.calls[0]["modified_since"], 1754680000)
+
+    def test_indoor_rows_filtered_from_outdoor_view(self):
+        rows = [row(1, location_type=0), row(2, lat=45.51, location_type=1)]
+        self.cache.store_fetch(self.bounds, "outdoor", rows, 1754680000)
+        result = cache.fetch_area(FakeClient([]), self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual([r["sensor_index"] for r in result.rows], [1])
+
+
+class FetchFavoritesTest(CacheBase):
+    def test_only_stale_missing_favorites_are_fetched(self):
+        self.cache.store_fetch(bounds_around(45.5, -122.6, 20.0), "outdoor", [row(5)], 1754680000)
+        client = FakeClient([FetchResult([row(6, lat=39.1)], 1754680060)])
+        rows = cache.fetch_favorites(client, self.cache, [5, 6], have_ids={1}, ttl=120)
+        self.assertEqual(sorted(r["sensor_index"] for r in rows), [5, 6])
+        self.assertEqual(client.calls[0]["show_only"], [6])
+
+    def test_no_call_when_everything_is_covered(self):
+        client = FakeClient([])
+        self.assertEqual(cache.fetch_favorites(client, self.cache, [5], have_ids={5}, ttl=120), [])
+        self.assertEqual(client.calls, [])

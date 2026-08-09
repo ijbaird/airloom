@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .purpleair import Bounds, bounds_contains
+from .purpleair import Bounds, bounds_contains, DATA_FIELDS, MAP_FIELDS, _integer
 
 MAX_REGIONS = 50
 SENSOR_MAX_AGE = 24 * 3600.0
@@ -213,3 +213,65 @@ class SensorCache:
             self._db.execute("DELETE FROM regions")
             self._db.execute("DELETE FROM trends")
             self._db.commit()
+
+
+@dataclass(frozen=True, slots=True)
+class AreaResult:
+    rows: list[dict]
+    age: float
+    polled: bool
+
+
+def _matches_filter(values: dict, location_filter: str) -> bool:
+    if location_filter == "both":
+        return True
+    want = 1 if location_filter == "indoor" else 0
+    # A missing location_type (e.g. a delta payload that only carries changed
+    # fields) defaults to outdoor, matching PurpleAir's own field default.
+    return (_integer(values.get("location_type")) or 0) == want
+
+
+def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
+               ttl: float, force: bool = False) -> AreaResult:
+    """Serve an area from cache, delta-poll a stale known region, or full-fetch
+    a new one. May raise PurpleAirError — the caller owns fallback policy."""
+    region = cache.covering_region(bounds, location_filter)
+    now = cache.clock()
+
+    def rows_in_view() -> list[dict]:
+        return [v for v in cache.sensors_in(bounds) if _matches_filter(v, location_filter)]
+
+    if region is not None and not force and now - region.fetched_at < ttl:
+        return AreaResult(rows_in_view(), now - region.fetched_at, False)
+    if region is not None and region.api_time_stamp is not None:
+        result = client.fetch_rows(
+            bounds=region.bounds,
+            location_filter=location_filter,
+            fields=DATA_FIELDS,
+            modified_since=region.api_time_stamp,
+        )
+        unknown = cache.apply_delta(region.id, result.rows, result.time_stamp)
+        if unknown:
+            followup = client.fetch_rows(show_only=sorted(unknown))
+            cache.upsert_rows(followup.rows)
+        return AreaResult(rows_in_view(), 0.0, True)
+    result = client.fetch_rows(bounds=bounds, location_filter=location_filter, fields=MAP_FIELDS)
+    cache.store_fetch(bounds, location_filter, result.rows, result.time_stamp)
+    return AreaResult(rows_in_view(), 0.0, True)
+
+
+def fetch_favorites(client, cache: SensorCache, favorite_ids, have_ids,
+                    ttl: float, force: bool = False) -> list[dict]:
+    """Rows for favorites not already in `have_ids`: cached-fresh ones for free,
+    one show_only batch for the rest."""
+    missing = [int(i) for i in favorite_ids if int(i) not in have_ids]
+    if not missing:
+        return []
+    cached = {} if force else cache.fresh_sensors(missing, ttl)
+    rows = list(cached.values())
+    need = sorted(set(missing) - set(cached))
+    if need:
+        result = client.fetch_rows(show_only=need)
+        cache.upsert_rows(result.rows)
+        rows += result.rows
+    return rows
