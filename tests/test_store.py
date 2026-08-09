@@ -204,6 +204,14 @@ class StoreTest(unittest.TestCase):
                 {"123": "Valid", "7": "Padded key", "10": "x" * 80},
             )
 
+    def test_hidden_unicode_digit_keys_are_dropped_not_crashing(self):
+        # "²".isdigit() is True but int("²") raises; a hand-edited config
+        # must never make _sanitize (and thus app startup) crash.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"hidden": {"²": "x", "5": "ok"}}), encoding="utf-8")
+            self.assertEqual(Store(path).data["hidden"], {"5": "ok"})
+
     def test_hidden_wrong_type_falls_back(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

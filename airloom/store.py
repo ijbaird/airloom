@@ -75,7 +75,7 @@ def _sanitize(data: dict) -> dict:
         clean["hidden"] = {
             str(int(key)): value.strip()[:80]
             for key, value in hidden.items()
-            if isinstance(key, str) and key.isdigit() and isinstance(value, str)
+            if isinstance(key, str) and key.isascii() and key.isdigit() and isinstance(value, str)
         }
     return clean
 
