@@ -615,6 +615,7 @@ class AirloomApplication(Adw.Application):
 
     def _save_settings(self, message: dict) -> None:
         previous_mode = self.store.data.get("home_mode")
+        previous_home = (self.store.data.get("latitude"), self.store.data.get("longitude"))
         try:
             radius = max(2.0, min(100.0, float(message["radius_km"])))
             heatmap = max(5.0, min(1000.0, float(message["heatmap_threshold_km"])))
@@ -659,7 +660,11 @@ class AirloomApplication(Adw.Application):
             # The user just clicked Save in our UI, so the window is focused
             # and the permission dialog (if any) can appear immediately.
             self._start_locator()
-        if home_mode == "fixed":
+        home_pinned = home_mode == "fixed" and (
+            previous_mode != "fixed"
+            or (updates["latitude"], updates["longitude"]) != previous_home
+        )
+        if home_pinned:
             # Glide the map to the newly pinned home instead of leaving it
             # wherever the user happened to be looking when they saved.
             self._send(
@@ -671,7 +676,14 @@ class AirloomApplication(Adw.Application):
                     "source": "fixed",
                 },
             )
-        self.refresh()
+        if home_pinned or self.current_view is None:
+            self.refresh()
+        else:
+            # Any other save keeps the user where they're looking: refetch
+            # the current view (same rule as the location filter) instead of
+            # yanking the sensor list back to the home area.
+            bounds, center = self.current_view
+            self._start_fetch(bounds, center, include_favorites=True)
 
     def _paint_cached_home(self) -> None:
         """First paint from the cache so launch never blocks on the network.

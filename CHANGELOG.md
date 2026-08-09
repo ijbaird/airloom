@@ -2,6 +2,13 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## Unreleased
+
+- Fixed: Save & refresh no longer replaces the map's sensors with the home
+  area's while you're browsing somewhere else — preferences saves now refetch
+  the view you're looking at. Choosing a new fixed home still glides the map
+  there, but re-saving with an unchanged fixed home stays put too.
+
 ## 0.12.0 — 2026-08-08
 
 - Sensors with poor A/B channel agreement (PurpleAir confidence below 90%) are
