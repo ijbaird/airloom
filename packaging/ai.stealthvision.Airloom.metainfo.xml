@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.10.0" date="2026-08-08">
+      <description><p>Sensors can now be hidden (for erroneous units) via eye-off buttons on the detail pane and map popup; a new Preferences section lists hidden sensors with per-sensor Unhide and Unhide all. Hidden sensors are excluded everywhere, including alerts; favorites keep their star across hide and unhide.</p></description>
+    </release>
     <release version="0.9.0" date="2026-08-08">
       <description><p>Airloom now presents itself as a GNOME desktop app rather than Fedora-only: the Flatpak runs on any Linux distribution with the GNOME runtime. No functional changes.</p></description>
     </release>

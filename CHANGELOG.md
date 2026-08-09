@@ -2,6 +2,10 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.10.0 — 2026-08-08
+
+- Sensors can now be hidden — useful for erroneous units reporting bogus readings. A new eye-off button in the sensor detail pane and the map popup removes the sensor from the map, lists, heat map, counts, and alerts. Preferences gains a "Hidden sensors" section listing hidden sensors by name with per-sensor Unhide and an "Unhide all" action; unhiding restores a sensor instantly, and a hidden favorite keeps its star for when it returns.
+
 ## 0.9.0 — 2026-08-08
 
 - Airloom now describes itself as GNOME-native rather than Fedora-native across the AppStream metadata, About dialog, and README. Nothing in the app is Fedora-specific: the Flatpak runs on any Linux distribution with the GNOME runtime. Fedora remains the development and from-source reference platform.
