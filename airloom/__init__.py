@@ -1,4 +1,4 @@
-"""Airloom — a Fedora-native, PurpleAir-focused air quality viewer."""
+"""Airloom — a GNOME-native, PurpleAir-focused air quality viewer."""
 
-__version__ = "0.4.2"
+__version__ = "0.9.0"
 

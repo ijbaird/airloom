@@ -3,7 +3,7 @@
 [![Flatpak](https://github.com/ijbaird/airloom/actions/workflows/flatpak.yml/badge.svg)](https://github.com/ijbaird/airloom/actions/workflows/flatpak.yml)
 [![Latest release](https://img.shields.io/github/v/release/ijbaird/airloom)](https://github.com/ijbaird/airloom/releases/latest)
 
-Airloom is a fast, focused air-quality desktop app built specifically for Fedora and GNOME. It turns hyperlocal PurpleAir readings into an interactive map, clear trends, practical health guidance, and local alerts.
+Airloom is a fast, focused air-quality app built for the GNOME desktop, developed and tested on Fedora. It turns hyperlocal PurpleAir readings into an interactive map, clear trends, practical health guidance, and local alerts. The Flatpak runs on any Linux distribution with the GNOME runtime.
 
 The 0.1 MVP includes:
 
@@ -13,7 +13,7 @@ The 0.1 MVP includes:
 - temperature, humidity, PM2.5, and PM10 readings;
 - local desktop notifications when a favorite crosses a chosen AQI threshold;
 - a no-account demo mode and live mode with your own PurpleAir read key;
-- light/dark GNOME styling and Fedora desktop/Flatpak metadata.
+- light/dark GNOME styling and desktop/Flatpak metadata.
 
 ## Run on Fedora
 

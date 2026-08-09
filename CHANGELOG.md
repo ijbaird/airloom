@@ -2,6 +2,10 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.9.0 — 2026-08-08
+
+- Airloom now describes itself as GNOME-native rather than Fedora-native across the AppStream metadata, About dialog, and README. Nothing in the app is Fedora-specific: the Flatpak runs on any Linux distribution with the GNOME runtime. Fedora remains the development and from-source reference platform.
+
 ## 0.4.2 — 2026-08-08
 
 - No application changes. Confirms the automatic-update pipeline introduced in 0.4.1 end to end: this release was delivered to an installed copy via `flatpak update` from the signed repository.

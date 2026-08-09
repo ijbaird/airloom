@@ -993,7 +993,7 @@ class AirloomApplication(Adw.Application):
             application_icon=APP_ID,
             developer_name="Airloom contributors",
             version=__version__,
-            comments="A focused, Fedora-native viewer for hyperlocal PurpleAir readings.",
+            comments="A focused, GNOME-native viewer for hyperlocal PurpleAir readings.",
             website="https://www2.purpleair.com/",
             license_type=Gtk.License.MIT_X11,
         )

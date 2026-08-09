@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Airloom is a Fedora/GNOME desktop app showing hyperlocal PurpleAir air-quality readings. It deliberately has **zero third-party dependencies**: Python stdlib + system PyGObject (GTK4, libadwaita, WebKitGTK 6.0, libnotify) on the backend, and hand-written vanilla JS/CSS on the frontend (no map library — OSM tile math is done manually in `app.js`). Keep it that way; don't add pip packages or JS dependencies.
+Airloom is a GNOME desktop app (developed on Fedora, distributed as a Flatpak) showing hyperlocal PurpleAir air-quality readings. It deliberately has **zero third-party dependencies**: Python stdlib + system PyGObject (GTK4, libadwaita, WebKitGTK 6.0, libnotify) on the backend, and hand-written vanilla JS/CSS on the frontend (no map library — OSM tile math is done manually in `app.js`). Keep it that way; don't add pip packages or JS dependencies.
 
 ## Commands
 
