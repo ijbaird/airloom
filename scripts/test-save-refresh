@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""End-to-end regression test: Save & refresh must keep the map's current
+view, driven over the debug port.
+
+Saving preferences used to end in a home-area refresh that replaced the
+sensor list even when the user was looking somewhere else, emptying the
+visible map. This launches the app in demo mode with a fixed Portland
+home, glides the view to Seattle, saves preferences unchanged, and
+asserts the Seattle view keeps its sensors. Requires GTK and a display;
+not part of `make test`. Exits 0 on success.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+PROJECT = Path(__file__).resolve().parent.parent
+
+HOME = {"latitude": 45.5152, "longitude": -122.6784, "name": "Portland, Oregon"}
+AWAY = {"latitude": 47.6062, "longitude": -122.3321, "name": "Seattle"}
+NEW_HOME = {"latitude": 43.6150, "longitude": -116.2023, "name": "Boise"}
+
+ON_SCREEN_MARKERS_JS = """
+(() => {
+  const map = document.querySelector("#map-panel").getBoundingClientRect();
+  return [...document.querySelectorAll(".map-marker")].filter((m) => {
+    const r = m.getBoundingClientRect();
+    return r.right > map.left && r.left < map.right && r.bottom > map.top && r.top < map.bottom;
+  }).length;
+})()
+"""
+
+# Wraps the bridge receiver so the test can tell when a fresh `sensors`
+# payload lands after saving (demo source strings look identical).
+COUNT_SENSOR_PAYLOADS_JS = """
+(() => {
+  if (window.__origReceive) return "already installed";
+  window.__origReceive = window.Airloom.receive;
+  window.__sensorsPayloads = 0;
+  window.Airloom.receive = (event, payload) => {
+    if (event === "sensors") window.__sensorsPayloads += 1;
+    return window.__origReceive(event, payload);
+  };
+  return "installed";
+})()
+"""
+
+SAVE_SETTINGS_JS = """
+(() => {
+  window.Airloom.receive("open-settings");
+  const form = document.querySelector("#settings-form");
+  form.requestSubmit(document.querySelector("#save-settings"));
+  return "submitted";
+})()
+"""
+
+PIN_HOME_JS = """
+(() => {
+  window.Airloom.receive("open-settings");
+  const form = document.querySelector("#settings-form");
+  form.elements.home_mode.value = "fixed";
+  form.elements.home_lat.value = "%(latitude)s";
+  form.elements.home_lon.value = "%(longitude)s";
+  form.elements.location_name.value = "%(name)s";
+  form.requestSubmit(document.querySelector("#save-settings"));
+  return "submitted";
+})()
+"""
+
+
+def request(sock_path: str, cmd: str, **fields):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    try:
+        sock.connect(sock_path)
+        sock.sendall(json.dumps({"id": 1, "cmd": cmd, **fields}).encode("utf-8") + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("connection closed before a full response")
+            buf += chunk
+    finally:
+        sock.close()
+    response = json.loads(buf.split(b"\n", 1)[0])
+    if not response.get("ok"):
+        raise AssertionError(f"debug command {cmd!r} failed: {response}")
+    return response.get("result")
+
+
+def eval_js(sock_path: str, js: str):
+    return request(sock_path, "eval", js=js)
+
+
+def wait_for(probe, timeout_s: float, what: str):
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            value = probe()
+            if value is not None:
+                return value
+        except (OSError, ConnectionError, AssertionError) as exc:
+            last_error = exc
+        time.sleep(0.4)
+    raise AssertionError(f"timed out after {timeout_s}s waiting for {what} (last error: {last_error})")
+
+
+def check(condition: bool, message: str):
+    if not condition:
+        raise AssertionError(message)
+    print(f"  ok: {message}")
+
+
+def at(center: dict, place: dict) -> bool:
+    return abs(center["lat"] - place["latitude"]) < 0.01 and abs(center["lon"] - place["longitude"]) < 0.01
+
+
+def main() -> int:
+    workdir = Path(tempfile.mkdtemp(prefix="airloom-save-refresh-test-"))
+    sock_path = str(workdir / "debug.sock")
+    env = {**os.environ, "AIRLOOM_DEBUG_SOCKET": sock_path}
+    env["XDG_CONFIG_HOME"] = str(workdir / "config")
+    env["XDG_CACHE_HOME"] = str(workdir / "cache")
+    # A fixed home skips GeoClue, so no location fix can move the map
+    # mid-test; demo mode (no API key) keeps the data deterministic.
+    config_dir = Path(env["XDG_CONFIG_HOME"]) / "airloom"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text(json.dumps({
+        "home_mode": "fixed",
+        "latitude": HOME["latitude"],
+        "longitude": HOME["longitude"],
+        "location_name": HOME["name"],
+    }), encoding="utf-8")
+    print(f"work dir (screenshots): {workdir}")
+    app = subprocess.Popen([str(PROJECT / "scripts" / "debug-run")], env=env)
+    try:
+        wait_for(lambda: request(sock_path, "ping") or True, 25, "debug socket")
+        wait_for(
+            lambda: (request(sock_path, "state").get("sensorCount", 0) > 0) or None,
+            30,
+            "sensors to load",
+        )
+
+        print("— at home (Portland) —")
+        state = request(sock_path, "state")
+        check(at(state["center"], HOME), "map starts at the fixed Portland home")
+        markers = eval_js(sock_path, ON_SCREEN_MARKERS_JS)
+        check(markers > 0, f"{markers} markers on screen at home")
+
+        print("— viewing away (Seattle) —")
+        eval_js(
+            sock_path,
+            '(() => { window.Airloom.receive("location", %s); return "glided"; })()'
+            % json.dumps({**AWAY, "source": "fixed"}),
+        )
+        wait_for(
+            lambda: (at(request(sock_path, "state")["center"], AWAY)
+                     and eval_js(sock_path, ON_SCREEN_MARKERS_JS) > 0) or None,
+            20,
+            "the Seattle view to load its sensors",
+        )
+        markers = eval_js(sock_path, ON_SCREEN_MARKERS_JS)
+        check(markers > 0, f"{markers} markers on screen at Seattle")
+        request(sock_path, "screenshot", path=str(workdir / "1-seattle-before-save.png"))
+
+        print("— save preferences unchanged —")
+        check(eval_js(sock_path, COUNT_SENSOR_PAYLOADS_JS) == "installed", "payload counter installed")
+        eval_js(sock_path, SAVE_SETTINGS_JS)
+        wait_for(
+            lambda: (eval_js(sock_path, "window.__sensorsPayloads") >= 1) or None,
+            20,
+            "the post-save sensors payload",
+        )
+        state = request(sock_path, "state")
+        check(at(state["center"], AWAY), "map is still centered on Seattle after save")
+        markers = eval_js(sock_path, ON_SCREEN_MARKERS_JS)
+        request(sock_path, "screenshot", path=str(workdir / "2-seattle-after-save.png"))
+        check(markers > 0, f"{markers} markers still on screen at Seattle after save")
+
+        print("— pin a new fixed home (Boise) —")
+        eval_js(sock_path, PIN_HOME_JS % NEW_HOME)
+        wait_for(
+            lambda: (at(request(sock_path, "state")["center"], NEW_HOME)
+                     and eval_js(sock_path, ON_SCREEN_MARKERS_JS) > 0) or None,
+            20,
+            "the map to glide to the newly pinned Boise home",
+        )
+        markers = eval_js(sock_path, ON_SCREEN_MARKERS_JS)
+        check(markers > 0, f"{markers} markers on screen after gliding to the new home")
+        request(sock_path, "screenshot", path=str(workdir / "3-new-home.png"))
+
+        print("PASS")
+        return 0
+    finally:
+        try:
+            request(sock_path, "quit")
+            app.wait(timeout=10)
+        except (AssertionError, OSError, ConnectionError, subprocess.TimeoutExpired):
+            app.kill()
+            try:
+                app.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except AssertionError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        raise SystemExit(1)
