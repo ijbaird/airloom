@@ -122,3 +122,32 @@ class CorruptionTest(unittest.TestCase):
             bounds = bounds_around(45.5, -122.6, 20.0)
             c.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
             self.assertEqual(len(c.sensors_in(bounds)), 1)
+
+
+class TrendTest(CacheBase):
+    def test_round_trip_and_ttl(self):
+        trend = [{"label": "Now", "aqi": 12}]
+        self.cache.store_trend(7, trend)
+        self.assertEqual(self.cache.get_trend(7, max_age=120), trend)
+        self.clock.now += 300
+        self.assertIsNone(self.cache.get_trend(7, max_age=120))
+        self.assertIsNone(self.cache.get_trend(8, max_age=120))
+
+
+class PruneTest(CacheBase):
+    def test_region_count_is_capped(self):
+        for index in range(cache.MAX_REGIONS + 10):
+            bounds = bounds_around(45.5 + index * 0.001, -122.6, 5.0)
+            self.clock.now += 1
+            self.cache.store_fetch(bounds, "outdoor", [], 1754680000 + index)
+        count = self.cache._db.execute("SELECT COUNT(*) FROM regions").fetchone()[0]
+        self.assertEqual(count, cache.MAX_REGIONS)
+
+    def test_ancient_sensors_and_trends_are_dropped(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        self.cache.store_trend(1, [{"label": "Now", "aqi": 12}])
+        self.clock.now += cache.SENSOR_MAX_AGE + 60
+        self.cache.store_fetch(bounds, "outdoor", [row(2)], 1754770000)
+        self.assertEqual([r["sensor_index"] for r in self.cache.sensors_in(bounds)], [2])
+        self.assertIsNone(self.cache.get_trend(1, max_age=cache.SENSOR_MAX_AGE * 2))

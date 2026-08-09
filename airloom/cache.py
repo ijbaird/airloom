@@ -188,6 +188,25 @@ class SensorCache:
         self._db.execute("DELETE FROM sensors WHERE fetched_at < ?", (cutoff,))
         self._db.execute("DELETE FROM trends WHERE fetched_at < ?", (cutoff,))
 
+    def store_trend(self, sensor_id: int, trend: list) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO trends (sensor_index, data, fetched_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(sensor_index) DO UPDATE SET data = excluded.data,"
+                " fetched_at = excluded.fetched_at",
+                (int(sensor_id), json.dumps(trend), self.clock()),
+            )
+            self._db.commit()
+
+    def get_trend(self, sensor_id: int, max_age: float) -> list | None:
+        with self._lock:
+            cursor = self._db.execute(
+                "SELECT data FROM trends WHERE sensor_index = ? AND fetched_at > ?",
+                (int(sensor_id), self.clock() - max_age),
+            )
+            found = cursor.fetchone()
+            return json.loads(found[0]) if found else None
+
     def clear(self) -> None:
         with self._lock:
             self._db.execute("DELETE FROM sensors")
