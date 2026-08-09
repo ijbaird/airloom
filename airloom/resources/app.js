@@ -278,7 +278,12 @@
 
   function renderChart(sensor) {
     const points = (sensor.trend || []).filter((point) => Number.isFinite(point.aqi));
-    if (!points.length) { $("#chart").innerHTML = '<div class="empty-state">No trend available</div>'; $("#trend-direction").textContent = "—"; return; }
+    if (!points.length) {
+      const message = state.config.has_api_key ? "Loading trend…" : "No trend available";
+      $("#chart").innerHTML = `<div class="empty-state">${message}</div>`;
+      $("#trend-direction").textContent = "—";
+      return;
+    }
     const width = 300, height = 104, padX = 8, padTop = 9, padBottom = 20;
     const max = Math.max(60, ...points.map((point) => point.aqi)) * 1.12;
     const coordinates = points.map((point, index) => ({

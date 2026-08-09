@@ -45,6 +45,7 @@ from .geocode import GeocodeError, reverse as reverse_geocode, search as place_s
 from .location import GeoClueLocator, is_coarse_fix
 from .models import Sensor
 from .purpleair import (
+    TREND_FETCH_FIELDS,
     Bounds,
     PurpleAirClient,
     PurpleAirError,
@@ -52,6 +53,7 @@ from .purpleair import (
     bounds_contains,
     cap_bounds,
     sensor_from_values,
+    trend_from_values,
 )
 from .store import Store
 
@@ -482,6 +484,7 @@ class AirloomApplication(Adw.Application):
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None:
                 self.selected_id = sensor_id
+                self._ensure_trend(sensor_id)
         elif action == "favorite":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None and any(sensor.sensor_id == sensor_id for sensor in self.sensors):
@@ -763,9 +766,49 @@ class AirloomApplication(Adw.Application):
             # that would suppress retries for the refresh interval.
             self.view_bounds = bounds
             self.view_fetched_at = time.monotonic()
+        if self.selected_id is not None:
+            self._ensure_trend(self.selected_id)
         if self.pending_fetch is not None:
             pending, self.pending_fetch = self.pending_fetch, None
             self._start_fetch(*pending)
+        return GLib.SOURCE_REMOVE
+
+    def _ensure_trend(self, sensor_id: int) -> None:
+        """Attach a trend to the selected sensor: cached if fresh, else one
+        cheap single-row fetch. Demo sensors already carry trends inline."""
+        if not self.store.data.get("api_key"):
+            return
+        sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
+        if sensor is None:
+            return
+        cached = self.cache.get_trend(sensor_id, self._refresh_seconds())
+        if cached is not None:
+            if sensor.trend != cached:
+                sensor.trend = cached
+                self._send_sensor_state()
+            return
+        api_key = self.store.data["api_key"]
+
+        def worker() -> None:
+            trend = None
+            try:
+                result = PurpleAirClient(api_key).fetch_rows(
+                    show_only=[sensor_id], fields=TREND_FETCH_FIELDS)
+                if result.rows:
+                    trend = trend_from_values(result.rows[0])
+            except PurpleAirError:
+                trend = None  # chart keeps its loading/empty state; next select retries
+            GLib.idle_add(self._finish_trend, sensor_id, trend)
+
+        threading.Thread(target=worker, name="airloom-trend", daemon=True).start()
+
+    def _finish_trend(self, sensor_id: int, trend: list | None) -> bool:
+        if trend:
+            self.cache.store_trend(sensor_id, trend)
+            sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
+            if sensor is not None:
+                sensor.trend = trend
+                self._send_sensor_state()
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:
