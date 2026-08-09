@@ -173,6 +173,10 @@ class FieldListTest(unittest.TestCase):
         self.assertIn("sensor_index", purpleair.DATA_FIELDS)
         self.assertIn("pm2.5_cf_1", purpleair.DATA_FIELDS)
 
+    def test_confidence_is_requested_in_area_and_delta_fetches(self):
+        self.assertIn("confidence", purpleair.MAP_FIELDS)
+        self.assertIn("confidence", purpleair.DATA_FIELDS)
+
     def test_trend_fetch_fields_carry_humidity_for_epa_correction(self):
         self.assertIn("humidity", purpleair.TREND_FETCH_FIELDS)
         self.assertIn("pm2.5_1week", purpleair.TREND_FETCH_FIELDS)
@@ -226,6 +230,13 @@ class SensorFromValuesTest(unittest.TestCase):
         self.assertEqual(sensor.sensor_id, 7)
         self.assertIsNotNone(sensor.aqi)
         self.assertIsNone(purpleair.sensor_from_values({"sensor_index": 7, "pm2.5_cf_1": 4.0}))
+
+    def test_confidence_is_parsed(self):
+        base = {"sensor_index": 7, "latitude": 45.5, "longitude": -122.6}
+        self.assertEqual(purpleair.sensor_from_values({**base, "confidence": 97}).confidence, 97)
+        self.assertEqual(purpleair.sensor_from_values({**base, "confidence": "88"}).confidence, 88)
+        self.assertIsNone(purpleair.sensor_from_values(base).confidence)
+        self.assertIsNone(purpleair.sensor_from_values({**base, "confidence": "junk"}).confidence)
 
     def test_trend_from_values_produces_seven_points(self):
         values = {"sensor_index": 7, "humidity": 40, "pm2.5_cf_1": 4.0,
