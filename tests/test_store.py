@@ -23,6 +23,26 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(loaded.public_config()["api_key_hint"], "••••1234")
             self.assertNotIn("api_key", loaded.public_config())
 
+    def test_confidence_filter_defaults_on_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            self.assertTrue(store.data["confidence_filter"])
+            self.assertTrue(store.public_config()["confidence_filter"])
+            store.data["confidence_filter"] = False
+            store.save()
+            loaded = Store(path)
+            self.assertFalse(loaded.data["confidence_filter"])
+            self.assertFalse(loaded.public_config()["confidence_filter"])
+
+    def test_confidence_filter_rejects_non_bool(self):
+        for bad in ("yes", 1, 0, None, [], {}):
+            with self.subTest(bad=bad):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    path.write_text(json.dumps({"confidence_filter": bad}), encoding="utf-8")
+                    self.assertTrue(Store(path).data["confidence_filter"])
+
     def test_malformed_config_falls_back(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
