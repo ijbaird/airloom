@@ -89,6 +89,20 @@ def bounds_contains(outer: Bounds, inner: Bounds) -> bool:
     )
 
 
+MAX_FETCH_SPAN_KM = 200.0
+
+
+def cap_bounds(bounds: Bounds, center: tuple[float, float]) -> Bounds:
+    """Clamp a viewport to a fetchable area so one zoomed-out scroll can't
+    request thousands of sensor rows."""
+    height_km = (bounds.north - bounds.south) * 111.0
+    mid_lat = (bounds.north + bounds.south) / 2
+    width_km = (bounds.east - bounds.west) * 111.0 * max(0.1, math.cos(math.radians(mid_lat)))
+    if height_km <= MAX_FETCH_SPAN_KM and width_km <= MAX_FETCH_SPAN_KM:
+        return bounds
+    return bounds_around(center[0], center[1], MAX_FETCH_SPAN_KM / 2)
+
+
 class PurpleAirError(RuntimeError):
     pass
 

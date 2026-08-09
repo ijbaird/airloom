@@ -237,6 +237,18 @@ class SensorFromValuesTest(unittest.TestCase):
         self.assertTrue(all(isinstance(point["aqi"], int) for point in trend))
 
 
+class CapBoundsTest(unittest.TestCase):
+    def test_small_view_passes_through(self):
+        bounds = purpleair.bounds_around(45.5, -122.6, 20.0)
+        self.assertEqual(purpleair.cap_bounds(bounds, (45.5, -122.6)), bounds)
+
+    def test_huge_view_is_capped_around_center(self):
+        bounds = purpleair.Bounds(49.0, -130.0, 32.0, -114.0)  # ~1900 km tall
+        capped = purpleair.cap_bounds(bounds, (40.0, -120.0))
+        self.assertEqual(capped, purpleair.bounds_around(40.0, -120.0, 100.0))
+        self.assertTrue(purpleair.bounds_contains(bounds, capped))
+
+
 if __name__ == "__main__":
     unittest.main()
 
