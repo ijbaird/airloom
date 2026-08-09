@@ -2,7 +2,7 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
-## Unreleased
+## 0.12.0 — 2026-08-08
 
 - Sensors with poor A/B channel agreement (PurpleAir confidence below 90%) are
   now hidden by default, with a "Hide low-confidence sensors" preference to show
