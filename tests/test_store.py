@@ -155,6 +155,98 @@ class StoreTest(unittest.TestCase):
                     path.write_text(json.dumps({"heatmap_threshold_km": bad}), encoding="utf-8")
                     self.assertEqual(Store(path).data["heatmap_threshold_km"], 40.0)
 
+    def test_hidden_defaults_empty_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            self.assertEqual(store.data["hidden"], {})
+            self.assertEqual(store.public_config()["hidden"], [])
+            store.hide(4242, "Backyard PurpleAir")
+            self.assertTrue(store.is_hidden(4242))
+            self.assertEqual(store.hidden_ids(), {4242})
+            loaded = Store(path)
+            self.assertEqual(loaded.data["hidden"], {"4242": "Backyard PurpleAir"})
+            self.assertEqual(
+                loaded.public_config()["hidden"],
+                [{"id": 4242, "name": "Backyard PurpleAir"}],
+            )
+
+    def test_unhide_and_unhide_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            store.hide(1, "One")
+            store.hide(2, "Two")
+            store.unhide(1)
+            self.assertFalse(store.is_hidden(1))
+            self.assertEqual(Store(path).hidden_ids(), {2})
+            store.unhide(999)  # no-op on unknown id, must not raise
+            store.unhide_all()
+            self.assertEqual(store.hidden_ids(), set())
+            self.assertEqual(Store(path).data["hidden"], {})
+
+    def test_hidden_sanitize_drops_garbage_and_truncates(self):
+        corrupt = {
+            "hidden": {
+                "123": "Valid",
+                "007": "Padded key",
+                "abc": "bad key",
+                "9": 42,
+                "10": "x" * 200,
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(corrupt), encoding="utf-8")
+            store = Store(path)
+            self.assertEqual(
+                store.data["hidden"],
+                {"123": "Valid", "7": "Padded key", "10": "x" * 80},
+            )
+
+    def test_hidden_unicode_digit_keys_are_dropped_not_crashing(self):
+        # "²".isdigit() is True but int("²") raises; a hand-edited config
+        # must never make _sanitize (and thus app startup) crash.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"hidden": {"²": "x", "5": "ok"}}), encoding="utf-8")
+            self.assertEqual(Store(path).data["hidden"], {"5": "ok"})
+
+    def test_hidden_wrong_type_falls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"hidden": ["12"]}), encoding="utf-8")
+            self.assertEqual(Store(path).data["hidden"], {})
+
+    def test_hidden_names_sort_case_insensitively_in_public_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.hide(3, "zebra")
+            store.hide(1, "Alpha")
+            store.hide(2, "beta")
+            self.assertEqual(
+                [item["name"] for item in store.public_config()["hidden"]],
+                ["Alpha", "beta", "zebra"],
+            )
+
+    def test_hide_keeps_favorite_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            store.toggle_favorite(77)
+            store.hide(77, "Starred and hidden")
+            self.assertEqual(store.data["favorites"], [77])
+            store.unhide(77)
+            self.assertEqual(Store(path).data["favorites"], [77])
+
+    def test_hide_truncates_and_strips_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.hide(5, "  padded  ")
+            self.assertEqual(store.data["hidden"]["5"], "padded")
+            store.hide(6, "y" * 200)
+            self.assertEqual(store.data["hidden"]["6"], "y" * 80)
+
 
 if __name__ == "__main__":
     unittest.main()

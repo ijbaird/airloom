@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "alert_threshold": 101,
     "favorites": [],
     "alert_states": {},
+    "hidden": {},
 }
 
 
@@ -69,6 +70,13 @@ def _sanitize(data: dict) -> dict:
         )
     if isinstance(data.get("alert_states"), dict):
         clean["alert_states"] = {str(key): bool(value) for key, value in data["alert_states"].items()}
+    hidden = data.get("hidden")
+    if isinstance(hidden, dict):
+        clean["hidden"] = {
+            str(int(key)): value.strip()[:80]
+            for key, value in hidden.items()
+            if isinstance(key, str) and key.isascii() and key.isdigit() and isinstance(value, str)
+        }
     return clean
 
 
@@ -112,6 +120,10 @@ class Store:
             "alert_threshold": self.data["alert_threshold"],
             "has_api_key": has_key,
             "api_key_hint": f"••••{api_key[-4:]}" if has_key and len(api_key) >= 8 else "",
+            "hidden": sorted(
+                ({"id": int(key), "name": name} for key, name in self.data["hidden"].items()),
+                key=lambda item: (item["name"].lower(), item["id"]),
+            ),
         }
 
     def has_custom_location(self) -> bool:
@@ -132,3 +144,22 @@ class Store:
         self.data["favorites"] = sorted(favorites)
         self.save()
         return enabled
+
+    def hide(self, sensor_id: int, name: str) -> None:
+        self.data["hidden"][str(sensor_id)] = str(name).strip()[:80]
+        self.save()
+
+    def unhide(self, sensor_id: int) -> None:
+        if self.data["hidden"].pop(str(sensor_id), None) is not None:
+            self.save()
+
+    def unhide_all(self) -> None:
+        if self.data["hidden"]:
+            self.data["hidden"] = {}
+            self.save()
+
+    def is_hidden(self, sensor_id: int) -> bool:
+        return str(sensor_id) in self.data["hidden"]
+
+    def hidden_ids(self) -> set[int]:
+        return {int(key) for key in self.data["hidden"]}

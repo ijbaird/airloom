@@ -467,6 +467,25 @@ class AirloomApplication(Adw.Application):
                     if sensor.sensor_id == sensor_id:
                         sensor.favorite = enabled
                 self._send_sensor_state()
+        elif action == "hide":
+            sensor_id = self._message_sensor_id(message)
+            if sensor_id is not None:
+                if self.store.is_hidden(sensor_id):
+                    self.store.unhide(sensor_id)
+                    self._send_sensor_state()
+                else:
+                    sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
+                    if sensor is not None:
+                        self.store.hide(sensor_id, sensor.name)
+                        self._send_sensor_state()
+        elif action == "unhide":
+            sensor_id = self._message_sensor_id(message)
+            if sensor_id is not None:
+                self.store.unhide(sensor_id)
+                self._send_sensor_state()
+        elif action == "unhide-all":
+            self.store.unhide_all()
+            self._send_sensor_state()
         elif action == "save-settings":
             self._save_settings(message)
         elif action == "view-changed":
@@ -697,8 +716,14 @@ class AirloomApplication(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:
+        hidden = self.store.hidden_ids()
+        visible = [sensor for sensor in self.sensors if sensor.sensor_id not in hidden]
+        # Hiding the selected sensor must not leave a dangling selection —
+        # same reconciliation rule _finish_refresh applies after a fetch.
+        if self.selected_id not in {sensor.sensor_id for sensor in visible}:
+            self.selected_id = visible[0].sensor_id if visible else None
         payload = {
-            "items": [sensor.to_dict() for sensor in self.sensors],
+            "items": [sensor.to_dict() for sensor in visible],
             "selected_id": self.selected_id,
             "source": source or self.last_source or ("PurpleAir live" if self.store.data.get("api_key") else "Demo data"),
             "config": self.store.public_config(),
@@ -716,8 +741,9 @@ class AirloomApplication(Adw.Application):
         for stale_key in [key for key in states if key not in favorite_keys]:
             del states[stale_key]
             changed = True
+        hidden = self.store.hidden_ids()
         for sensor in self.sensors:
-            if not sensor.favorite or sensor.aqi is None:
+            if not sensor.favorite or sensor.aqi is None or sensor.sensor_id in hidden:
                 continue
             key = str(sensor.sensor_id)
             was_high = bool(states.get(key, False))
