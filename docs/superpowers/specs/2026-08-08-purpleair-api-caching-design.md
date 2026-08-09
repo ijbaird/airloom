@@ -74,11 +74,21 @@ through one decision in the worker thread:
 2. **Fresh hit** — covering region younger than TTL, same filter → serve
    `sensors_in(bounds)`; zero API calls.
 3. **Stale hit** — covering region exists but older than TTL → **delta poll**: same
-   bounded query plus `modified_since=<region.api_time_stamp>`. Merge returned rows over
-   cached rows; unchanged sensors keep cached values; region gets new `fetched_at` and
-   `api_time_stamp`.
-4. **Miss** — no covering region → full fetch with the trimmed map-field list
+   bounded query plus `modified_since=<region.api_time_stamp>`, requesting only the
+   **changing fields** (`sensor_index`, `last_seen`, `humidity`, `temperature`,
+   `pm1.0`, `pm2.5_cf_1`, `pm10.0` ⇒ ~10–11 pts/row). Metadata (`name`, `latitude`,
+   `longitude`, `location_type`) rarely changes, so delta rows merge onto the cached
+   metadata. A delta row whose `sensor_index` is *not* in the cache (a sensor new to
+   the region) is set aside; after the merge, one follow-up `show_only` fetch with the
+   full field list brings in those sensors' metadata (rare). Region gets new
+   `fetched_at` and `api_time_stamp`.
+4. **Miss** — no covering region → full fetch with the full map-field list
    (17 fields minus the six pm2.5 average fields ⇒ ~16 pts/row), stored as a new region.
+
+Two field-list constants in `purpleair.py`: `MAP_FIELDS` (full, for misses and the
+new-sensor follow-up) and `DATA_FIELDS` (changing fields only, for delta polls).
+PurpleAir's guidelines' *groups* feature was considered and rejected: at Airloom's
+scale it matches `show_only` row-for-row while adding group lifecycle management.
 
 **Force refresh** (header button): skip the TTL check, always delta poll. `modified_since`
 results are fully current by definition (unchanged rows are identical to cache). Does
@@ -132,14 +142,17 @@ All GTK-free stdlib `unittest`, consistent with the existing suite:
 - `tests/test_cache.py`: region containment and TTL, delta merge preserves unchanged
   rows, filter mismatch forces a miss, corruption recovery, trend TTL, pruning bounds
   the DB.
-- `tests/test_purpleair.py`: `modified_since` request encoding, trimmed area field
-  list, trend-only fetch field list.
+- `tests/test_purpleair.py`: `modified_since` request encoding, `MAP_FIELDS` vs
+  `DATA_FIELDS` selection, trend-only fetch field list.
+- Delta-merge test: a delta row for an unknown `sensor_index` triggers (and is
+  satisfied by) the follow-up full fetch; known rows keep cached metadata.
 - `tests/test_store.py`: `refresh_minutes` sanitize bounds.
 - `make check` before PR.
 
 ## Expected impact
 
 - Dev relaunch loop: near-zero points (fresh-hit path).
-- Steady state: ~16 pts × changed rows per interval; trends only for opened sensors.
+- Steady state: ~10–11 pts × changed rows per interval; trends only for opened
+  sensors.
 - A repeat of the last two dev days should cost low tens of thousands of points
   instead of 1.4M.
