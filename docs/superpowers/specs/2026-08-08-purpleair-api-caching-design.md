@@ -28,8 +28,10 @@ than the 2-minute sensor report cadence.
 New GTK-free module `airloom/cache.py` with a `SensorCache` class backed by SQLite at
 `~/.cache/airloom/cache.db` (XDG cache dir — regenerable data; directory mode 0700).
 `PurpleAirClient` stays a pure API client; the fetch worker in `app.py` consults the
-cache around it. The cache stores **post-parse sensor dicts** (what the UI receives),
-never raw API responses, and never demo data.
+cache around it. Each cached sensor row stores the sensor's **raw API field values**
+(one JSON object per sensor, merged across fetches) — so a delta poll merge is a plain
+dict update, and `Sensor` objects are always built by one construction path
+(`sensor_from_values`). The cache never stores raw HTTP responses or demo data.
 
 ### Schema
 
