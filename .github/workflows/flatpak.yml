@@ -59,14 +59,33 @@ jobs:
           arch: ${{ matrix.arch }}
           branch: stable
           upload-artifact: false
+      - name: Import signing key
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+        run: scripts/import-signing-key.sh
       - name: Rebuild bundle with update-repo origin
+        shell: bash
         run: |
+          # Embedding --gpg-keys makes flatpak *require* a commit signature at
+          # install time, so keys and signing must travel together: release
+          # builds sign the repo commit (build-sign — the signature the
+          # installer checks; build-bundle --gpg-sign is not enough) and embed
+          # the key, while unsigned PR/main bundles get neither.
+          gpg_args=()
+          if [ -n "${GPG_KEY_ID:-}" ]; then
+            flatpak build-sign repo ai.stealthvision.Airloom stable \
+              --arch="${{ matrix.arch }}" \
+              --gpg-sign="${GPG_KEY_ID}" \
+              --gpg-homedir="${GNUPGHOME}"
+            gpg_args=(--gpg-keys="packaging/airloom-flatpak.gpg")
+          fi
           flatpak build-bundle repo "Airloom-${{ matrix.arch }}.flatpak" \
             ai.stealthvision.Airloom stable \
             --arch="${{ matrix.arch }}" \
             --repo-url="https://ijbaird.github.io/airloom/repo" \
             --runtime-repo="https://dl.flathub.org/repo/flathub.flatpakrepo" \
-            --gpg-keys="packaging/airloom-flatpak.gpg"
+            "${gpg_args[@]}"
       - name: Upload workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -158,15 +177,7 @@ jobs:
       - name: Import signing key
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
-        run: |
-          test -n "${FLATPAK_GPG_PRIVATE_KEY}" || { echo "FLATPAK_GPG_PRIVATE_KEY secret is not set" >&2; exit 1; }
-          keydir="$(mktemp -d)"
-          chmod 700 "${keydir}"
-          printf '%s\n' "${FLATPAK_GPG_PRIVATE_KEY}" | GNUPGHOME="${keydir}" gpg --batch --import
-          key_id="$(GNUPGHOME="${keydir}" gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ {print $10; exit}')"
-          test -n "${key_id}" || { echo "no secret key found after import" >&2; exit 1; }
-          echo "GNUPGHOME=${keydir}" >> "${GITHUB_ENV}"
-          echo "GPG_KEY_ID=${key_id}" >> "${GITHUB_ENV}"
+        run: scripts/import-signing-key.sh
       - name: Assemble site
         run: scripts/publish-flatpak-repo.sh _site repos/airloom-repo-x86_64 repos/airloom-repo-aarch64
       - name: Upload Pages artifact
