@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.12.2" date="2026-08-10">
+      <description><p>Fixed: downloaded Flatpak bundles failed to install with a GPG verification error — release bundles are now properly signed.</p></description>
+    </release>
     <release version="0.12.1" date="2026-08-08">
       <description><p>Fixed: saving preferences no longer jumps the sensor data back to your home area while you are browsing somewhere else on the map — saves now refresh the area you are looking at. Choosing a new fixed home still moves the map there.</p></description>
     </release>

@@ -2,6 +2,12 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.12.2 — 2026-08-10
+
+- Fixed: released Flatpak bundles failed to install with "GPG verification
+  enabled, but no signatures found" — release builds now GPG-sign the bundle's
+  commit with the same key that signs the update repository.
+
 ## 0.12.1 — 2026-08-08
 
 - Fixed: Save & refresh no longer replaces the map's sensors with the home
