@@ -24,11 +24,11 @@ Wrapped sensor copies, interrupted animations, failed tiles, stale search contex
 
 **Files:** Modify `airloom/resources/app.js`, `index.html`, `app.css`, `tests/js/core.test.js`; consume foundation `core.js`.
 
-- [ ] Extend failing Node tests for nearest-world markers/popups/heat points, crossing view payloads, six heat/legend bands at 150/151, 200/201, 300/301, viewport-only area medians, distant favorite exclusion, and capped-coverage status.
-- [ ] Run `node --test tests/js/core.test.js`; confirm failures.
-- [ ] Load core before app, maintain unwrapped center longitude, use nearest world copies everywhere, send explicit crossing bounds, use all six bands, and separate area/favorite rendering/summary inputs.
-- [ ] Run Node tests and `node --check` on all JS; expect PASS.
-- [ ] Commit `fix: make map geography and AQI presentation consistent`.
+- [x] Extend failing Node tests for nearest-world markers/popups/heat points, crossing view payloads, six heat/legend bands at 150/151, 200/201, 300/301, viewport-only area medians, distant favorite exclusion, and capped-coverage status.
+- [x] Run `node --test tests/js/core.test.js`; confirm failures.
+- [x] Load core before app, maintain unwrapped center longitude, use nearest world copies everywhere, send explicit crossing bounds, use all six bands, and separate area/favorite rendering/summary inputs.
+- [x] Run Node tests and `node --check` on all JS; expect PASS.
+- [x] Commit `fix: make map geography and AQI presentation consistent`.
 
 ### Task 2: Navigation and tile lifecycle
 
