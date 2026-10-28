@@ -229,21 +229,21 @@ class CorruptionTest(unittest.TestCase):
             db.close()
         with self.path.open("rb") as original:
             original_inode = os.fstat(original.fileno()).st_ino
-            failure = None
+            failure = False
             opened = None
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ResourceWarning)
                 try:
                     opened = cache.SensorCache(self.path, clock=FakeClock())
-                except cache.CacheError as exc:
-                    failure = exc
+                except cache.CacheError:
+                    failure = True
                 if opened is not None:
                     opened.close()
                 gc.collect()
             self.assertEqual(
                 [item for item in caught if item.category is ResourceWarning], [])
             self.assertEqual(self.path.stat().st_ino, original_inode)
-            self.assertIsNotNone(failure)
+            self.assertTrue(failure)
 
     def test_locked_healthy_db_preserves_inode_and_data(self):
         bounds = self._create_healthy_cache()
