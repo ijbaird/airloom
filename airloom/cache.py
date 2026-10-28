@@ -66,34 +66,66 @@ def _default_cache_dir() -> Path:
     return base / "airloom"
 
 
+class CacheError(RuntimeError):
+    """The cache could not be opened without destroying valid data."""
+
+
 class SensorCache:
     def __init__(self, path: Path | None = None, clock=time.time):
         self.path = path or _default_cache_dir() / "cache.db"
         self.clock = clock
         self._lock = threading.Lock()
+        self._db = None
         self._connect()
 
+    def close(self) -> None:
+        with self._lock:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+
+    def __enter__(self) -> SensorCache:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
     def _connect(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             self._open_and_migrate()
-        except sqlite3.Error:
-            # It's only a cache: a corrupt file is deleted, never repaired.
-            self.path.unlink(missing_ok=True)
-            self._open_and_migrate()
+        except sqlite3.Error as exc:
+            corruption_codes = {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}
+            if getattr(exc, "sqlite_errorcode", None) not in corruption_codes:
+                raise CacheError(f"Could not open cache at {self.path}") from exc
+            # Only confirmed corruption is disposable; locks, permissions,
+            # and I/O errors must leave the existing file untouched.
+            try:
+                self.path.unlink(missing_ok=True)
+                self._open_and_migrate()
+            except (OSError, sqlite3.Error) as recovery_exc:
+                raise CacheError(f"Could not recreate cache at {self.path}") from recovery_exc
+        except OSError as exc:
+            raise CacheError(f"Could not open cache at {self.path}") from exc
 
     def _open_and_migrate(self) -> None:
-        self._db = sqlite3.connect(self.path, check_same_thread=False)
-        self._db.executescript(_SCHEMA)
-        version = self._db.execute("PRAGMA user_version").fetchone()[0]
-        if version != SCHEMA_VERSION:
-            self._db.execute("DELETE FROM sensors")
-            self._db.execute("DELETE FROM regions")
-            self._db.execute("DELETE FROM trends")
-            # PRAGMA does not take bound parameters; SCHEMA_VERSION is a
-            # module constant int, never user input.
-            self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        self._db.commit()
+        db = sqlite3.connect(self.path, check_same_thread=False)
+        self._db = db
+        try:
+            db.executescript(_SCHEMA)
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version != SCHEMA_VERSION:
+                db.execute("DELETE FROM sensors")
+                db.execute("DELETE FROM regions")
+                db.execute("DELETE FROM trends")
+                # PRAGMA does not take bound parameters; SCHEMA_VERSION is a
+                # module constant int, never user input.
+                db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            db.commit()
+        except BaseException:
+            self._db = None
+            db.close()
+            raise
 
     def upsert_rows(self, rows: list[dict]) -> list[int]:
         with self._lock:

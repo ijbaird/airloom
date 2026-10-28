@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import gc
+import os
+import sqlite3
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 from airloom import cache
@@ -29,6 +33,49 @@ class CacheBase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.clock = FakeClock()
         self.cache = cache.SensorCache(Path(self.tmp.name) / "cache.db", clock=self.clock)
+        self.addCleanup(self.cache.close)
+
+
+class OwnershipTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "cache.db"
+
+    def _cache(self):
+        c = cache.SensorCache(self.path, clock=FakeClock())
+        # Keep even failing ownership tests from leaking their raw connection.
+        self.addCleanup(c._db.close)
+        return c
+
+    def test_cache_error_is_a_runtime_error(self):
+        self.assertTrue(issubclass(cache.CacheError, RuntimeError))
+
+    def test_close_is_idempotent(self):
+        c = self._cache()
+        connection = c._db
+        c.close()
+        c.close()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+    def test_context_manager_closes_connection(self):
+        c = self._cache()
+        connection = c._db
+        with c as entered:
+            self.assertIs(entered, c)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+    def test_closed_cache_has_no_forced_gc_resource_warning(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            c = self._cache()
+            c.close()
+            del c
+            gc.collect()
+        self.assertEqual(
+            [item for item in caught if item.category is ResourceWarning], [])
 
 
 class SchemaVersionTest(CacheBase):
@@ -44,7 +91,9 @@ class SchemaVersionTest(CacheBase):
         self.cache.store_trend(1, [{"label": "Now", "aqi": 40}])
         self.cache._db.execute("PRAGMA user_version = 0")  # simulate pre-feature DB
         self.cache._db.commit()
+        self.cache.close()
         reopened = cache.SensorCache(Path(self.tmp.name) / "cache.db", clock=self.clock)
+        self.addCleanup(reopened.close)
         self.assertEqual(reopened.sensors_in(bounds), [])
         self.assertIsNone(reopened.covering_region(bounds, "outdoor"))
         self.assertIsNone(reopened.get_trend(1, max_age=3600))
@@ -54,7 +103,9 @@ class SchemaVersionTest(CacheBase):
     def test_current_version_keeps_rows_across_reconnect(self):
         bounds = bounds_around(45.5, -122.6, 20.0)
         self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        self.cache.close()
         reopened = cache.SensorCache(Path(self.tmp.name) / "cache.db", clock=self.clock)
+        self.addCleanup(reopened.close)
         self.assertEqual(len(reopened.sensors_in(bounds)), 1)
 
 
@@ -73,7 +124,9 @@ class StoreFetchTest(CacheBase):
     def test_persists_across_instances(self):
         bounds = bounds_around(45.5, -122.6, 20.0)
         self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        self.cache.close()
         reopened = cache.SensorCache(Path(self.tmp.name) / "cache.db", clock=self.clock)
+        self.addCleanup(reopened.close)
         self.assertEqual(len(reopened.sensors_in(bounds)), 1)
         self.assertIsNotNone(reopened.covering_region(bounds, "outdoor"))
 
@@ -141,14 +194,78 @@ class FreshSensorsTest(CacheBase):
 
 
 class CorruptionTest(unittest.TestCase):
-    def test_garbage_db_file_is_recreated(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "cache.db"
-            path.write_bytes(b"this is not a sqlite database at all")
-            c = cache.SensorCache(path, clock=FakeClock())
-            bounds = bounds_around(45.5, -122.6, 20.0)
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "cache.db"
+
+    def _create_healthy_cache(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        with cache.SensorCache(self.path, clock=FakeClock()) as c:
             c.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
-            self.assertEqual(len(c.sensors_in(bounds)), 1)
+        return bounds
+
+    def test_garbage_db_file_is_recreated_without_leaking_failed_connection(self):
+        self.path.write_bytes(b"this is not a sqlite database at all")
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        with self.path.open("rb") as original:
+            original_inode = os.fstat(original.fileno()).st_ino
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                with cache.SensorCache(self.path, clock=FakeClock()) as c:
+                    c.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+                    self.assertEqual(len(c.sensors_in(bounds)), 1)
+                gc.collect()
+            self.assertEqual(
+                [item for item in caught if item.category is ResourceWarning], [])
+            self.assertNotEqual(self.path.stat().st_ino, original_inode)
+
+    def test_non_corruption_constructor_failure_closes_connection_and_preserves_file(self):
+        db = sqlite3.connect(self.path)
+        try:
+            db.execute("CREATE VIEW sensors AS SELECT 1 AS sensor_index")
+            db.commit()
+        finally:
+            db.close()
+        with self.path.open("rb") as original:
+            original_inode = os.fstat(original.fileno()).st_ino
+            failure = None
+            opened = None
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                try:
+                    opened = cache.SensorCache(self.path, clock=FakeClock())
+                except cache.CacheError as exc:
+                    failure = exc
+                if opened is not None:
+                    opened.close()
+                gc.collect()
+            self.assertEqual(
+                [item for item in caught if item.category is ResourceWarning], [])
+            self.assertEqual(self.path.stat().st_ino, original_inode)
+            self.assertIsNotNone(failure)
+
+    def test_locked_healthy_db_preserves_inode_and_data(self):
+        bounds = self._create_healthy_cache()
+        with self.path.open("rb") as original:
+            original_inode = os.fstat(original.fileno()).st_ino
+            locker = sqlite3.connect(self.path, timeout=0)
+            try:
+                locker.execute("BEGIN EXCLUSIVE")
+                opened = None
+                try:
+                    opened = cache.SensorCache(self.path, clock=FakeClock())
+                except cache.CacheError:
+                    pass
+                if opened is not None:
+                    opened.close()
+                self.assertEqual(self.path.stat().st_ino, original_inode)
+                self.assertIsNone(opened)
+            finally:
+                locker.close()
+        with cache.SensorCache(self.path, clock=FakeClock()) as reopened:
+            self.assertEqual(
+                [item["sensor_index"] for item in reopened.sensors_in(bounds)], [1])
 
 
 class TrendTest(CacheBase):
