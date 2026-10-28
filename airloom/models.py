@@ -22,6 +22,8 @@ class Sensor:
     trend: list[dict[str, int | str | None]] = field(default_factory=list)
     favorite: bool = False
     indoor: bool = False
+    origin: str = "live"
+    delivery: str = "network"
 
     def to_dict(self) -> dict:
         result = asdict(self)
