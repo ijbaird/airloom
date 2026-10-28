@@ -45,11 +45,11 @@ Crossing bounds at ±180°, non-finite IDs/coordinates, superseded request token
 - `RequestRegistry.begin(context: str, generation: int = 0) -> RequestToken`.
 - `is_current(token) -> bool`, `finish(token) -> None`, `invalidate(context: str | None = None) -> None`.
 
-- [ ] Write failing tests for monotonically increasing IDs, same-context supersession, independent contexts, stale finish, generation mismatch, and targeted/global invalidation.
-- [ ] Run `python3 -m unittest tests.test_requests -v`; expect import failure.
-- [ ] Implement the thread-safe registry with no GTK or clock dependency; only the newest live token for a context/generation is current.
-- [ ] Re-run focused tests; expect PASS.
-- [ ] Commit `feat: add request identity registry`.
+- [x] Write failing tests for monotonically increasing IDs, same-context supersession, independent contexts, stale finish, generation mismatch, and targeted/global invalidation.
+- [x] Run `python3 -m unittest tests.test_requests -v`; expect import failure.
+- [x] Implement the thread-safe registry with no GTK or clock dependency; only the newest live token for a context/generation is current.
+- [x] Re-run focused tests; expect PASS.
+- [x] Commit `feat: add request identity registry`.
 
 ### Task 3: Presentation and alert decisions
 
