@@ -64,6 +64,8 @@ TREND_FIELDS = (
 
 
 MAX_FETCH_SPAN_KM = 200.0
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 
 def cap_bounds(bounds: Bounds, center: tuple[float, float]) -> Bounds:
@@ -243,12 +245,17 @@ def _integer(value) -> int | None:
     if value is None:
         return None
     if isinstance(value, int):
-        return int(value)
+        return int(value) if _INT64_MIN <= value <= _INT64_MAX else None
     try:
         parsed = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
-    if not parsed.is_finite() or parsed != parsed.to_integral_value():
+    if (
+        not parsed.is_finite()
+        or parsed < _INT64_MIN
+        or parsed > _INT64_MAX
+        or parsed != parsed.to_integral_value()
+    ):
         return None
     return int(parsed)
 

@@ -252,6 +252,17 @@ class SensorFromValuesTest(unittest.TestCase):
         )
         self.assertEqual(sensor.sensor_id, sensor_id)
 
+    def test_sensor_ids_enforce_signed_64_bit_limit_without_losing_boundaries(self):
+        maximum = 2**63 - 1
+        base = {"latitude": 45.5, "longitude": -122.6}
+        for value in (maximum, str(maximum), "9.223372036854775807e18"):
+            with self.subTest(valid=value):
+                sensor = purpleair.sensor_from_values({**base, "sensor_index": value})
+                self.assertEqual(sensor.sensor_id, maximum)
+        for value in ("1e5000", "-1e5000", "9.223372036854775808e18", 2**63, 10**400):
+            with self.subTest(invalid=value):
+                self.assertIsNone(purpleair.sensor_from_values({**base, "sensor_index": value}))
+
     def test_near_integer_fractional_string_sensor_id_is_rejected(self):
         sensor = purpleair.sensor_from_values(
             {"sensor_index": "7.0000000000000001", "latitude": 45.5, "longitude": -122.6}
