@@ -29,11 +29,11 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 - `RefreshDecision(publish: bool, sensors: tuple, trend_ids: tuple[int, ...])` frozen dataclass.
 - `ApplicationController(config: dict)` with `set_view(view: dict)`, `set_config(config: dict)`, `begin_refresh(force=False)`, `complete_refresh(request, sensors, origin, delivery)`.
 
-- [ ] Write failing tests for current-view manual/auto refresh, home fallback before view, A superseded by B/config/filter, cached superseded results not publishing or starting trends, and latest B publishing once.
-- [ ] Run `python3 -m unittest tests.test_controller -v`; expect import failure.
-- [ ] Implement generation-based newest-request authorization; cache writes remain adapter-side and do not require `publish=True`.
-- [ ] Re-run focused tests; expect PASS.
-- [ ] Commit `feat: add authoritative refresh controller`.
+- [x] Write failing tests for current-view manual/auto refresh, home fallback before view, A superseded by B/config/filter, cached superseded results not publishing or starting trends, and latest B publishing once.
+- [x] Run `python3 -m unittest tests.test_controller -v`; expect import failure.
+- [x] Implement generation-based newest-request authorization; cache writes remain adapter-side and do not require `publish=True`.
+- [x] Re-run focused tests; expect PASS.
+- [x] Commit `feat: add authoritative refresh controller`.
 
 ### Task 2: Port sensor state, filters, summaries, and alerts
 
