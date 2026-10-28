@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -198,6 +199,54 @@ class DebugPortSafetyTest(unittest.TestCase):
         with self.assertRaises(OSError):
             port.start()
 
+        current = os.lstat(self.path)
+        self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+
+    def test_live_socket_with_full_backlog_is_refused_without_hanging(self):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(self.path)
+        listener.listen(1)
+        original = os.lstat(self.path)
+
+        # Fill the listener queue without accepting. On Linux, the next
+        # non-blocking connect fails with EAGAIN while a blocking connect
+        # waits for queue space.
+        for _attempt in range(32):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.setblocking(False)
+            try:
+                client.connect(self.path)
+            except BlockingIOError:
+                client.close()
+                break
+            self.addCleanup(client.close)
+        else:
+            self.fail("could not saturate the disposable listener backlog")
+
+        port = DebugPort(self.path, _echo_dispatcher)
+        self.addCleanup(port.stop)
+        outcome = []
+
+        def start_port():
+            try:
+                port.start()
+            except OSError as exc:
+                outcome.append(exc)
+
+        starter = threading.Thread(target=start_port, daemon=True)
+        starter.start()
+        starter.join(timeout=2)
+        if starter.is_alive():
+            # Release the blocked pre-fix probe before failing so the test
+            # leaves no running startup thread behind.
+            accepted, _ = listener.accept()
+            accepted.close()
+            starter.join(timeout=2)
+            self.fail("start() blocked on a live listener with a full connection backlog")
+
+        self.assertEqual(len(outcome), 1, "start() did not refuse the congested live listener")
+        self.assertIsInstance(outcome[0], OSError)
         current = os.lstat(self.path)
         self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
 

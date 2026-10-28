@@ -100,6 +100,10 @@ class DebugPort:
             raise FileExistsError(errno.EEXIST, "debug path exists and is not a socket", self._path)
 
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # A full listen queue can block AF_UNIX connect() indefinitely. A
+        # timeout is not proof of staleness, so the OSError handler below
+        # refuses startup and preserves the existing path.
+        probe.settimeout(0.2)
         try:
             probe.connect(self._path)
         except ConnectionRefusedError:
