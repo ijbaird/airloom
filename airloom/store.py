@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
+import threading
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -14,6 +17,7 @@ DEFAULT_CONFIG = {
     "location_name": "Portland, Oregon",
     "radius_km": 22.0,
     "heatmap_threshold_km": 40.0,
+    "interface_scale": 1.0,
     "temperature_unit": "F",
     "home_mode": "auto",
     "location_filter": "outdoor",
@@ -34,6 +38,26 @@ def _default_config_dir() -> Path:
     return base / "airloom"
 
 
+def sensor_id(value) -> int | None:
+    """Return a positive, signed-64-bit sensor ID, or None for hostile input."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 < value <= 2**63 - 1 else None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        not parsed.is_finite()
+        or parsed <= 0
+        or parsed > 2**63 - 1
+        or parsed != parsed.to_integral_value()
+    ):
+        return None
+    return int(parsed)
+
+
 def _sanitize(data: dict) -> dict:
     clean = deepcopy(DEFAULT_CONFIG)
 
@@ -50,6 +74,9 @@ def _sanitize(data: dict) -> dict:
     number("heatmap_threshold_km", 5.0, 1000.0)
     number("alert_threshold", 1, 500)
     clean["alert_threshold"] = int(clean["alert_threshold"])
+    scale = data.get("interface_scale")
+    if isinstance(scale, float) and scale in (1.0, 1.25, 1.5):
+        clean["interface_scale"] = scale
     if isinstance(data.get("api_key"), str):
         clean["api_key"] = data["api_key"].strip()
     if isinstance(data.get("location_name"), str) and data["location_name"].strip():
@@ -66,29 +93,27 @@ def _sanitize(data: dict) -> dict:
         clean["confidence_filter"] = data["confidence_filter"]
     favorites = data.get("favorites")
     if isinstance(favorites, list):
-        clean["favorites"] = sorted(
-            {
-                int(item)
-                for item in favorites
-                if (isinstance(item, (int, float)) and not isinstance(item, bool))
-                or (isinstance(item, str) and item.isdigit())
-            }
-        )
+        valid_favorites = set()
+        for item in favorites:
+            normalized = sensor_id(item)
+            if normalized is not None:
+                valid_favorites.add(normalized)
+        clean["favorites"] = sorted(valid_favorites)
     if isinstance(data.get("alert_states"), dict):
         clean["alert_states"] = {str(key): bool(value) for key, value in data["alert_states"].items()}
     hidden = data.get("hidden")
     if isinstance(hidden, dict):
-        clean["hidden"] = {
-            str(int(key)): value.strip()[:80]
-            for key, value in hidden.items()
-            if isinstance(key, str) and key.isascii() and key.isdigit() and isinstance(value, str)
-        }
+        for key, value in hidden.items():
+            normalized = sensor_id(key) if isinstance(key, str) else None
+            if normalized is not None and isinstance(value, str):
+                clean["hidden"][str(normalized)] = value.strip()[:80]
     return clean
 
 
 class Store:
     def __init__(self, path: Path | None = None):
         self.path = path or _default_config_dir() / "config.json"
+        self._save_lock = threading.RLock()
         self.data = self._load()
 
     def _load(self) -> dict:
@@ -102,14 +127,42 @@ class Store:
         return _sanitize(loaded)
 
     def save(self) -> None:
+        with self._save_lock:
+            self.apply(deepcopy(self.data))
+
+    def apply(self, candidate: dict) -> dict:
+        clean = _sanitize(candidate)
+        with self._save_lock:
+            self._write(clean)
+            self.data = clean
+        return clean
+
+    def _write(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = self.path.with_suffix(".tmp")
-        # The config holds the API key, so it must never touch disk with
-        # permissive modes — create the file 0600 from the start.
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(self.data, indent=2, sort_keys=True))
-        temporary.replace(self.path)
+        # mkstemp uses O_EXCL and mode 0600, so preexisting files and links
+        # cannot redirect or expose the API key while it is being written.
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=self.path.parent,
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        open_descriptor: int | None = descriptor
+        try:
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+            open_descriptor = None
+            with handle:
+                handle.write(json.dumps(data, indent=2, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if open_descriptor is not None:
+                os.close(open_descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
     def public_config(self) -> dict:
         api_key = self.data.get("api_key")
@@ -120,6 +173,7 @@ class Store:
             "location_name": self.data["location_name"],
             "radius_km": self.data["radius_km"],
             "heatmap_threshold_km": self.data["heatmap_threshold_km"],
+            "interface_scale": self.data["interface_scale"],
             "temperature_unit": self.data["temperature_unit"],
             "home_mode": self.data["home_mode"],
             "location_filter": self.data["location_filter"],
@@ -142,29 +196,37 @@ class Store:
         )
 
     def toggle_favorite(self, sensor_id: int) -> bool:
-        favorites = set(self.data.get("favorites", []))
-        if sensor_id in favorites:
-            favorites.remove(sensor_id)
-            enabled = False
-        else:
-            favorites.add(sensor_id)
-            enabled = True
-        self.data["favorites"] = sorted(favorites)
-        self.save()
+        with self._save_lock:
+            candidate = deepcopy(self.data)
+            favorites = set(candidate.get("favorites", []))
+            if sensor_id in favorites:
+                favorites.remove(sensor_id)
+                enabled = False
+            else:
+                favorites.add(sensor_id)
+                enabled = True
+            candidate["favorites"] = sorted(favorites)
+            self.apply(candidate)
         return enabled
 
     def hide(self, sensor_id: int, name: str) -> None:
-        self.data["hidden"][str(sensor_id)] = str(name).strip()[:80]
-        self.save()
+        with self._save_lock:
+            candidate = deepcopy(self.data)
+            candidate["hidden"][str(sensor_id)] = str(name).strip()[:80]
+            self.apply(candidate)
 
     def unhide(self, sensor_id: int) -> None:
-        if self.data["hidden"].pop(str(sensor_id), None) is not None:
-            self.save()
+        with self._save_lock:
+            candidate = deepcopy(self.data)
+            if candidate["hidden"].pop(str(sensor_id), None) is not None:
+                self.apply(candidate)
 
     def unhide_all(self) -> None:
-        if self.data["hidden"]:
-            self.data["hidden"] = {}
-            self.save()
+        with self._save_lock:
+            candidate = deepcopy(self.data)
+            if candidate["hidden"]:
+                candidate["hidden"] = {}
+                self.apply(candidate)
 
     def is_hidden(self, sensor_id: int) -> bool:
         return str(sensor_id) in self.data["hidden"]
