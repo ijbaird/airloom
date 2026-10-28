@@ -61,11 +61,11 @@ Crossing bounds at ±180°, non-finite IDs/coordinates, superseded request token
 - Sensor provenance fields: `origin: str = "live"`, `delivery: str = "network"`; serialized to JS.
 - `MAX_ALERT_OBSERVATION_AGE = 2 * 3600`.
 
-- [ ] Write failing tests proving cached/network/favorite paths obey hidden/confidence/location filters, demo and >2h observations neither alert nor mutate state, fresh real crossings alert once, and origin/delivery serialize.
-- [ ] Run `python3 -m unittest tests.test_presentation tests.test_models -v`; expect import/attribute failures.
-- [ ] Implement pure filtering and threshold transitions using `last_seen`; do not infer freshness from retrieval time.
-- [ ] Re-run focused tests; expect PASS.
-- [ ] Commit `feat: add provenance-aware presentation decisions`.
+- [x] Write failing tests proving cached/network/favorite paths obey hidden/confidence/location filters, demo and >2h observations neither alert nor mutate state, fresh real crossings alert once, and origin/delivery serialize.
+- [x] Run `python3 -m unittest tests.test_presentation tests.test_models -v`; expect import/attribute failures.
+- [x] Implement pure filtering and threshold transitions using `last_seen`; do not infer freshness from retrieval time.
+- [x] Re-run focused tests; expect PASS.
+- [x] Commit `feat: add provenance-aware presentation decisions`.
 
 ### Task 4: Wire dependency-free checks
 
