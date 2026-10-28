@@ -28,11 +28,11 @@ Huge finite values, malformed Unicode favorites, preexisting symlinks, locked he
 - `epa_corrected_pm25(value, humidity, basis="CF1") -> float | None`; basis is `CF1` or `ATM`.
 - `CORRECTION_VERSION = 2`; trend requests include `location_type`; cache schema bumps in Task 3/4.
 
-- [ ] Add independently calculated failing fixtures for CF1 <570, 570–611 blend, ≥611; all five ATM branches; indoor/outdoor equivalent trends; `1e30`, `1e308`, NaN/Infinity, fractional IDs, invalid coordinates; demo `Now == aqi`.
-- [ ] Run the three focused modules and confirm failures reproduce InvalidOperation/infinite-to-Good/wrong outdoor trends.
-- [ ] Implement finite-safe correction/truncation/clamping, strict sensor ID/coordinate validation, basis selection, location_type trend fields, and demo endpoint consistency. Document historical humidity approximation and sources in code.
-- [ ] Re-run focused modules; expect PASS and no crash/AQI 0 for invalid measurements.
-- [ ] Commit `fix: version and correct sensor conversion paths`.
+- [x] Add independently calculated failing fixtures for CF1 <570, 570–611 blend, ≥611; all five ATM branches; indoor/outdoor equivalent trends; `1e30`, `1e308`, NaN/Infinity, fractional IDs, invalid coordinates; demo `Now == aqi`.
+- [x] Run the three focused modules and confirm failures reproduce InvalidOperation/infinite-to-Good/wrong outdoor trends.
+- [x] Implement finite-safe correction/truncation/clamping, strict sensor ID/coordinate validation, basis selection, location_type trend fields, and demo endpoint consistency. Document historical humidity approximation and sources in code.
+- [x] Re-run focused modules; expect PASS and no crash/AQI 0 for invalid measurements.
+- [x] Commit `fix: version and correct sensor conversion paths`.
 
 ### Task 2: Transactional private settings
 
