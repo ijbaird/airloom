@@ -385,3 +385,27 @@ test("failed tile settlement keeps failed imagery hidden and retains retired cov
   assert.ok(old.childNodes.length > 0, "failed replacements must not clear successful retired imagery");
   assert.equal(old.hidden, false);
 });
+
+test("mixed tile settlement ending in failure retains retired coverage", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const old = app.elements.get("tiles-old");
+  for (const image of [...live.childNodes]) image.onload();
+  app.context.Airloom.debugZoomTo(13);
+  assert.ok(old.childNodes.length > 0, "successful imagery should move to the retired layer");
+
+  const replacements = [...live.childNodes];
+  assert.ok(replacements.length > 2, "the new zoom should request several tiles");
+  const successful = replacements[0];
+  const finalFailure = replacements.at(-1);
+  successful.onload();
+  for (const image of replacements.slice(1, -1)) image.onerror();
+  assert.ok(old.childNodes.length > 0, "the final pending request must not yet retire imagery");
+
+  finalFailure.onerror();
+
+  assert.equal(successful.classList.contains("loaded"), true);
+  assert.ok(old.childNodes.length > 0, "a partially failed replacement must not clear retired imagery");
+  assert.equal(old.hidden, false);
+});

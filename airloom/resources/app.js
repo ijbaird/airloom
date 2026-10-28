@@ -526,9 +526,10 @@
 
   function clearRetiredTilesWhenCovered(owner) {
     if (owner !== tileLayer || owner.pending > 0) return;
-    // Settlement is not coverage: an error leaves the image hidden and must
-    // not discard the last successful layer as though a replacement arrived.
-    if ($("#tiles").querySelector(".tile.loaded")) clearRetiredTiles();
+    // Settlement is not coverage: only a completely successful current layer
+    // can replace the last usable imagery.
+    const tiles = [...owner.tiles.values()];
+    if (tiles.length && tiles.every((img) => img.classList.contains("loaded"))) clearRetiredTiles();
   }
 
   function renderFrame() {
