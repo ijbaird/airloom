@@ -167,6 +167,7 @@
     state.coverage = payload.coverage || null;
     state.selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
     state.source = payload.source || "Demo data";
+    state.stale = payload.stale;
     state.config = { ...state.config, ...(payload.config || {}) };
     stampPlaceName();
     applyInterfaceScale();
@@ -193,9 +194,10 @@
 
   function renderProvenance() {
     const source = (state.source || "").toLowerCase();
+    const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
     let label = "";
     if (source.includes("demo") || state.areaSensors.some((sensor) => sensor.origin === "demo")) label = "Demo data";
-    else if (source.includes("stale")) label = "Stale cached data";
+    else if (state.stale === true || legacyStale) label = "Stale cached data";
     else if (source.includes("cached") || state.areaSensors.some((sensor) => sensor.delivery === "cache")) label = "Cached data";
     for (const id of ["summary-provenance", "detail-provenance"]) {
       const element = $(`#${id}`);

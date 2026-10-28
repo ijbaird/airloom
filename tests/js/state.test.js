@@ -720,7 +720,7 @@ test("narrow layout stacks summary below a full-width top search", () => {
   assert.match(narrow, /\.summary-chip\s*\{[^}]*top:\s*64px;[^}]*left:\s*10px;[^}]*right:\s*auto;/);
 });
 
-test("demo, cached, stale, and coverage provenance remain visible near AQI", () => {
+test("demo and coverage provenance remain visible near AQI", () => {
   const app = loadApp();
   configureMap(app);
   const summary = app.elements.get("summary-provenance");
@@ -734,20 +734,45 @@ test("demo, cached, stale, and coverage provenance remain visible near AQI", () 
   assert.equal(detail.hidden, false);
   assert.equal(detail.textContent, "Demo data");
 
-  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached" });
-  assert.equal(summary.textContent, "Cached data");
-  assert.equal(detail.textContent, "Cached data");
-  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], {
-    source: "PurpleAir · stale cached data",
-    coverage: { capped: true, complete: false },
-  });
-  assert.equal(summary.textContent, "Stale cached data");
-  assert.equal(app.elements.get("coverage-status").hidden, false);
-
-  receiveSensors(app, [fixtureSensor(1)], { coverage: { capped: false, complete: true } });
+  receiveSensors(app, [fixtureSensor(1)], { coverage: { capped: true, complete: false } });
   assert.equal(summary.hidden, true);
   assert.equal(detail.hidden, true);
+  assert.equal(app.elements.get("coverage-status").hidden, false);
+  receiveSensors(app, [fixtureSensor(1)], { coverage: { capped: false, complete: true } });
   assert.equal(app.elements.get("coverage-status").hidden, true);
+});
+
+test("actual legacy cached fallback payload is labeled stale", () => {
+  const app = loadApp();
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached" });
+
+  assert.equal(app.elements.get("summary-provenance").textContent, "Stale cached data");
+  assert.equal(app.elements.get("detail-provenance").textContent, "Stale cached data");
+});
+
+test("explicit stale provenance overrides the legacy source label", () => {
+  const app = loadApp();
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached", stale: true });
+
+  assert.equal(app.elements.get("summary-provenance").textContent, "Stale cached data");
+  assert.equal(app.elements.get("detail-provenance").textContent, "Stale cached data");
+});
+
+test("ordinary cached payloads remain cached instead of becoming stale", () => {
+  const app = loadApp();
+  configureMap(app);
+  const summary = app.elements.get("summary-provenance");
+  const detail = app.elements.get("detail-provenance");
+
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached", stale: false });
+  assert.equal(summary.textContent, "Cached data");
+  assert.equal(detail.textContent, "Cached data");
+
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached startup" });
+  assert.equal(summary.textContent, "Cached data");
+  assert.equal(detail.textContent, "Cached data");
 });
 
 test("Sensors count matches nearby rows when favorites are a separate collection", () => {
