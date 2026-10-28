@@ -30,11 +30,11 @@ Crossing bounds at ±180°, non-finite IDs/coordinates, superseded request token
 - Produces: `Bounds(north, west, south, east)`, `bounds_around(...)`, `bounds_contains(outer, inner)`, `split_bounds(bounds) -> tuple[Bounds, ...]`, `nearest_longitude(longitude, reference) -> float`.
 - Produces JS `AirloomCore.splitBounds`, `nearestLongitude`, `bandForAQI`, `summarySensors(sensors, view)` with UMD-style browser/`module.exports` exposure.
 
-- [ ] Write failing Python tests for 179/-179 splitting, containment on both sides, bounds_around wrapping, nearest-world ±180 projection, finite/range validation; write Node tests for the same math, all six AQI boundaries, and exclusion of remote favorites from summaries.
-- [ ] Run `python3 -m unittest tests.test_geography -v` and `node --test tests/js/core.test.js`; expect missing-module/export failures.
-- [ ] Move/re-export geographic primitives, implement split/nearest helpers, and implement pure JS math using the six existing `aqi.py` bands. `summarySensors` accepts an explicit `isRemoteFavorite` flag and never guesses from distance.
-- [ ] Re-run both focused suites and existing `tests.test_purpleair`; expect PASS.
-- [ ] Commit `feat: add canonical geography and frontend math contracts`.
+- [x] Write failing Python tests for 179/-179 splitting, containment on both sides, bounds_around wrapping, nearest-world ±180 projection, finite/range validation; write Node tests for the same math, all six AQI boundaries, and exclusion of remote favorites from summaries.
+- [x] Run `python3 -m unittest tests.test_geography -v` and `node --test tests/js/core.test.js`; expect missing-module/export failures.
+- [x] Move/re-export geographic primitives, implement split/nearest helpers, and implement pure JS math using the six existing `aqi.py` bands. `summarySensors` accepts an explicit `isRemoteFavorite` flag and never guesses from distance.
+- [x] Re-run both focused suites and existing `tests.test_purpleair`; expect PASS.
+- [x] Commit `feat: add canonical geography and frontend math contracts`.
 
 ### Task 2: Request identity registry
 
