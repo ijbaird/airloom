@@ -44,11 +44,11 @@ Regular-file socket paths, live sockets, unrelated running apps, custom DESTDIR/
 
 **Files:** Create `tests/test_workflows.py`; modify `.github/workflows/flatpak.yml`, `.github/workflows/claude-code-review.yml`, other Claude workflows/Dependabot config as needed, `Makefile` only to consume already-landed checks.
 
-- [ ] Add failing `tests/test_workflows.py` contract tests asserting `make check`, headless WebKit UI job, isolated env, no live API key, Dependabot/fork clean skip, and immutable action SHAs for the offered checkout/deploy-pages/Flatpak updates.
-- [ ] Run workflow tests against current YAML; confirm missing gates/actor failure.
-- [ ] Align CI, add Fedora/WebKit headless job for existing isolated UI scripts, safely skip credential review for untrusted actors, and adopt compatible action updates pinned by SHA.
-- [ ] Run workflow/shell/Python checks locally; expect PASS. Actual CI result remains pending until pushed.
-- [ ] Commit `ci: complete regression coverage and actor gating`.
+- [x] Add failing `tests/test_workflows.py` contract tests asserting `make check`, headless WebKit UI job, isolated env, no live API key, Dependabot/fork clean skip, and immutable action SHAs for the offered checkout/deploy-pages/Flatpak updates.
+- [x] Run workflow tests against current YAML; confirm missing gates/actor failure.
+- [x] Align CI, add Fedora/WebKit headless job for existing isolated UI scripts, safely skip credential review for untrusted actors, and adopt compatible action updates pinned by SHA.
+- [x] Run workflow/shell/Python checks locally; expect PASS. Actual CI result remains pending until pushed.
+- [x] Commit `ci: complete regression coverage and actor gating`.
 
 ### Task 4: Fail-closed release eligibility and provenance
 
