@@ -245,6 +245,19 @@ class SensorFromValuesTest(unittest.TestCase):
             with self.subTest(sensor_id=sensor_id):
                 self.assertIsNone(purpleair.sensor_from_values({**base, "sensor_index": sensor_id}))
 
+    def test_large_integer_sensor_id_is_preserved_exactly(self):
+        sensor_id = 9007199254740993
+        sensor = purpleair.sensor_from_values(
+            {"sensor_index": sensor_id, "latitude": 45.5, "longitude": -122.6}
+        )
+        self.assertEqual(sensor.sensor_id, sensor_id)
+
+    def test_near_integer_fractional_string_sensor_id_is_rejected(self):
+        sensor = purpleair.sensor_from_values(
+            {"sensor_index": "7.0000000000000001", "latitude": 45.5, "longitude": -122.6}
+        )
+        self.assertIsNone(sensor)
+
     def test_out_of_range_and_non_finite_coordinates_are_rejected(self):
         base = {"sensor_index": 7, "latitude": 45.5, "longitude": -122.6}
         invalid = (
@@ -254,6 +267,8 @@ class SensorFromValuesTest(unittest.TestCase):
             {"longitude": -180.1},
             {"latitude": float("nan")},
             {"longitude": float("inf")},
+            {"latitude": 10**400},
+            {"longitude": 10**400},
         )
         for override in invalid:
             with self.subTest(override=override):
@@ -268,6 +283,15 @@ class SensorFromValuesTest(unittest.TestCase):
         overflowing = purpleair.sensor_from_values({**base, "pm2.5_cf_1": 1e308})
         self.assertIsNone(overflowing.aqi)
         self.assertIsNone(overflowing.pm25)
+
+    def test_oversized_integer_measurements_become_unavailable(self):
+        base = {"sensor_index": 7, "latitude": 45.5, "longitude": -122.6}
+        concentration = purpleair.sensor_from_values({**base, "pm2.5_cf_1": 10**400})
+        self.assertIsNone(concentration.aqi)
+        self.assertIsNone(concentration.pm25)
+        humidity = purpleair.sensor_from_values({**base, "pm2.5_cf_1": 20, "humidity": 10**400})
+        self.assertIsNone(humidity.humidity)
+        self.assertIsNotNone(humidity.aqi)  # Missing humidity uses the neutral default.
 
     def test_trend_from_values_produces_seven_points(self):
         values = {"sensor_index": 7, "humidity": 40, "pm2.5_cf_1": 4.0,

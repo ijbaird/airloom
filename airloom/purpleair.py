@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -233,7 +234,7 @@ def _number(value) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -241,11 +242,13 @@ def _number(value) -> float | None:
 def _integer(value) -> int | None:
     if value is None:
         return None
+    if isinstance(value, int):
+        return int(value)
     try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
         return None
-    if not math.isfinite(parsed) or not parsed.is_integer():
+    if not parsed.is_finite() or parsed != parsed.to_integral_value():
         return None
     return int(parsed)
 
