@@ -73,8 +73,8 @@ Crossing bounds at ±180°, non-finite IDs/coordinates, superseded request token
 
 **Interfaces:** `make check` runs Python unittest discovery, compileall, `node --check` for every JS source, and `node --test tests/js/*.test.js`.
 
-- [ ] Write a failing `BuildCheckTest` that runs `make -n check` and asserts the dry-run output contains `node --test`; run `python3 -m unittest tests.test_build -v` and confirm the assertion fails.
-- [ ] Run `make check`; note that the new Node suite is not invoked.
-- [ ] Add `check-js` and include it in `check` without adding package installation.
-- [ ] Run `make check`; expect all existing and new tests PASS.
-- [ ] Commit `build: include pure JavaScript tests in checks` and request Sol review of the complete foundation diff.
+- [x] Write a failing `BuildCheckTest` that runs `make -n check` and asserts the dry-run output contains `node --test`; run `python3 -m unittest tests.test_build -v` and confirm the assertion fails.
+- [x] Run `make check`; note that the new Node suite is not invoked.
+- [x] Add `check-js` and include it in `check` without adding package installation.
+- [x] Run `make check`; expect all existing and new tests PASS.
+- [x] Commit `build: include pure JavaScript tests in checks` and request Sol review of the complete foundation diff.
