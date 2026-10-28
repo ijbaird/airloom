@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# Launch Airloom in debug mode: kills any other running instance first (a
-# debug launch must be the only one, and a stray flatpak/python instance
-# would otherwise sit on the same well-known socket path or just be
-# confusing to drive), picks a default AIRLOOM_DEBUG_SOCKET if the caller
-# didn't set one, and execs the repo's ./run so this script's PID becomes
-# Airloom's PID (useful for callers that want to `kill` it directly, though
-# the debug port's own `quit` command is the preferred way to stop it).
+# Launch a separate Airloom instance in debug mode without disrupting any
+# other instance. Debug mode uses Gio.ApplicationFlags.NON_UNIQUE, and a
+# live socket at the same path is refused rather than replaced. The script
+# picks a default AIRLOOM_DEBUG_SOCKET if the caller didn't set one and
+# execs the repo's ./run so this script's PID becomes Airloom's PID (useful
+# for callers that want to `kill` it directly, though the debug port's own
+# `quit` command is the preferred way to stop it).
 set -euo pipefail
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-
-pkill -f 'python3 -m airloom' || true
-flatpak kill ai.stealthvision.Airloom 2>/dev/null || true
 
 export AIRLOOM_DEBUG_SOCKET="${AIRLOOM_DEBUG_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/airloom-debug.sock}"
 echo "airloom debug socket: ${AIRLOOM_DEBUG_SOCKET}" >&2

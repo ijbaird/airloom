@@ -10,11 +10,12 @@ GNOME/systemd sessions), e.g.::
 
     AIRLOOM_DEBUG_SOCKET="$XDG_RUNTIME_DIR/airloom-debug.sock" ./run
 
-The socket file is always created 0600 regardless of the process umask,
-and any stale file already at the path is unlinked first. This module
-does not itself refuse a world-writable parent directory (e.g. /tmp) —
-callers are responsible for choosing a safe path; XDG_RUNTIME_DIR is
-safe, /tmp is not.
+The socket file is always created 0600 regardless of the process umask.
+An existing path is unlinked only after lstat identifies a socket and a
+connection proves it stale; regular files, live listeners, and other file
+types are preserved. This module does not itself refuse a world-writable
+parent directory (e.g. /tmp) — callers are responsible for choosing a safe
+path; XDG_RUNTIME_DIR is safe, /tmp is not.
 
 Protocol: newline-delimited JSON over an ``AF_UNIX``/``SOCK_STREAM``
 socket, one client connection at a time. Each line the client sends is a
@@ -42,10 +43,12 @@ exercised by plain ``unittest`` without a display.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
 import socket
+import stat
 import threading
 from typing import Callable
 
@@ -68,13 +71,11 @@ class DebugPort:
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
+        self._bound_identity: tuple[int, int] | None = None
 
     def start(self) -> None:
         """Bind, chmod 0600, and start accepting connections on a daemon thread."""
-        try:
-            os.unlink(self._path)
-        except FileNotFoundError:
-            pass
+        self._remove_stale_socket()
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         old_umask = os.umask(0o177)
@@ -82,14 +83,48 @@ class DebugPort:
             sock.bind(self._path)
         finally:
             os.umask(old_umask)
-        # Belt-and-braces: chmod explicitly rather than relying solely on
-        # the umask trick, in case the path already existed with looser
-        # permissions before the unlink (e.g. a stale socket from a crash).
+        bound = os.lstat(self._path)
+        self._bound_identity = (bound.st_dev, bound.st_ino)
         os.chmod(self._path, 0o600)
         sock.listen(1)
         self._sock = sock
         self._thread = threading.Thread(target=self._accept_loop, name="airloom-debugport", daemon=True)
         self._thread.start()
+
+    def _remove_stale_socket(self) -> None:
+        try:
+            original = os.lstat(self._path)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(original.st_mode):
+            raise FileExistsError(errno.EEXIST, "debug path exists and is not a socket", self._path)
+
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(self._path)
+        except ConnectionRefusedError:
+            # A listener that has exited leaves a socket inode whose
+            # connections are refused. Only that demonstrated state is stale.
+            pass
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise OSError(errno.EBUSY, f"could not prove debug socket is stale: {exc}", self._path) from exc
+        else:
+            raise OSError(errno.EADDRINUSE, "debug socket already has a live listener", self._path)
+        finally:
+            probe.close()
+
+        try:
+            current = os.lstat(self._path)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(current.st_mode) or (current.st_dev, current.st_ino) != (
+            original.st_dev,
+            original.st_ino,
+        ):
+            raise FileExistsError(errno.EEXIST, "debug socket path changed while checking it", self._path)
+        os.unlink(self._path)
 
     def stop(self) -> None:
         self._stopping.set()
@@ -98,8 +133,14 @@ class DebugPort:
                 self._sock.close()
             except OSError:
                 pass
+        identity = self._bound_identity
+        self._bound_identity = None
+        if identity is None:
+            return
         try:
-            os.unlink(self._path)
+            current = os.lstat(self._path)
+            if stat.S_ISSOCK(current.st_mode) and (current.st_dev, current.st_ino) == identity:
+                os.unlink(self._path)
         except OSError:
             pass
 
@@ -241,7 +282,10 @@ def validate_command(command: dict) -> tuple[dict | None, str | None]:
     about (which includes `eval`/`pinch`; callers must route those before
     falling back to this function).
     """
-    validator = _VALIDATORS.get(command.get("cmd"))
+    cmd = command.get("cmd")
+    if not isinstance(cmd, str):
+        return None, f"unknown cmd: {cmd!r}"
+    validator = _VALIDATORS.get(cmd)
     if validator is None:
-        return None, f"unknown cmd: {command.get('cmd')!r}"
+        return None, f"unknown cmd: {cmd!r}"
     return validator(command)

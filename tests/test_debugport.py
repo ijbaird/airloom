@@ -106,10 +106,12 @@ class DebugPortTest(unittest.TestCase):
         self.assertEqual(mode, 0o600)
 
     def test_stale_socket_file_is_replaced(self):
-        # Simulate a leftover file at the path (e.g. from a prior crash)
+        # Simulate a leftover socket at the path (e.g. from a prior crash)
         # from *before* start() is called on a fresh DebugPort instance.
         stale_path = str(Path(self._tempdir.name) / "stale.sock")
-        Path(stale_path).write_text("stale", encoding="utf-8")
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(stale_path)
+        stale.close()
         port = DebugPort(stale_path, _echo_dispatcher)
         port.start()
         try:
@@ -168,6 +170,73 @@ class DebugPortTest(unittest.TestCase):
             self.assertTrue(response["ok"])
 
 
+class DebugPortSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.path = str(Path(self._tempdir.name) / "airloom-debug.sock")
+
+    def test_regular_file_is_preserved(self):
+        Path(self.path).write_bytes(b"do not delete")
+        port = DebugPort(self.path, _echo_dispatcher)
+        self.addCleanup(port.stop)
+
+        with self.assertRaises(OSError):
+            port.start()
+
+        self.assertEqual(Path(self.path).read_bytes(), b"do not delete")
+
+    def test_live_socket_is_refused_and_preserved(self):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(self.path)
+        listener.listen(1)
+        original = os.lstat(self.path)
+        port = DebugPort(self.path, _echo_dispatcher)
+        self.addCleanup(port.stop)
+
+        with self.assertRaises(OSError):
+            port.start()
+
+        current = os.lstat(self.path)
+        self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+
+    def test_stale_socket_is_replaced(self):
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(self.path)
+        stale.close()
+        original = os.lstat(self.path)
+        port = DebugPort(self.path, _echo_dispatcher)
+        self.addCleanup(port.stop)
+
+        port.start()
+
+        current = os.lstat(self.path)
+        self.assertNotEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+        client = _ClientSession(self.path)
+        self.addCleanup(client.close)
+        self.assertTrue(client.request({"id": 1, "cmd": "ping"})["ok"])
+
+    def test_stop_preserves_a_replacement_socket(self):
+        port = DebugPort(self.path, _echo_dispatcher)
+        port.start()
+        os.unlink(self.path)
+        replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(replacement.close)
+        replacement.bind(self.path)
+        replacement.listen(1)
+        replacement_identity = os.lstat(self.path)
+
+        port.stop()
+
+        self.assertTrue(os.path.lexists(self.path), "stop() removed a socket it did not create")
+        current = os.lstat(self.path)
+        self.assertEqual(
+            (current.st_dev, current.st_ino),
+            (replacement_identity.st_dev, replacement_identity.st_ino),
+        )
+
+
 class ValidateCommandTest(unittest.TestCase):
     """GTK-free coverage of every command's payload validation — see the
     table in airloom/debugport.py. app.py's dispatcher trusts these results
@@ -200,6 +269,16 @@ class ValidateCommandTest(unittest.TestCase):
         normalized, error = validate_command({"id": 1})
         self.assertIsNone(normalized)
         self.assertIn("unknown cmd", error)
+
+    def test_non_string_cmd_is_an_error_not_an_exception(self):
+        for cmd in (None, 17, ["ping"], {"name": "ping"}):
+            with self.subTest(cmd=cmd):
+                try:
+                    normalized, error = validate_command({"id": 1, "cmd": cmd})
+                except TypeError as exc:
+                    self.fail(f"non-string cmd raised TypeError instead of returning an error: {exc}")
+                self.assertIsNone(normalized)
+                self.assertIn("unknown cmd", error)
 
     def test_eval_and_pinch_are_not_in_the_table(self):
         # app.py routes these to their own (pre-existing) validation before
