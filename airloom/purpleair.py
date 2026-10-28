@@ -42,6 +42,7 @@ DATA_FIELDS = (
 TREND_FETCH_FIELDS = (
     "sensor_index",
     "humidity",
+    "location_type",
     "pm2.5_cf_1",
     "pm2.5_10minute",
     "pm2.5_30minute",
@@ -101,7 +102,7 @@ class PurpleAirClient:
         if not self.api_key:
             raise PurpleAirError("A PurpleAir read key is required for live data.")
         if show_only:
-            show_only = [i for i in (_integer(value) for value in show_only) if i is not None]
+            show_only = [i for i in (_sensor_id(value) for value in show_only) if i is not None]
         if bounds is None and not show_only:
             raise PurpleAirError("A sensor query needs bounds or sensor ids.")
         params: dict[str, str] = {"fields": ",".join(fields)}
@@ -163,8 +164,14 @@ def parse_rows(payload: dict) -> FetchResult:
 def sensor_from_values(values: dict) -> Sensor | None:
     lat = _number(values.get("latitude"))
     lon = _number(values.get("longitude"))
-    sensor_id = _integer(values.get("sensor_index"))
-    if lat is None or lon is None or sensor_id is None:
+    sensor_id = _sensor_id(values.get("sensor_index"))
+    if (
+        lat is None
+        or lon is None
+        or sensor_id is None
+        or not -90.0 <= lat <= 90.0
+        or not -180.0 <= lon <= 180.0
+    ):
         return None
     humidity = _number(values.get("humidity"))
     corrected_pm = epa_corrected_pm25(_number(values.get("pm2.5_cf_1")), humidity)
@@ -191,10 +198,18 @@ def sensor_from_values(values: dict) -> Sensor | None:
 
 
 def trend_from_values(values: dict) -> list[dict]:
+    """Correct historical averages using the sensor's reported basis.
+
+    PurpleAir's simple running averages are ATM outdoors and CF1 indoors
+    (API discussion posts 17–19). Applying the current humidity to historical
+    averages is an approximation because historical humidity is unavailable.
+    """
     humidity = _number(values.get("humidity"))
+    average_basis = "CF1" if _integer(values.get("location_type")) == 1 else "ATM"
     trend = []
     for label, key in TREND_FIELDS:
-        point_pm = epa_corrected_pm25(_number(values.get(key)), humidity)
+        basis = "CF1" if label == "Now" else average_basis
+        point_pm = epa_corrected_pm25(_number(values.get(key)), humidity, basis=basis)
         trend.append({"label": label, "aqi": aqi_from_pm25(point_pm)})
     return trend
 
@@ -227,9 +242,17 @@ def _integer(value) -> int | None:
     if value is None:
         return None
     try:
-        return int(float(value))
+        parsed = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
+    if not math.isfinite(parsed) or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _sensor_id(value) -> int | None:
+    sensor_id = _integer(value)
+    return sensor_id if sensor_id is not None and sensor_id > 0 else None
 
 
 def _rounded(value: float | None) -> float | None:
