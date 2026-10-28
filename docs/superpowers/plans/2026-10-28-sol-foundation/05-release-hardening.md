@@ -24,11 +24,11 @@ Regular-file socket paths, live sockets, unrelated running apps, custom DESTDIR/
 
 **Files:** Modify `airloom/debugport.py`, `tests/test_debugport.py`, `scripts/debug-run`, `scripts/test-heatmap`, `scripts/test-save-refresh`; add focused script tests under `tests/`.
 
-- [ ] Add failing tests for regular-file preservation, live-socket refusal, stale-only replacement, inode-safe stop, non-string cmd errors, sentinel unrelated process/config/cache survival, and private XDG_CACHE_HOME.
-- [ ] Run focused Python/shell tests; reproduce destructive behavior in disposable fixtures only.
-- [ ] Implement socket lstat/type/live/stale/inode handling and direct non-unique child launch with isolated config/cache and child-only cleanup. Controller owns app-side stop wiring.
-- [ ] Re-run focused tests; expect PASS and sentinels unchanged.
-- [ ] Commit `fix: isolate debug endpoints and GUI regression tests`.
+- [x] Add failing tests for regular-file preservation, live-socket refusal, stale-only replacement, inode-safe stop, non-string cmd errors, sentinel unrelated process/config/cache survival, and private XDG_CACHE_HOME.
+- [x] Run focused Python/shell tests; reproduce destructive behavior in disposable fixtures only.
+- [x] Implement socket lstat/type/live/stale/inode handling and direct non-unique child launch with isolated config/cache and child-only cleanup. Controller owns app-side stop wiring.
+- [x] Re-run focused tests; expect PASS and sentinels unchanged.
+- [x] Commit `fix: isolate debug endpoints and GUI regression tests`.
 
 ### Task 2: Installation and documentation correctness
 
