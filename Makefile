@@ -14,8 +14,7 @@ check: test check-js
 	$(PYTHON) -m compileall -q airloom
 
 check-js:
-	node --check airloom/resources/app.js
-	node --check airloom/resources/core.js
+	for file in airloom/resources/*.js; do node --check "$$file" || exit; done
 	node --test tests/js/*.test.js
 
 flatpak:
