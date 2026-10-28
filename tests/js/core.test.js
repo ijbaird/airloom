@@ -477,6 +477,48 @@ test("dragging preserves an unwrapped center while view payloads use crossing bo
   assert.equal(AirloomCore.splitBounds(message).length, 2);
 });
 
+test("a full-world viewport emits full-world bounds and includes visible summaries", () => {
+  const app = loadApp();
+  app.elements.get("map-panel").clientWidth = 2048;
+  configureMap(app, 0);
+  app.context.Airloom.debugZoomTo(3);
+  app.context.Airloom.receive("sensors", {
+    items: [fixtureSensor(1, 0, 42)],
+    selected_id: 1,
+    source: "PurpleAir live",
+  });
+  app.runTimers();
+
+  assert.equal(app.elements.get("summary-aqi").textContent, "42");
+  const message = app.messages.filter((item) => item.action === "view-changed").at(-1);
+  assert.ok(message, "the full-world view should emit a view-changed payload");
+  assert.equal(message.west, -180);
+  assert.equal(message.east, 180);
+});
+
+test("a wider-than-world viewport keeps full-world bounds and summary coverage", () => {
+  const app = loadApp();
+  app.elements.get("map-panel").clientWidth = 4096;
+  configureMap(app, 0);
+  app.context.Airloom.debugZoomTo(3);
+  app.context.Airloom.receive("sensors", {
+    items: [
+      fixtureSensor(1, -170, 20),
+      fixtureSensor(2, 170, 40),
+    ],
+    selected_id: 1,
+    source: "PurpleAir live",
+  });
+  app.runTimers();
+
+  assert.equal(app.elements.get("summary-aqi").textContent, "40");
+  assert.equal(app.elements.get("summary-chip").title, "2 sensors reporting");
+  const message = app.messages.filter((item) => item.action === "view-changed").at(-1);
+  assert.ok(message, "the wider-than-world view should emit a view-changed payload");
+  assert.equal(message.west, -180);
+  assert.equal(message.east, 180);
+});
+
 test("fly-to uses the nearest unwrapped world across the antimeridian", () => {
   const app = loadApp();
   configureMap(app, 179.9);

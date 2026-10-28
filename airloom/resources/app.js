@@ -357,6 +357,7 @@
   function geographicBounds(view) {
     const nw = inverseWorld(view.left, view.top, state.zoom);
     const se = inverseWorld(view.left + view.width, view.top + view.height, state.zoom);
+    if (se.lon - nw.lon >= 360) return { north: nw.lat, west: -180, south: se.lat, east: 180 };
     return { north: nw.lat, west: wrapLon(nw.lon), south: se.lat, east: wrapLon(se.lon) };
   }
 
