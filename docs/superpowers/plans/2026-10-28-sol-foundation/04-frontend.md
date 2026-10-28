@@ -36,11 +36,11 @@ Wrapped sensor copies, interrupted animations, failed tiles, stale search contex
 
 **Interfaces:** `NavigationGate` tokens for `fly`, `zoom`, and `direct`; `begin(kind)`, `cancel(kind)`, `isCurrent(kind, token)`; reduced-motion query injectable.
 
-- [ ] Write failing state tests for drag/wheel/pinch canceling fly, fly superseding zoom, reduced-motion immediate completion, horizontal/zero wheel ignoring, and failed tile settlement not providing successful coverage.
-- [ ] Run `node --test tests/js/state.test.js`; expect missing export/current race failures.
-- [ ] Implement the gate and port animation/gesture/tile callbacks; distinguish successful `onload` from `onerror`, keep failed imagery hidden, and honor reduced motion.
-- [ ] Re-run Node tests/syntax; expect PASS.
-- [ ] Commit `fix: coordinate navigation and tile completion`.
+- [x] Write failing state tests for drag/wheel/pinch canceling fly, fly superseding zoom, reduced-motion immediate completion, horizontal/zero wheel ignoring, and failed tile settlement not providing successful coverage.
+- [x] Run `node --test tests/js/state.test.js`; expect missing export/current race failures.
+- [x] Implement the gate and port animation/gesture/tile callbacks; distinguish successful `onload` from `onerror`, keep failed imagery hidden, and honor reduced motion.
+- [x] Re-run Node tests/syntax; expect PASS.
+- [x] Commit `fix: coordinate navigation and tile completion`.
 
 ### Task 3: Stable controls and accessible layouts
 
