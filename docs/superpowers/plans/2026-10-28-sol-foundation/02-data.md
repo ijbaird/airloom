@@ -56,11 +56,11 @@ Huge finite values, malformed Unicode favorites, preexisting symlinks, locked he
 
 **Interfaces:** `SensorCache.close() -> None`, context manager, `CacheError(RuntimeError)` for non-corruption open failures.
 
-- [ ] Add failing tests for idempotent close, constructor failure cleanup, forced-gc ResourceWarnings, locked healthy DB inode/data preservation, and actual corruption-only recreation.
-- [ ] Run focused tests; reproduce deletion/warnings.
-- [ ] Restrict recovery to SQLITE_CORRUPT/SQLITE_NOTADB evidence, close failed connections, add lock-protected close/context management, and close every test fixture/reopen.
-- [ ] Run with `-W error::ResourceWarning`; expect PASS.
-- [ ] Commit `fix: make cache recovery and ownership safe`.
+- [x] Add failing tests for idempotent close, constructor failure cleanup, forced-gc ResourceWarnings, locked healthy DB inode/data preservation, and actual corruption-only recreation.
+- [x] Run focused tests; reproduce deletion/warnings.
+- [x] Restrict recovery to SQLITE_CORRUPT/SQLITE_NOTADB evidence, close failed connections, add lock-protected close/context management, and close every test fixture/reopen.
+- [x] Run with `-W error::ResourceWarning`; expect PASS.
+- [x] Commit `fix: make cache recovery and ownership safe`.
 
 ### Task 4: Transactional coverage and observation freshness
 
