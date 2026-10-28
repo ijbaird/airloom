@@ -34,11 +34,11 @@ Regular-file socket paths, live sockets, unrelated running apps, custom DESTDIR/
 
 **Files:** Modify `run-installed`, `Makefile`, `scripts/build-flatpak.sh`, `README.md`, `RELEASE.md`, `SECURITY.md`, `packaging/ai.stealthvision.Airloom.metainfo.xml`; add `tests/test_install.py` and release metadata checks.
 
-- [ ] Add failing staged-install tests for default, `/usr`, custom PREFIX/DESTDIR and outside-checkout resolution; dirty-version filename fixture; network/privacy documentation inventory; version-neutral install examples.
-- [ ] Run focused tests; confirm hardcoded `/usr/local` and dirty-version import.
-- [ ] Resolve prefix relative to installed launcher, read version from exported cwd, update privacy/AQI/alert/build docs, and add useful AppStream links (screenshots land in integration).
-- [ ] Run focused tests plus desktop/AppStream validation; expect PASS.
-- [ ] Commit `fix: make installation and operational documentation reliable`.
+- [x] Add failing staged-install tests for default, `/usr`, custom PREFIX/DESTDIR and outside-checkout resolution; dirty-version filename fixture; network/privacy documentation inventory; version-neutral install examples.
+- [x] Run focused tests; confirm hardcoded `/usr/local` and dirty-version import.
+- [x] Resolve prefix relative to installed launcher, read version from exported cwd, update privacy/AQI/alert/build docs, and add useful AppStream links (screenshots land in integration).
+- [x] Run focused tests plus desktop/AppStream validation; expect PASS.
+- [x] Commit `fix: make installation and operational documentation reliable`.
 
 ### Task 3: Complete CI and dependency automation
 
