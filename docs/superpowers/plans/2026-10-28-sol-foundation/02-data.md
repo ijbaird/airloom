@@ -44,11 +44,11 @@ Huge finite values, malformed Unicode favorites, preexisting symlinks, locked he
 - `interface_scale` defaults to `1.0`, accepts only `1.0`, `1.25`, or `1.5`, and appears in public config.
 - Existing favorite/hide methods become transactional on save failure.
 
-- [ ] Add failing file-based tests for NaN/Infinity/`"²"` favorites, permissive temp, temp symlink, overlapping saves, failed-save rollback, mode 0600, valid-entry survival, and interface-scale defaults/validation.
-- [ ] Run `python3 -m unittest tests.test_store -v`; reproduce startup exceptions and permission failures.
-- [ ] Implement shared validation, the three interface-scale values, `mkstemp` + 0600 + flush/fsync + atomic replace + cleanup, per-store save lock, deep-candidate apply, and rollback for mutators.
-- [ ] Re-run focused tests; expect PASS with no temp/symlink damage.
-- [ ] Commit `fix: make settings validation and saves transactional`.
+- [x] Add failing file-based tests for NaN/Infinity/`"²"` favorites, permissive temp, temp symlink, overlapping saves, failed-save rollback, mode 0600, valid-entry survival, and interface-scale defaults/validation.
+- [x] Run `python3 -m unittest tests.test_store -v`; reproduce startup exceptions and permission failures.
+- [x] Implement shared validation, the three interface-scale values, `mkstemp` + 0600 + flush/fsync + atomic replace + cleanup, per-store save lock, deep-candidate apply, and rollback for mutators.
+- [x] Re-run focused tests; expect PASS with no temp/symlink damage.
+- [x] Commit `fix: make settings validation and saves transactional`.
 
 ### Task 3: Safe SQLite ownership and recovery
 
