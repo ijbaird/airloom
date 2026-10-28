@@ -216,10 +216,30 @@ class FakeElement {
       this._markers.push(marker);
     }
   }
-  get innerHTML() { return this._innerHTML; }
+  get innerHTML() { return this._innerHTML || this.childNodes.map((child) => child.outerHTML).join(""); }
+  get outerHTML() {
+    const tag = this.tagName.toLowerCase();
+    const classes = this.className ? ` class="${this.className}"` : "";
+    const data = Object.entries(this.dataset).map(([name, value]) => ` data-${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}="${value}"`).join("");
+    return `<${tag}${classes}${data}>${this._innerHTML}</${tag}>`;
+  }
 
   get firstChild() { return this.childNodes[0] || null; }
+  get children() { return this.childNodes; }
   appendChild(child) { child.parentNode = this; this.childNodes.push(child); return child; }
+  insertBefore(child, reference) {
+    if (child.parentNode) {
+      const siblings = child.parentNode.childNodes;
+      const index = siblings.indexOf(child);
+      if (index >= 0) siblings.splice(index, 1);
+    }
+    child.parentNode = this;
+    child.isConnected = true;
+    const index = reference === null ? -1 : this.childNodes.indexOf(reference);
+    if (index < 0) this.childNodes.push(child);
+    else this.childNodes.splice(index, 0, child);
+    return child;
+  }
   remove() {
     this.isConnected = false;
     if (this.parentNode) {
@@ -243,14 +263,29 @@ class FakeElement {
     for (const listener of this.listeners.get(type) || []) listener(event);
   }
   click() { this.dispatch("click"); }
+  focus() {}
   setAttribute(name, value) { this[name] = String(value); }
   setPointerCapture() {}
   getBoundingClientRect() {
     return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight };
   }
   closest() { return null; }
-  querySelector() { return null; }
-  querySelectorAll(selector) { return selector === ".map-marker" ? this._markers : []; }
+  matches(selector) {
+    if (selector.startsWith(".")) return selector.slice(1).split(".").every((name) => this.classList.contains(name));
+    return this.tagName === selector.toUpperCase();
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  querySelectorAll(selector) {
+    const matches = [];
+    const visit = (node) => {
+      for (const child of node.childNodes) {
+        if (child.matches(selector)) matches.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return matches;
+  }
   getContext() {
     if (this.tagName !== "CANVAS") return null;
     return {
@@ -280,6 +315,7 @@ function loadApp({ preview = false } = {}) {
 
   const document = new FakeElement("document");
   document.body = new FakeElement("body");
+  document.documentElement = new FakeElement("html");
   document.querySelector = (selector) => selector.startsWith("#") ? elements.get(selector.slice(1)) || null : null;
   document.querySelectorAll = () => [];
   document.createElement = (tagName) => new FakeElement(tagName);

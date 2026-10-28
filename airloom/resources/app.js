@@ -9,7 +9,7 @@
     coverage: null,
     selectedId: null,
     previewHidden: [],
-    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", hidden: [] },
+    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", interface_scale: 1, hidden: [] },
     source: "Starting Airloom",
     center: { lat: 45.5152, lon: -122.6784 },
     home: { lat: 45.5152, lon: -122.6784 },
@@ -23,6 +23,8 @@
     // overrides the configured home name on the summary chip until replaced.
     viewName: null,
     popupId: null,
+    popupReturnFocus: null,
+    detailReturnFocus: null,
   };
 
   const bridge = (message) => {
@@ -103,6 +105,18 @@
     $("#place-name").textContent = state.viewName || state.config.location_name;
   }
 
+  function applyInterfaceScale() {
+    const requested = Number(state.config.interface_scale);
+    const scale = [1, 1.25, 1.5].includes(requested) ? requested : 1;
+    document.documentElement.style.setProperty("--interface-scale", String(scale));
+    document.documentElement.dataset.interfaceScale = String(scale);
+  }
+
+  function announce(message) {
+    const region = $("#ui-status");
+    if (region.textContent !== message) region.textContent = message;
+  }
+
   const FILTER_LABELS = { outdoor: "Outdoor", indoor: "Indoor", both: "All sensors" };
   const FILTER_NEXT = { outdoor: "indoor", indoor: "both", both: "outdoor" };
   function stampFilterChip() {
@@ -135,6 +149,7 @@
     }
     stampPlaceName();
     stampFilterChip();
+    applyInterfaceScale();
     renderMap();
   }
 
@@ -154,6 +169,7 @@
     state.source = payload.source || "Demo data";
     state.config = { ...state.config, ...(payload.config || {}) };
     stampPlaceName();
+    applyInterfaceScale();
     $("#data-source").textContent = state.source;
     renderAll();
     reconcilePopup();
@@ -175,7 +191,21 @@
     return hasLimitedCoverage() ? `${base} · Limited coverage` : base;
   }
 
+  function renderProvenance() {
+    const source = (state.source || "").toLowerCase();
+    let label = "";
+    if (source.includes("demo") || state.areaSensors.some((sensor) => sensor.origin === "demo")) label = "Demo data";
+    else if (source.includes("stale")) label = "Stale cached data";
+    else if (source.includes("cached") || state.areaSensors.some((sensor) => sensor.delivery === "cache")) label = "Cached data";
+    for (const id of ["summary-provenance", "detail-provenance"]) {
+      const element = $(`#${id}`);
+      element.hidden = !label;
+      element.textContent = label;
+    }
+  }
+
   function renderSummary(view = mapViewport()) {
+    renderProvenance();
     const limited = hasLimitedCoverage();
     $("#coverage-status").hidden = !limited;
     $("#coverage-status").textContent = limited ? "Limited coverage" : "";
@@ -222,69 +252,147 @@
     open ? showPopup(open) : hidePopup();
   }
 
+  function restoreRemovedFocus(metadata) {
+    if (!metadata) return;
+    if ((metadata.surface === "sensor-list" || metadata.surface === "favorites-list") && !$("#sensors-panel").hidden) {
+      const preferred = $(`#${metadata.surface}`).querySelector(".sensor-row");
+      const fallback = preferred || $("#sensor-list").querySelector(".sensor-row") || $("#favorites-list").querySelector(".sensor-row");
+      if (fallback) { fallback.focus(); return; }
+    }
+    $("#sensors-button").focus();
+  }
+
+  function restoreLogicalFocus(origin) {
+    if (origin?.surface === "search") { $("#search").focus(); return; }
+    if (origin && (origin.surface === "sensor-list" || origin.surface === "favorites-list" || origin.surface === "markers")) {
+      const panelHidden = origin.surface !== "markers" && $("#sensors-panel").hidden;
+      const container = $(`#${origin.surface}`);
+      const target = [...container.children].find((node) => node.dataset.id === String(origin.key));
+      if (!panelHidden && target) { target.focus(); return; }
+    }
+    $("#sensors-button").focus();
+  }
+
+  function renderKeyedCollection(container, items, emptyMarkup) {
+    const result = AirloomState.reconcileKeyed(container, items, (sensor) => sensor.id, createSensorRow, updateSensorRow);
+    if (!items.length) container.innerHTML = emptyMarkup;
+    restoreRemovedFocus(result.removedFocus);
+  }
+
   function renderLists() {
     const visible = visibleSensors();
     const separateFavorites = state.favoriteSensors !== null;
     const favorites = separateFavorites ? visibleSensors(state.favoriteSensors) : visible.filter((sensor) => sensor.favorite);
     const nearby = separateFavorites ? visibleSensors(state.areaSensors) : visible;
-    $("#sensor-count").textContent = visible.length;
+    $("#sensor-count").textContent = nearby.length;
     $("#favorite-count").textContent = favorites.length;
-    $("#favorites-list").innerHTML = favorites.length ? favorites.map(sensorRow).join("") : '<div class="empty-state small">Star a sensor to keep it close.</div>';
-    $("#sensor-list").innerHTML = nearby.length ? nearby.map(sensorRow).join("") : '<div class="empty-state">No sensors match that search.</div>';
-    document.querySelectorAll(".sensor-row").forEach((row) => row.addEventListener("click", () => selectSensor(Number(row.dataset.id), true)));
+    renderKeyedCollection($("#favorites-list"), favorites, '<div class="empty-state small">Star a sensor to keep it close.</div>');
+    renderKeyedCollection($("#sensor-list"), nearby, '<div class="empty-state">No sensors match that search.</div>');
   }
 
-  function sensorRow(sensor) {
-    const selected = sensor.id === state.selectedId ? " selected" : "";
+  function createSensorRow() {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.addEventListener("click", () => selectSensor(Number(row.dataset.id), true, { key: row.dataset.id, surface: row.parentNode.id }));
+    return row;
+  }
+
+  function updateSensorRow(row, sensor) {
+    row.className = `sensor-row${sensor.id === state.selectedId ? " selected" : ""}`;
+    row.dataset.id = String(sensor.id);
+    row.style.setProperty("--sensor", sensor.color || "");
+    row.style.setProperty("--sensor-fg", sensor.foreground || "");
+    row.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}${sensor.favorite ? ", favorite" : ""}`);
     const meta = [formatTemperature(sensor.temperature_f), formatHumidity(sensor.humidity)].filter(Boolean).join(" · ");
-    return `<button class="sensor-row${selected}" data-id="${sensor.id}" style="--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">
-      <span class="sensor-badge">${sensor.aqi ?? "—"}</span>
+    row.innerHTML = `<span class="sensor-badge">${sensor.aqi ?? "—"}</span>
       <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small></span>
-      ${sensor.favorite ? '<span class="row-star"><svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg></span>' : ""}
-    </button>`;
+      ${sensor.favorite ? '<span class="row-star"><svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg></span>' : ""}`;
   }
 
-  function selectSensor(id, revealDetail = false) {
+  function selectSensor(id, revealDetail = false, origin = null) {
     state.selectedId = id;
     bridge({ action: "select", id });
     renderLists();
     renderMapMarkers();
     renderDetail();
-    if (revealDetail) { hidePopup(); $("#detail-card").hidden = false; }
+    if (revealDetail) {
+      hidePopup(false);
+      state.detailReturnFocus = origin || { surface: "search" };
+      $("#detail-card").hidden = false;
+      $("#close-detail").focus();
+    }
+    const sensor = selectedSensor();
+    if (sensor) announce(`${sensor.name}. AQI ${sensor.aqi ?? "unavailable"}.`);
   }
 
   function selectedSensor() {
     return state.sensors.find((sensor) => sensor.id === state.selectedId);
   }
 
-  function showPopup(sensor) {
-    const point = sensorWorldPoint(sensor);
+  function positionPopup(sensor, view = mapViewport()) {
+    if (!view.width || !view.height) return;
     const popup = $("#map-popup");
-    popup.style.left = `${point.x}px`;
+    const point = sensorWorldPoint(sensor);
+    const margin = 12, gap = 30;
+    const width = popup.clientWidth || 232;
+    const height = popup.clientHeight || 140;
+    const screenX = point.x - view.left;
+    const screenY = point.y - view.top;
+    const halfWidth = width / 2;
+    const x = view.width <= width + margin * 2
+      ? view.width / 2
+      : Math.max(margin + halfWidth, Math.min(view.width - margin - halfWidth, screenX));
+    const aboveSpace = screenY - gap - margin;
+    const belowSpace = view.height - screenY - gap - margin;
+    const below = aboveSpace < height && belowSpace > aboveSpace;
+    popup.classList.toggle("below", below);
+    popup.dataset.placement = below ? "below" : "above";
+    popup.style.left = `${view.left + x}px`;
     popup.style.top = `${point.y}px`;
+  }
+
+  function showPopup(sensor, { origin = null, focus = false } = {}) {
+    const popup = $("#map-popup");
+    if (origin) state.popupReturnFocus = origin;
+    else if (state.popupId !== sensor.id) state.popupReturnFocus = { key: String(sensor.id), surface: "markers" };
     $("#popup-aqi").textContent = sensor.aqi ?? "—";
     $("#popup-aqi").style.background = sensor.color || "";
     $("#popup-aqi").style.color = sensor.foreground || "";
     $("#popup-name").textContent = sensor.name;
     $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
     $("#popup-favorite").classList.toggle("active", Boolean(sensor.favorite));
-    const demo = (state.source || "").includes("Demo");
+    $("#popup-favorite").setAttribute("aria-pressed", String(Boolean(sensor.favorite)));
+    const demo = (state.source || "").toLowerCase().includes("demo") || sensor.origin === "demo";
     const link = $("#popup-purpleair");
     link.hidden = demo; // demo sensor ids do not exist on the public map
     if (!demo) link.href = `https://map.purpleair.com/1/mAQI/a10/p604800/cC0?select=${sensor.id}#14/${sensor.latitude}/${sensor.longitude}`;
     popup.hidden = false;
     state.popupId = sensor.id;
+    positionPopup(sensor);
+    if (focus) $("#popup-details").focus();
   }
 
-  function hidePopup() {
-    $("#map-popup").hidden = true;
+  function hidePopup(restoreFocus) {
+    const popup = $("#map-popup");
+    const shouldRestore = restoreFocus ?? (state.popupId !== null && popup.contains(document.activeElement));
+    const origin = state.popupReturnFocus;
+    popup.hidden = true;
     state.popupId = null;
+    state.popupReturnFocus = null;
+    if (shouldRestore && origin) restoreLogicalFocus(origin);
+  }
+
+  function hideDetail(restoreFocus = true) {
+    const origin = state.detailReturnFocus;
+    $("#detail-card").hidden = true;
+    state.detailReturnFocus = null;
+    if (restoreFocus && origin) restoreLogicalFocus(origin);
   }
 
   function renderDetail() {
     const sensor = selectedSensor();
     if (!sensor) {
-      $("#detail-card").hidden = true;
+      hideDetail();
       return;
     }
     $("#sensor-name").textContent = sensor.name;
@@ -299,6 +407,7 @@
     $("#guidance").textContent = sensor.guidance;
     $("#guidance-card").style.setProperty("--guidance-color", sensor.color);
     $("#favorite-button").classList.toggle("active", sensor.favorite);
+    $("#favorite-button").setAttribute("aria-pressed", String(Boolean(sensor.favorite)));
     $("#updated-time").textContent = relativeTime(sensor.last_seen);
     renderChart(sensor);
   }
@@ -622,12 +731,7 @@
     // reposition only matters for flyTo/pan frames while a popup stays open.
     if (state.popupId !== null) {
       const open = byId.get(state.popupId);
-      if (open) {
-        const point = sensorWorldPoint(open);
-        const popup = $("#map-popup");
-        popup.style.left = `${point.x}px`;
-        popup.style.top = `${point.y}px`;
-      }
+      if (open) positionPopup(open, view);
     }
   }
 
@@ -712,20 +816,52 @@
     requestAnimationFrame(step);
   }
 
+  function createMapMarker() {
+    const marker = document.createElement("button");
+    marker.type = "button";
+    marker.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = Number(marker.dataset.id);
+      selectSensor(id, false);
+      const sensor = state.sensors.find((item) => item.id === id);
+      if (sensor) showPopup(sensor, { origin: { key: marker.dataset.id, surface: "markers" }, focus: true });
+    });
+    return marker;
+  }
+
+  function updateMapMarker(marker, sensor) {
+    const point = sensorWorldPoint(sensor);
+    marker.className = `map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}`;
+    marker.dataset.id = String(sensor.id);
+    marker.title = `${sensor.name} · AQI ${sensor.aqi ?? "unavailable"}`;
+    marker.setAttribute("aria-label", marker.title);
+    marker.style.left = `${point.x}px`;
+    marker.style.top = `${point.y}px`;
+    marker.style.setProperty("--sensor", sensor.color || "");
+    marker.style.setProperty("--sensor-fg", sensor.foreground || "");
+    marker.textContent = sensor.aqi ?? "—";
+  }
+
   function renderMapMarkers() {
     const view = mapViewport();
     if (!view.width) return;
-    if (heatmapActive()) { $("#markers").innerHTML = ""; markerDriftX = markerDriftY = 0; renderHeatmap(view); return; }
+    const container = $("#markers");
+    if (heatmapActive()) {
+      const result = AirloomState.reconcileKeyed(container, [], (sensor) => sensor.id, createMapMarker, updateMapMarker);
+      restoreRemovedFocus(result.removedFocus);
+      markerDriftX = markerDriftY = 0;
+      renderHeatmap(view);
+      return;
+    }
     markerDriftX = markerDriftY = 0;
     const pad = MARKER_CULL_PAD;
-    const markers = visibleSensors().map((sensor) => {
+    const markers = visibleSensors().filter((sensor) => {
       const point = sensorWorldPoint(sensor);
-      if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
-          point.y < view.top - pad || point.y > view.top + view.height + pad) return "";
-      return `<button class="map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
+      return point.x >= view.left - pad && point.x <= view.left + view.width + pad &&
+        point.y >= view.top - pad && point.y <= view.top + view.height + pad;
     });
-    $("#markers").innerHTML = markers.join("");
-    $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), false); const sensor = state.sensors.find((s) => s.id === Number(marker.dataset.id)); if (sensor) showPopup(sensor); }));
+    const result = AirloomState.reconcileKeyed(container, markers, (sensor) => sensor.id, createMapMarker, updateMapMarker);
+    restoreRemovedFocus(result.removedFocus);
     layoutMarkers(view);
   }
 
@@ -884,7 +1020,7 @@
     box.hidden = false;
     state.placeResults = places;
     box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
-      if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true); }
+      if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true, { surface: "search" }); }
       else {
         const place = state.placeResults[Number(button.dataset.index)];
         if (place) {
@@ -945,10 +1081,14 @@
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
     if (event.key === "Escape" && !$("#settings-dialog").open) {
-      if (!$("#map-popup").hidden) hidePopup();
-      else if (!$("#search-results").hidden) $("#search-results").hidden = true;
-      else if (!$("#detail-card").hidden) $("#detail-card").hidden = true;
-      else $("#sensors-panel").hidden = true;
+      if (!$("#map-popup").hidden) hidePopup(true);
+      else if (!$("#search-results").hidden) { $("#search-results").hidden = true; $("#search").focus(); }
+      else if (!$("#detail-card").hidden) hideDetail();
+      else if (!$("#sensors-panel").hidden) {
+        $("#sensors-panel").hidden = true;
+        $("#sensors-button").setAttribute("aria-expanded", "false");
+        $("#sensors-button").focus();
+      }
     }
   });
   $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
@@ -956,15 +1096,24 @@
   $("#hide-button").addEventListener("click", () => {
     if (state.selectedId === null) return;
     const id = state.selectedId;
-    $("#detail-card").hidden = true; // deterministic close; the resend reselects another sensor
+    hideDetail(false); // deterministic close; the resend reselects another sensor
+    $("#sensors-button").focus();
     requestHide(id);
   });
-  $("#popup-details").addEventListener("click", () => { $("#detail-card").hidden = false; renderDetail(); hidePopup(); });
+  $("#popup-details").addEventListener("click", () => {
+    const origin = state.popupReturnFocus || (state.popupId !== null ? { key: String(state.popupId), surface: "markers" } : null);
+    hidePopup(false);
+    state.detailReturnFocus = origin;
+    $("#detail-card").hidden = false;
+    renderDetail();
+    $("#close-detail").focus();
+  });
   $("#popup-favorite").addEventListener("click", () => { if (state.popupId !== null) { if (window.webkit?.messageHandlers?.airloom) bridge({ action: "favorite", id: state.popupId }); else { const sensor = state.sensors.find((s) => s.id === state.popupId); if (sensor) { sensor.favorite = !sensor.favorite; renderAll(); showPopup(sensor); } } } });
   $("#popup-hide").addEventListener("click", () => {
     if (state.popupId === null) return;
     const id = state.popupId;
-    hidePopup();
+    hidePopup(false);
+    $("#sensors-button").focus();
     requestHide(id);
   });
   $("#unhide-all").addEventListener("click", () => {
@@ -975,9 +1124,18 @@
   $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) + 1, centerAnchor()); });
   $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) - 1, centerAnchor()); });
   $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); flyTo(state.home.lat, state.home.lon); });
-  $("#sensors-button").addEventListener("click", () => { $("#sensors-panel").hidden = !$("#sensors-panel").hidden; });
-  $("#close-sensors").addEventListener("click", () => { $("#sensors-panel").hidden = true; });
-  $("#close-detail").addEventListener("click", () => { $("#detail-card").hidden = true; });
+  $("#sensors-button").addEventListener("click", () => {
+    const open = $("#sensors-panel").hidden;
+    $("#sensors-panel").hidden = !open;
+    $("#sensors-button").setAttribute("aria-expanded", String(open));
+    (open ? $("#close-sensors") : $("#sensors-button")).focus();
+  });
+  $("#close-sensors").addEventListener("click", () => {
+    $("#sensors-panel").hidden = true;
+    $("#sensors-button").setAttribute("aria-expanded", "false");
+    $("#sensors-button").focus();
+  });
+  $("#close-detail").addEventListener("click", () => hideDetail());
   $("#legend-chip").addEventListener("click", () => {
     const legend = $("#legend");
     legend.hidden = !legend.hidden;

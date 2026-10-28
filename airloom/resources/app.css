@@ -10,8 +10,9 @@
   --accent: #16805c;
   --accent-soft: #dcefe5;
   --shadow: 0 18px 50px rgba(29, 42, 35, .14);
+  --interface-scale: 1;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
-  font-size: 14px;
+  font-size: calc(14px * var(--interface-scale));
 }
 
 * { box-sizing: border-box; }
@@ -21,6 +22,8 @@ button { color: inherit; }
 svg { width: 20px; height: 20px; fill: currentColor; }
 h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
 .eyebrow { margin: 0 0 5px; color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .16em; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 
 .map-shell { position: fixed; inset: 0; }
 .map-panel { position: absolute; inset: 0; overflow: hidden; background: #dfe7df; cursor: grab; user-select: none; touch-action: none; }
@@ -39,6 +42,8 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 
 .map-popup { position: absolute; z-index: 6; width: 232px; transform: translate(-50%, calc(-100% - 30px)); background: var(--panel-solid); border-radius: 13px; box-shadow: 0 8px 28px rgba(0,0,0,.3); padding: 11px 12px 9px; pointer-events: auto; }
 .map-popup::after { content: ""; position: absolute; left: 50%; bottom: -6px; width: 12px; height: 12px; transform: translateX(-50%) rotate(45deg); background: var(--panel-solid); box-shadow: 4px 4px 8px rgba(0,0,0,.08); }
+.map-popup.below { transform: translate(-50%, 30px); }
+.map-popup.below::after { top: -6px; bottom: auto; box-shadow: -4px -4px 8px rgba(0,0,0,.08); }
 .map-popup[hidden] { display: none; }
 .popup-head { display: flex; align-items: center; gap: 9px; }
 .popup-aqi { min-width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-weight: 800; font-size: 12px; background: var(--soft); }
@@ -53,8 +58,9 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .popup-action:hover { background: var(--accent-soft); }
 
 .overlay { position: absolute; z-index: 5; }
-.search-overlay { top: 14px; left: 14px; width: min(340px, calc(100vw - 28px)); }
+.search-overlay { z-index: 12; top: 14px; left: 14px; width: min(340px, calc(100vw - 28px)); }
 .search-pill { display: flex; align-items: center; gap: 8px; background: var(--panel-solid); border-radius: 22px; padding: 9px 14px; box-shadow: 0 2px 10px rgba(0,0,0,.18); }
+.search-pill:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; }
 .search-pill svg { width: 17px; color: var(--muted); }
 .search-pill input { border: 0; background: none; outline: none; flex: 1; font: inherit; color: var(--ink); }
 .search-pill kbd { color: var(--muted); font: 10px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 5px; padding: 2px 5px; white-space: nowrap; }
@@ -69,7 +75,9 @@ h2, .section-heading h3 { margin: 0; font-size: 12px; font-weight: 800; text-tra
 .summary-copy strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .summary-copy small { color: var(--muted); font-size: 11px; line-height: 1.3; }
 .summary-copy .coverage-status { font-weight: 700; }
-.summary-copy .coverage-status[hidden] { display: none; }
+.provenance-status { color: var(--muted); font-size: 10px; font-weight: 750; }
+.summary-copy .provenance-status { color: var(--muted); }
+.provenance-status[hidden], .summary-copy .coverage-status[hidden] { display: none; }
 .pulse { display: none; width: 8px; height: 8px; margin-left: auto; border-radius: 99px; background: var(--accent); animation: pulse 1.2s ease-out infinite; }
 .loading .pulse { display: block; }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(22,128,92,.45); } 100% { box-shadow: 0 0 0 9px rgba(22,128,92,0); } }
@@ -193,6 +201,8 @@ fieldset label { display: flex; align-items: center; gap: 5px; font-size: 11px; 
 .dialog-actions .primary { background: var(--accent); color: white; }
 
 @media (max-width: 640px) {
+  .search-overlay { top: 10px; left: 10px; width: calc(100vw - 20px); }
+  .summary-chip { top: 64px; left: 10px; right: auto; max-width: calc(100vw - 20px); }
   .sensors-panel, .detail-card { left: 0; right: 0; top: auto; bottom: 0; width: auto; max-height: 70vh; border-radius: 14px 14px 0 0; }
 }
 
