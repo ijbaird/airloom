@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 
 from . import __version__
 from .aqi import aqi_from_pm25, epa_corrected_pm25
+from .geography import Bounds, bounds_around, bounds_contains
 from .models import Sensor
 
 
@@ -58,37 +59,6 @@ TREND_FIELDS = (
     ("10m", "pm2.5_10minute"),
     ("Now", "pm2.5_cf_1"),
 )
-
-
-@dataclass(frozen=True, slots=True)
-class Bounds:
-    north: float
-    west: float
-    south: float
-    east: float
-
-
-def bounds_around(latitude: float, longitude: float, radius_km: float) -> Bounds:
-    radius = max(2.0, min(100.0, radius_km))
-    lat_delta = radius / 111.0
-    lon_scale = max(0.1, math.cos(math.radians(latitude)))
-    lon_delta = radius / (111.0 * lon_scale)
-    return Bounds(
-        min(90.0, latitude + lat_delta),
-        max(-180.0, longitude - lon_delta),
-        max(-90.0, latitude - lat_delta),
-        min(180.0, longitude + lon_delta),
-    )
-
-
-def bounds_contains(outer: Bounds, inner: Bounds) -> bool:
-    """True when `inner` lies entirely within `outer`."""
-    return (
-        inner.north <= outer.north
-        and inner.south >= outer.south
-        and inner.west >= outer.west
-        and inner.east <= outer.east
-    )
 
 
 MAX_FETCH_SPAN_KM = 200.0
