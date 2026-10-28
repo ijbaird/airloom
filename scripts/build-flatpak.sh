@@ -18,7 +18,7 @@ fi
 manifest="${export_dir}/packaging/ai.stealthvision.Airloom.yml"
 app_id="ai.stealthvision.Airloom"
 remote="${FLATPAK_REMOTE:-flathub}"
-version="$(PYTHONPATH="${export_dir}" python3 -c 'from airloom import __version__; print(__version__)')"
+version="$(cd "${export_dir}" && PYTHONPATH="${export_dir}" python3 -c 'from airloom import __version__; print(__version__)')"
 arch="$(flatpak --default-arch)"
 bundle="${dist_dir}/Airloom-${version}-${arch}.flatpak"
 
