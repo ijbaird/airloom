@@ -2,7 +2,7 @@ PREFIX ?= /usr/local
 DESTDIR ?=
 PYTHON ?= python3
 
-.PHONY: run test check flatpak install uninstall
+.PHONY: run test check check-js flatpak install uninstall
 
 run:
 	$(PYTHON) -m airloom
@@ -10,9 +10,13 @@ run:
 test:
 	$(PYTHON) -m unittest discover -s tests -v
 
-check: test
+check: test check-js
 	$(PYTHON) -m compileall -q airloom
+
+check-js:
 	node --check airloom/resources/app.js
+	node --check airloom/resources/core.js
+	node --test tests/js/*.test.js
 
 flatpak:
 	./scripts/build-flatpak.sh
