@@ -24,14 +24,33 @@ jobs:
           node-version: '22'
       - name: Install metadata validators
         run: sudo apt-get update && sudo apt-get install -y appstream desktop-file-utils
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-      - name: Check JavaScript
-        run: node --check airloom/resources/app.js
+      - name: Run repository checks
+        run: make check
       - name: Validate desktop metadata
         run: |
           desktop-file-validate packaging/ai.stealthvision.Airloom.desktop
           appstreamcli validate --no-net packaging/ai.stealthvision.Airloom.metainfo.xml
+
+  webkit-ui:
+    name: Headless WebKit UI
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install headless WebKit dependencies
+        run: dnf install -y python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth
+      - name: Run isolated WebKit UI regressions
+        shell: bash
+        env:
+          NO_AT_BRIDGE: "1"
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "${XDG_RUNTIME_DIR}"
+          for script in scripts/test-heatmap scripts/test-save-refresh; do
+            xvfb-run -a -s "-screen 0 1280x800x24" "${script}"
+          done
 
   flatpak:
     name: Flatpak (${{ matrix.arch }})
@@ -51,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build Flatpak bundle
-        uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
           bundle: Airloom-${{ matrix.arch }}.flatpak
           manifest-path: packaging/ai.stealthvision.Airloom.yml
@@ -186,4 +205,4 @@ jobs:
           path: _site
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
