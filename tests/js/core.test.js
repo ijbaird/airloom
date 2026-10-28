@@ -142,3 +142,459 @@ test("core exposes the same API as a direct-file browser global", () => {
   assert.equal(typeof context.AirloomCore.summarySensors, "function");
   assert.equal(context.AirloomCore.nearestLongitude(-179, 179), 181);
 });
+
+const path = require("node:path");
+const indexPath = require.resolve("../../airloom/resources/index.html");
+
+class FakeClassList {
+  constructor() { this.values = new Set(); }
+  add(...names) { for (const name of names) this.values.add(name); }
+  remove(...names) { for (const name of names) this.values.delete(name); }
+  contains(name) { return this.values.has(name); }
+  toggle(name, force) {
+    const enabled = force === undefined ? !this.values.has(name) : Boolean(force);
+    enabled ? this.values.add(name) : this.values.delete(name);
+    return enabled;
+  }
+}
+
+class FakeElement {
+  constructor(tagName = "div", id = "") {
+    this.tagName = tagName.toUpperCase();
+    this.id = id;
+    this.hidden = false;
+    this.open = false;
+    this.value = "";
+    this.checked = false;
+    this.clientWidth = 0;
+    this.clientHeight = 0;
+    this.dataset = {};
+    this.style = { setProperty: (name, value) => { this.style[name] = value; } };
+    this.classList = new FakeClassList();
+    this.listeners = new Map();
+    this.childNodes = [];
+    this.isConnected = true;
+    this.elements = {};
+    this._innerHTML = "";
+    this._markers = [];
+    this.lastImage = null;
+  }
+
+  set className(value) {
+    this._className = value;
+    this.classList = new FakeClassList();
+    for (const name of String(value).split(/\s+/).filter(Boolean)) this.classList.add(name);
+  }
+  get className() { return this._className || ""; }
+  set textContent(value) {
+    this._textContent = String(value);
+    if (value === "") this.childNodes = [];
+  }
+  get textContent() { return this._textContent || ""; }
+
+  set innerHTML(value) {
+    this._innerHTML = String(value);
+    this.childNodes = [];
+    this._markers = [];
+    if (this.id !== "markers") return;
+    for (const match of this._innerHTML.matchAll(/<button\b([^>]*)>/g)) {
+      const marker = new FakeElement("button");
+      for (const attribute of match[1].matchAll(/([:\w-]+)="([^"]*)"/g)) {
+        const [, name, value] = attribute;
+        if (name === "class") marker.className = value;
+        if (name === "style") {
+          for (const declaration of value.split(";")) {
+            const [property, setting] = declaration.split(":");
+            if (property && setting !== undefined) marker.style[property] = setting;
+          }
+        }
+        if (name.startsWith("data-")) {
+          const key = name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+          marker.dataset[key] = value;
+        }
+      }
+      this._markers.push(marker);
+    }
+  }
+  get innerHTML() { return this._innerHTML; }
+
+  get firstChild() { return this.childNodes[0] || null; }
+  appendChild(child) { child.parentNode = this; this.childNodes.push(child); return child; }
+  remove() {
+    this.isConnected = false;
+    if (this.parentNode) {
+      const index = this.parentNode.childNodes.indexOf(this);
+      if (index >= 0) this.parentNode.childNodes.splice(index, 1);
+    }
+  }
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  }
+  dispatch(type, properties = {}) {
+    const event = {
+      type,
+      target: properties.target || this,
+      currentTarget: this,
+      preventDefault() {},
+      stopPropagation() {},
+      ...properties,
+    };
+    for (const listener of this.listeners.get(type) || []) listener(event);
+  }
+  click() { this.dispatch("click"); }
+  setAttribute(name, value) { this[name] = String(value); }
+  setPointerCapture() {}
+  getBoundingClientRect() {
+    return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight };
+  }
+  closest() { return null; }
+  querySelector() { return null; }
+  querySelectorAll(selector) { return selector === ".map-marker" ? this._markers : []; }
+  getContext() {
+    if (this.tagName !== "CANVAS") return null;
+    return {
+      createImageData: (width, height) => ({
+        width,
+        height,
+        data: new Uint8ClampedArray(width * height * 4),
+      }),
+      putImageData: (image) => { this.lastImage = image; },
+      clearRect: () => { this.lastImage = null; },
+    };
+  }
+}
+
+function loadApp({ preview = false } = {}) {
+  const html = fs.readFileSync(indexPath, "utf8");
+  const elements = new Map();
+  for (const match of html.matchAll(/<([a-z][\w-]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)) {
+    const element = new FakeElement(match[1], match[2]);
+    element.hidden = /\shidden(?:\s|>)/.test(match[0]);
+    if (element.id === "map-panel") {
+      element.clientWidth = 512;
+      element.clientHeight = 512;
+    }
+    elements.set(element.id, element);
+  }
+
+  const document = new FakeElement("document");
+  document.body = new FakeElement("body");
+  document.querySelector = (selector) => selector.startsWith("#") ? elements.get(selector.slice(1)) || null : null;
+  document.querySelectorAll = () => [];
+  document.createElement = (tagName) => new FakeElement(tagName);
+  document.elementFromPoint = () => null;
+
+  const timers = new Map();
+  const animationFrames = new Map();
+  const messages = [];
+  let nextTimer = 1;
+  let nextAnimationFrame = 1;
+  const context = {
+    console,
+    document,
+    Uint8ClampedArray,
+    Math,
+    Number,
+    String,
+    Boolean,
+    Map,
+    Set,
+    Date,
+    JSON,
+    performance: { now: () => 0 },
+    requestAnimationFrame: (callback) => {
+      const id = nextAnimationFrame++;
+      animationFrames.set(id, callback);
+      return id;
+    },
+    cancelAnimationFrame: (id) => animationFrames.delete(id),
+    setTimeout: (callback) => {
+      const id = nextTimer++;
+      timers.set(id, callback);
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+    ResizeObserver: class { observe() {} },
+    Event: class {},
+    KeyboardEvent: class {},
+    PointerEvent: class {},
+    FormData: class {},
+    ...(preview ? {} : {
+      webkit: {
+        messageHandlers: {
+          airloom: { postMessage: (message) => messages.push(JSON.parse(message)) },
+        },
+      },
+    }),
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  for (const match of html.matchAll(/<script\s+src="([^"]+)"[^>]*><\/script>/g)) {
+    const scriptPath = path.resolve(path.dirname(indexPath), match[1]);
+    vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: path.basename(scriptPath) });
+  }
+
+  return {
+    context,
+    elements,
+    messages,
+    runTimers() {
+      const pending = [...timers.values()];
+      timers.clear();
+      for (const callback of pending) callback();
+    },
+    runAnimationFrames(now) {
+      const pending = [...animationFrames.values()];
+      animationFrames.clear();
+      for (const callback of pending) callback(now);
+    },
+  };
+}
+
+function fixtureSensor(id, longitude, aqi, extra = {}) {
+  return {
+    id,
+    name: `Sensor ${id}`,
+    latitude: 0,
+    longitude,
+    aqi,
+    pm25: null,
+    pm10: null,
+    temperature_f: null,
+    humidity: null,
+    last_seen: null,
+    favorite: false,
+    indoor: false,
+    origin: "live",
+    delivery: "network",
+    category: "Fixture",
+    color: "#7d8590",
+    foreground: "#ffffff",
+    guidance: "Fixture guidance",
+    trend: [],
+    ...extra,
+  };
+}
+
+function configureMap(app, longitude, extra = {}) {
+  app.context.Airloom.receive("config", {
+    latitude: 0,
+    longitude,
+    location_name: "Test area",
+    heatmap_threshold_km: 40,
+    ...extra,
+  });
+}
+
+function closeTo(actual, expected, epsilon = 0.000001) {
+  assert.ok(Math.abs(actual - expected) < epsilon, `${actual} was not close to ${expected}`);
+}
+
+test("markers and popups project sensors into the center's nearest world", () => {
+  const app = loadApp();
+  configureMap(app, 179.9, { heatmap_threshold_km: 1000 });
+  app.context.Airloom.debugZoomTo(8);
+  app.context.Airloom.receive("sensors", {
+    items: [fixtureSensor(1, -179.9, 151)],
+    selected_id: 1,
+    source: "PurpleAir live",
+  });
+
+  const marker = app.elements.get("markers").querySelectorAll(".map-marker")[0];
+  assert.ok(marker, "the sensor across the antimeridian should have a visible marker");
+  const expectedX = (180.1 + 180) / 360 * 256 * 2 ** 8;
+  closeTo(Number.parseFloat(marker.style.left), expectedX);
+  marker.dispatch("click");
+  closeTo(Number.parseFloat(app.elements.get("map-popup").style.left), expectedX);
+  assert.equal(app.elements.get("map-popup").hidden, false);
+});
+
+function heatColors(app, aqi, longitude) {
+  app.context.Airloom.receive("sensors", {
+    items: [fixtureSensor(1, longitude, aqi)],
+    selected_id: 1,
+    source: "PurpleAir live",
+  });
+  const image = app.elements.get("heatmap").lastImage;
+  assert.ok(image, `AQI ${aqi} should produce a heat image`);
+  const colors = new Set();
+  for (let offset = 0; offset < image.data.length; offset += 4) {
+    if (image.data[offset + 3]) colors.add(JSON.stringify([...image.data.slice(offset, offset + 3)]));
+  }
+  return colors;
+}
+
+test("heat-map points project into the center's nearest world", () => {
+  const app = loadApp();
+  configureMap(app, 179.9);
+  app.context.Airloom.debugZoomTo(8);
+  const colors = heatColors(app, 50, -179.9);
+  assert.ok(colors.has(JSON.stringify([53, 183, 121])), `nearest-world heat point was missing; got ${[...colors]}`);
+});
+
+test("heat-map colors use all six AQI bands at exact boundaries", () => {
+  const app = loadApp();
+  configureMap(app, 179.9);
+  app.context.Airloom.debugZoomTo(8);
+  const cases = [
+    [50, [53, 183, 121]],
+    [51, [246, 201, 69]],
+    [100, [246, 201, 69]],
+    [101, [243, 156, 61]],
+    [150, [243, 156, 61]],
+    [151, [230, 91, 101]],
+    [200, [230, 91, 101]],
+    [201, [155, 107, 195]],
+    [300, [155, 107, 195]],
+    [301, [126, 57, 77]],
+  ];
+  for (const [aqi, expected] of cases) {
+    const colors = heatColors(app, aqi, 179.9);
+    assert.ok(colors.has(JSON.stringify(expected)), `AQI ${aqi} did not produce ${expected}; got ${[...colors]}`);
+  }
+});
+
+test("dragging preserves an unwrapped center while view payloads use crossing bounds", () => {
+  const app = loadApp();
+  configureMap(app, 179.9);
+  app.context.Airloom.debugZoomTo(8);
+  const panel = app.elements.get("map-panel");
+  panel.dispatch("pointerdown", { clientX: 256, clientY: 256, pointerId: 1, buttons: 1 });
+  panel.dispatch("pointermove", { clientX: 0, clientY: 256, pointerId: 1, buttons: 1 });
+  panel.dispatch("pointerup", { clientX: 0, clientY: 256, pointerId: 1, buttons: 0 });
+  app.runTimers();
+
+  const center = app.context.Airloom.debugState().center;
+  closeTo(center.lon, 181.30625);
+  const message = app.messages.filter((item) => item.action === "view-changed").at(-1);
+  assert.ok(message, "the drag should emit a view-changed payload");
+  closeTo(message.west, 179.9);
+  closeTo(message.east, -177.2875);
+  closeTo(message.lon, -178.69375);
+  assert.ok(message.west > message.east, "crossing bounds must remain explicit");
+  assert.equal(AirloomCore.splitBounds(message).length, 2);
+});
+
+test("fly-to uses the nearest unwrapped world across the antimeridian", () => {
+  const app = loadApp();
+  configureMap(app, 179.9);
+  app.context.Airloom.receive("location", {
+    latitude: 0,
+    longitude: -179.9,
+    name: "Across the antimeridian",
+    source: "fixed",
+  });
+  app.runAnimationFrames(600);
+  closeTo(app.context.Airloom.debugState().center.lon, 180.1);
+});
+
+test("area medians update as the viewport moves", () => {
+  const app = loadApp();
+  configureMap(app, 0);
+  app.context.Airloom.debugZoomTo(8);
+  app.context.Airloom.receive("sensors", {
+    items: [
+      fixtureSensor(1, -1, 10),
+      fixtureSensor(2, 0.5, 20),
+      fixtureSensor(3, 1, 30),
+    ],
+    selected_id: 1,
+    source: "PurpleAir live",
+  });
+  assert.equal(app.elements.get("summary-aqi").textContent, "20");
+
+  const panel = app.elements.get("map-panel");
+  panel.dispatch("pointerdown", { clientX: 256, clientY: 256, pointerId: 1, buttons: 1 });
+  panel.dispatch("pointermove", { clientX: 0, clientY: 256, pointerId: 1, buttons: 1 });
+  panel.dispatch("pointerup", { clientX: 0, clientY: 256, pointerId: 1, buttons: 0 });
+  assert.equal(app.elements.get("summary-aqi").textContent, "30");
+});
+
+test("legacy summary items exclude out-of-viewport and remote-favorite readings", () => {
+  const app = loadApp();
+  configureMap(app, 0);
+  app.context.Airloom.debugZoomTo(8);
+  app.context.Airloom.receive("sensors", {
+    items: [
+      fixtureSensor(1, -1, 10),
+      fixtureSensor(2, 1, 30),
+      fixtureSensor(3, 100, 200),
+      fixtureSensor(4, 0.5, 1, { favorite: true, remote_favorite: true }),
+    ],
+    selected_id: 1,
+    source: "PurpleAir live",
+  });
+
+  assert.equal(app.elements.get("summary-aqi").textContent, "30");
+  assert.equal(app.elements.get("summary-chip").title, "2 sensors reporting");
+});
+
+test("area medians use only viewport sensors, never distant favorite inputs", () => {
+  const app = loadApp();
+  configureMap(app, 0);
+  app.context.Airloom.debugZoomTo(8);
+  app.context.Airloom.receive("sensors", {
+    area: [
+      fixtureSensor(1, -1, 10),
+      fixtureSensor(2, 1, 30),
+      fixtureSensor(3, 100, 200),
+    ],
+    favorites: [
+      fixtureSensor(4, 170, 250, { favorite: true, remote_favorite: true }),
+      fixtureSensor(5, 0.5, 1, { favorite: true, remote_favorite: true }),
+    ],
+    selected_id: 1,
+    source: "PurpleAir live",
+  });
+
+  assert.equal(app.elements.get("summary-aqi").textContent, "30");
+  assert.equal(app.elements.get("summary-chip").title, "2 sensors reporting");
+  assert.equal(app.elements.get("favorite-count").textContent, "2");
+  assert.match(app.elements.get("favorites-list").innerHTML, /data-id="4"/);
+  assert.match(app.elements.get("favorites-list").innerHTML, /data-id="5"/);
+  assert.doesNotMatch(app.elements.get("sensor-list").innerHTML, /data-id="[45]"/);
+});
+
+test("capped coverage is visible near the summary and clears for complete coverage", () => {
+  const app = loadApp();
+  configureMap(app, 0);
+  const payload = {
+    items: [fixtureSensor(1, 0, 20)],
+    selected_id: 1,
+    source: "PurpleAir live",
+  };
+  app.context.Airloom.receive("sensors", { ...payload, coverage: { capped: true, complete: false } });
+  const status = app.elements.get("coverage-status");
+  assert.ok(status, "the summary should include a coverage status element");
+  assert.equal(status.hidden, false);
+  assert.equal(status.textContent, "Limited coverage");
+  assert.match(app.elements.get("summary-chip").title, /limited coverage/i);
+
+  app.context.Airloom.receive("sensors", { ...payload, coverage: { capped: false, complete: true } });
+  assert.equal(status.hidden, true);
+});
+
+test("direct-file preview still loads demo data without a bridge", () => {
+  const app = loadApp({ preview: true });
+  app.context.Airloom.debugZoomTo(8);
+  app.runTimers();
+  assert.equal(app.elements.get("sensor-count").textContent, "8");
+  assert.equal(app.elements.get("data-source").textContent, "Browser preview · Demo data");
+  assert.notEqual(app.elements.get("summary-aqi").textContent, "—");
+});
+
+test("the direct-file legend renders all six exact AQI ranges", () => {
+  const html = fs.readFileSync(indexPath, "utf8");
+  const rows = [...html.matchAll(/<div><i style="--c:(#[0-9a-f]+)"><\/i><span>([^<]+)<\/span><b>([^<]+)<\/b><\/div>/g)]
+    .map((match) => match.slice(1));
+  assert.deepEqual(rows, [
+    ["#35b779", "Good", "0–50"],
+    ["#f6c945", "Moderate", "51–100"],
+    ["#f39c3d", "Sensitive", "101–150"],
+    ["#e65b65", "Unhealthy", "151–200"],
+    ["#9b6bc3", "Very unhealthy", "201–300"],
+    ["#7e394d", "Hazardous", "301–500"],
+  ]);
+});

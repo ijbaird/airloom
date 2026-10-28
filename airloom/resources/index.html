@@ -49,6 +49,7 @@
         <span class="summary-copy">
           <strong id="place-name">Locating…</strong>
           <small id="summary-label">Loading readings</small>
+          <small class="coverage-status" id="coverage-status" hidden>Limited coverage</small>
         </span>
         <span class="pulse" id="loading-pulse"></span>
       </button>
@@ -62,7 +63,9 @@
         <div><i style="--c:#35b779"></i><span>Good</span><b>0–50</b></div>
         <div><i style="--c:#f6c945"></i><span>Moderate</span><b>51–100</b></div>
         <div><i style="--c:#f39c3d"></i><span>Sensitive</span><b>101–150</b></div>
-        <div><i style="--c:#e65b65"></i><span>Unhealthy</span><b>151+</b></div>
+        <div><i style="--c:#e65b65"></i><span>Unhealthy</span><b>151–200</b></div>
+        <div><i style="--c:#9b6bc3"></i><span>Very unhealthy</span><b>201–300</b></div>
+        <div><i style="--c:#7e394d"></i><span>Hazardous</span><b>301–500</b></div>
       </div>
 
       <div class="overlay map-controls">
@@ -160,6 +163,7 @@
         <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
       </form>
     </dialog>
+    <script src="core.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

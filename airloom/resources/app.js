@@ -4,6 +4,9 @@
   const $ = (selector) => document.querySelector(selector);
   const state = {
     sensors: [],
+    areaSensors: [],
+    favoriteSensors: null,
+    coverage: null,
     selectedId: null,
     previewHidden: [],
     config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", hidden: [] },
@@ -136,7 +139,17 @@
   }
 
   function applySensors(payload) {
-    state.sensors = payload.items || [];
+    const area = Array.isArray(payload.area) ? payload.area : (payload.items || []);
+    const favorites = Array.isArray(payload.favorites) ? payload.favorites : [];
+    const merged = new Map(area.map((sensor) => [sensor.id, sensor]));
+    for (const favorite of favorites) {
+      const local = merged.get(favorite.id);
+      merged.set(favorite.id, local ? { ...local, favorite: local.favorite || favorite.favorite } : { ...favorite, remote_favorite: true });
+    }
+    state.sensors = [...merged.values()];
+    state.areaSensors = Array.isArray(payload.area) ? area : state.sensors;
+    state.favoriteSensors = Array.isArray(payload.favorites) ? favorites : null;
+    state.coverage = payload.coverage || null;
     state.selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
     state.source = payload.source || "Demo data";
     state.config = { ...state.config, ...(payload.config || {}) };
@@ -154,22 +167,34 @@
     renderDetail();
   }
 
-  function renderSummary() {
-    const valid = locationFiltered(state.sensors).filter((s) => Number.isFinite(s.aqi)).sort((a, b) => a.aqi - b.aqi);
+  function hasLimitedCoverage() {
+    return state.coverage?.capped === true || state.coverage?.complete === false;
+  }
+
+  function summaryTitle(base) {
+    return hasLimitedCoverage() ? `${base} · Limited coverage` : base;
+  }
+
+  function renderSummary(view = mapViewport()) {
+    const limited = hasLimitedCoverage();
+    $("#coverage-status").hidden = !limited;
+    $("#coverage-status").textContent = limited ? "Limited coverage" : "";
+    const valid = view.width ? AirloomCore.summarySensors(locationFiltered(state.areaSensors), geographicBounds(view)) : [];
     const sensor = valid[Math.floor(valid.length / 2)];
     if (!sensor) {
       $("#summary-aqi").textContent = "—";
       $("#summary-aqi").style.background = "";
       $("#summary-aqi").style.color = "";
       $("#summary-label").textContent = "No readings";
-      $("#summary-chip").title = "No sensors reporting in range";
+      $("#summary-chip").title = summaryTitle("No sensors reporting in range");
       return;
     }
+    const band = AirloomCore.bandForAQI(sensor.aqi);
     $("#summary-aqi").textContent = sensor.aqi;
-    $("#summary-aqi").style.background = sensor.color;
-    $("#summary-aqi").style.color = sensor.foreground;
-    $("#summary-label").textContent = sensor.category;
-    $("#summary-chip").title = `${valid.length} sensors reporting`;
+    $("#summary-aqi").style.background = band.color;
+    $("#summary-aqi").style.color = band.foreground;
+    $("#summary-label").textContent = band.label;
+    $("#summary-chip").title = summaryTitle(`${valid.length} sensors reporting`);
   }
 
   // Preview mode filters sensors locally by indoor/outdoor; app mode leaves
@@ -183,10 +208,10 @@
     return sensors;
   }
 
-  function visibleSensors() {
-    const sensors = locationFiltered(state.sensors);
+  function visibleSensors(sensors = state.sensors) {
+    const eligible = locationFiltered(sensors);
     const query = state.query.trim().toLowerCase();
-    return query ? sensors.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : sensors;
+    return query ? eligible.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : eligible;
   }
 
   // A sensor filtered out by the location filter or search query must not
@@ -199,11 +224,13 @@
 
   function renderLists() {
     const visible = visibleSensors();
-    const favorites = visible.filter((sensor) => sensor.favorite);
+    const separateFavorites = state.favoriteSensors !== null;
+    const favorites = separateFavorites ? visibleSensors(state.favoriteSensors) : visible.filter((sensor) => sensor.favorite);
+    const nearby = separateFavorites ? visibleSensors(state.areaSensors) : visible;
     $("#sensor-count").textContent = visible.length;
     $("#favorite-count").textContent = favorites.length;
     $("#favorites-list").innerHTML = favorites.length ? favorites.map(sensorRow).join("") : '<div class="empty-state small">Star a sensor to keep it close.</div>';
-    $("#sensor-list").innerHTML = visible.length ? visible.map(sensorRow).join("") : '<div class="empty-state">No sensors match that search.</div>';
+    $("#sensor-list").innerHTML = nearby.length ? nearby.map(sensorRow).join("") : '<div class="empty-state">No sensors match that search.</div>';
     document.querySelectorAll(".sensor-row").forEach((row) => row.addEventListener("click", () => selectSensor(Number(row.dataset.id), true)));
   }
 
@@ -231,7 +258,7 @@
   }
 
   function showPopup(sensor) {
-    const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+    const point = sensorWorldPoint(sensor);
     const popup = $("#map-popup");
     popup.style.left = `${point.x}px`;
     popup.style.top = `${point.y}px`;
@@ -311,15 +338,26 @@
   function worldPoint(lat, lon, zoom) {
     const size = 256 * 2 ** zoom;
     const sin = Math.sin(clampLat(lat) * Math.PI / 180);
-    return { x: (wrapLon(lon) + 180) / 360 * size, y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size };
+    return { x: (lon + 180) / 360 * size, y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size };
+  }
+
+  function sensorWorldPoint(sensor) {
+    const longitude = AirloomCore.nearestLongitude(sensor.longitude, state.center.lon);
+    return worldPoint(sensor.latitude, longitude, state.zoom);
   }
 
   function inverseWorld(x, y, zoom) {
     const size = 256 * 2 ** zoom;
-    const lon = wrapLon(x / size * 360 - 180);
+    const lon = x / size * 360 - 180;
     const n = Math.PI - 2 * Math.PI * y / size;
     const lat = clampLat(180 / Math.PI * Math.atan(Math.sinh(n)));
     return { lat, lon };
+  }
+
+  function geographicBounds(view) {
+    const nw = inverseWorld(view.left, view.top, state.zoom);
+    const se = inverseWorld(view.left + view.width, view.top + view.height, state.zoom);
+    return { north: nw.lat, west: wrapLon(nw.lon), south: se.lat, east: wrapLon(se.lon) };
   }
 
   // --- Heat map mode (spec: docs/superpowers/specs/2026-08-07-heatmap-mode-design.md) ---
@@ -340,13 +378,11 @@
     return viewportWidthKm() > Number(state.config.heatmap_threshold_km || 40);
   }
 
-  // Same buckets as the legend and demo.py; interpolated AQI values take the
-  // color of the bucket they land in, so every on-screen color is in the legend.
+  // Interpolated AQI values take the color of their shared core band, so
+  // every on-screen color has a matching legend entry.
   function aqiBucketColor(aqi) {
-    if (aqi <= 50) return [53, 183, 121];   // #35b779 Good
-    if (aqi <= 100) return [246, 201, 69];  // #f6c945 Moderate
-    if (aqi <= 150) return [243, 156, 61];  // #f39c3d Sensitive
-    return [230, 91, 101];                  // #e65b65 Unhealthy
+    const color = AirloomCore.bandForAQI(aqi).color;
+    return [1, 3, 5].map((offset) => Number.parseInt(color.slice(offset, offset + 2), 16));
   }
 
   // Re-render markers exactly once per threshold crossing; a marker popup
@@ -378,7 +414,7 @@
     const points = [];
     for (const sensor of visibleSensors()) {
       if (!Number.isFinite(sensor.aqi)) continue;
-      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+      const point = sensorWorldPoint(sensor);
       const x = point.x - view.left, y = point.y - view.top;
       if (x < -pad || x > view.width + pad || y < -pad || y > view.height + pad) continue;
       points.push({ x, y, aqi: sensor.aqi });
@@ -490,6 +526,7 @@
   function renderFrame() {
     const view = mapViewport();
     if (!view.width || !view.height) return;
+    renderSummary(view);
     const tz = tileZoomLevel();
     if (tileLayer.zoom !== tz) {
       if (tileLayer.zoom !== null) retireTiles();
@@ -560,7 +597,7 @@
     markers.querySelectorAll(".map-marker").forEach((element) => {
       const sensor = byId.get(Number(element.dataset.id));
       if (!sensor) return;
-      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+      const point = sensorWorldPoint(sensor);
       element.style.left = `${point.x}px`;
       element.style.top = `${point.y}px`;
     });
@@ -569,7 +606,7 @@
     if (state.popupId !== null) {
       const open = byId.get(state.popupId);
       if (open) {
-        const point = worldPoint(open.latitude, open.longitude, state.zoom);
+        const point = sensorWorldPoint(open);
         const popup = $("#map-popup");
         popup.style.left = `${point.x}px`;
         popup.style.top = `${point.y}px`;
@@ -643,7 +680,7 @@
     markerDriftX = markerDriftY = 0;
     const pad = MARKER_CULL_PAD;
     const markers = visibleSensors().map((sensor) => {
-      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+      const point = sensorWorldPoint(sensor);
       if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
           point.y < view.top - pad || point.y > view.top + view.height + pad) return "";
       return `<button class="map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
@@ -661,21 +698,26 @@
   function sendViewChanged() {
     const view = mapViewport();
     if (!view.width) return;
-    const nw = inverseWorld(view.left, view.top, state.zoom);
-    const se = inverseWorld(view.left + view.width, view.top + view.height, state.zoom);
-    bridge({ action: "view-changed", north: nw.lat, west: nw.lon, south: se.lat, east: se.lon, lat: state.center.lat, lon: state.center.lon, zoom: state.zoom });
+    bridge({
+      action: "view-changed",
+      ...geographicBounds(view),
+      lat: state.center.lat,
+      lon: wrapLon(state.center.lon),
+      zoom: state.zoom,
+    });
   }
 
   let flyGeneration = 0;
   function flyTo(lat, lon, durationMs = 600) {
     const from = { ...state.center };
+    const targetLon = AirloomCore.nearestLongitude(lon, from.lon);
     const start = performance.now();
     const gen = ++flyGeneration;
     function step(now) {
       if (gen !== flyGeneration) return;
       const t = Math.min(1, (now - start) / durationMs);
       const ease = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
-      state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (lon - from.lon) * ease };
+      state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (targetLon - from.lon) * ease };
       renderFrame();
       if (t < 1) requestAnimationFrame(step);
       else { renderMapMarkers(); scheduleViewChanged(); }
@@ -833,11 +875,10 @@
   function browserPreviewData() {
     const readings = [18, 34, 47, 56, 72, 88, 109, 43, 63, 31, 81, 52];
     const names = ["Alberta Arts", "Laurelhurst Park", "Mount Tabor", "Sellwood Garden", "Buckman School", "Overlook Bluff", "St. Johns North", "Hawthorne Ridge", "Woodstock Library", "Council Crest", "Irvington Air", "Rose City Park"];
-    const colors = (aqi) => aqi <= 50 ? ["Good", "#35b779", "#08271b"] : aqi <= 100 ? ["Moderate", "#f6c945", "#332400"] : ["Unhealthy for sensitive groups", "#f39c3d", "#341900"];
     return readings.map((aqi, index) => {
-      const [category, color, foreground] = colors(aqi);
+      const band = AirloomCore.bandForAQI(aqi);
       const angle = index * 2.399963;
-      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category, color, foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, indoor: index % 5 === 2, guidance: aqi <= 50 ? "Air quality is satisfactory. It is a good time to be outside." : aqi <= 100 ? "Unusually sensitive people may want to reduce prolonged outdoor exertion." : "Sensitive groups should reduce prolonged or heavy outdoor exertion.", trend: ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) })) };
+      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category: band.label, color: band.color, foreground: band.foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, indoor: index % 5 === 2, guidance: band.guidance, trend: ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) })) };
     });
   }
 
