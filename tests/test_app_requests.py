@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import sys
+import threading
 import types
 import unittest
 from types import SimpleNamespace
@@ -27,6 +29,7 @@ except (ImportError, ValueError):
     sys.modules["gi.repository"] = repository
     from airloom import app as app_module
 
+from airloom import geocode as geocode_module
 from airloom.app import AirloomApplication
 from airloom.geocode import Place
 from airloom.models import Sensor
@@ -432,6 +435,68 @@ class PlaceSearchRequestTest(ApplicationRequestTestCase):
         search.assert_not_called()
         self.assertEqual(idles.callbacks, [])
         self.assertEqual(self.place_events(app), [])
+
+    def test_superseded_search_waiting_in_geocoder_queue_never_reaches_network(self):
+        app = self.make_app()
+        idles = IdleQueue()
+        client = geocode_module.Geocoder(clock=lambda: 100.0, sleep=lambda _seconds: None)
+        base_url = geocode_module._base_url()
+        old_waiting = threading.Event()
+        queue_lock = threading.Lock()
+        queue_lock.acquire()
+
+        class SignallingLock:
+            def __enter__(self):
+                old_waiting.set()
+                return queue_lock.__enter__()
+
+            def __exit__(self, *args):
+                return queue_lock.__exit__(*args)
+
+        client._search_lock = SignallingLock()
+        real_thread = threading.Thread
+        threads = []
+
+        def recording_thread(**kwargs):
+            thread = real_thread(**kwargs)
+            threads.append(thread)
+            return thread
+
+        requests = []
+
+        def empty_response(request, timeout=None):
+            requests.append(request.full_url)
+            return mock.MagicMock(
+                __enter__=lambda _response: io.StringIO("[]"),
+                __exit__=lambda _response, *_args: False,
+            )
+
+        with (
+            mock.patch.object(geocode_module, "_default_geocoder", client),
+            mock.patch.object(geocode_module, "_default_base_url", base_url),
+            mock.patch.object(app_module.threading, "Thread", new=recording_thread),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(
+                geocode_module.urllib.request, "urlopen", side_effect=empty_response
+            ),
+        ):
+            try:
+                app._on_place_search(
+                    {"request_id": 1, "context": "main", "query": "old"}
+                )
+                self.assertTrue(old_waiting.wait(2), "old search did not enter geocoder queue")
+                app._on_place_search(
+                    {"request_id": 2, "context": "main", "query": "new"}
+                )
+            finally:
+                if queue_lock.locked():
+                    queue_lock.release()
+                for thread in threads:
+                    thread.join(5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(requests), 1)
+        self.assertIn("q=new", requests[0])
 
     def test_obsolete_search_response_cannot_publish(self):
         app = self.make_app()

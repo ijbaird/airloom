@@ -33,6 +33,7 @@ gi.require_version("Notify", "0.7")
 from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 
 from . import __version__
+from . import geocode as geocode_module
 from .bridge import decode_message
 from .cache import CacheError, SensorCache, fetch_area, fetch_favorites
 from .controller import ApplicationController, RefreshRequest
@@ -74,6 +75,50 @@ DEBUG_BUILD_ID_TIMEOUT_SECONDS = 2
 APP_ID = "ai.stealthvision.Airloom"
 RESOURCE_DIR = Path(__file__).parent / "resources"
 LOCATOR_FOCUS_FALLBACK_SECONDS = 20
+
+
+class _PlaceSearchSuperseded(Exception):
+    """A geocoder admitted a request after its bridge intent was superseded."""
+
+
+_place_search_admission = threading.local()
+_place_search_install_lock = threading.Lock()
+
+
+def _check_place_search_admission() -> None:
+    is_current = getattr(_place_search_admission, "is_current", None)
+    if is_current is not None and not is_current():
+        raise _PlaceSearchSuperseded()
+
+
+def _install_place_search_admission() -> None:
+    """Add adapter-owned cancellation to the shared geocoder's I/O boundary.
+
+    The data-owned Geocoder deliberately has no bridge-request dependency. Its
+    public search flow nevertheless exposes two adapter admission points:
+    ``_request`` after its search-lock wait and ``_throttle`` after any sleep.
+    Wrapping those points preserves its cache, throttling, and transport code.
+    Unannotated users of the shared client, including reverse geocoding, retain
+    the original behavior.
+    """
+    client = geocode_module._default_client()
+    with _place_search_install_lock:
+        if getattr(client, "_airloom_place_search_admission", False):
+            return
+        original_request = client._request
+        original_throttle = client._throttle
+
+        def request(url, params, timeout):
+            _check_place_search_admission()
+            return original_request(url, params, timeout)
+
+        def throttle():
+            original_throttle()
+            _check_place_search_admission()
+
+        client._request = request
+        client._throttle = throttle
+        client._airloom_place_search_admission = True
 
 
 @dataclass(slots=True)
@@ -929,14 +974,21 @@ class AirloomApplication(Adw.Application):
             # A thread queued behind newer user intent must not reach the network.
             if not self.requests.is_current(token):
                 return
+            _install_place_search_admission()
+            _place_search_admission.is_current = lambda: self.requests.is_current(token)
             try:
-                payload["results"] = [
-                    {"name": place.name, "latitude": place.latitude, "longitude": place.longitude}
-                    for place in place_search(query)
-                ]
-            except GeocodeError:
-                payload["error"] = "Place lookup unavailable."
-            GLib.idle_add(self._send_places, payload, token)
+                try:
+                    payload["results"] = [
+                        {"name": place.name, "latitude": place.latitude, "longitude": place.longitude}
+                        for place in place_search(query)
+                    ]
+                except _PlaceSearchSuperseded:
+                    return
+                except GeocodeError:
+                    payload["error"] = "Place lookup unavailable."
+                GLib.idle_add(self._send_places, payload, token)
+            finally:
+                _place_search_admission.is_current = None
 
         threading.Thread(target=worker, name="airloom-geocode", daemon=True).start()
 
