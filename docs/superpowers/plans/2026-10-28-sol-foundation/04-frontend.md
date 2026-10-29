@@ -60,8 +60,8 @@ Wrapped sensor copies, interrupted animations, failed tiles, stale search contex
 
 **Interfaces:** Desktop/preview adapter methods `favorite`, `refresh`, `saveSettings`, `placeSearch`; remote place search only on submit and always carries `{request_id, context}`.
 
-- [ ] Write failing fake-timer/bridge tests proving typing sends zero remote requests, submit sends one, Preferences close cancels/invalidates home work, out-of-order responses cannot cross contexts, trends reach terminal states/retry, and preview favorite/refresh/settings are truthful.
-- [ ] Run focused Node tests; reproduce debounce/global-context/loading issues.
-- [ ] Implement explicit-submit remote search with local incremental sensor filter, request identities, trend status/retry UI, rolling-average comparison labels, and centralized desktop/preview adapters.
-- [ ] Run all JS tests and `make check`; expect PASS.
-- [ ] Commit `fix: make frontend asynchronous actions explicit and truthful`; request Sol frontend-workstream review and list live-WebKit scenarios for integration.
+- [x] Write failing fake-timer/bridge tests proving typing sends zero remote requests, submit sends one, Preferences close cancels/invalidates home work, out-of-order responses cannot cross contexts, trends reach terminal states/retry, and preview favorite/refresh/settings are truthful.
+- [x] Run focused Node tests; reproduce debounce/global-context/loading issues.
+- [x] Implement explicit-submit remote search with local incremental sensor filter, request identities, trend status/retry UI, rolling-average comparison labels, and centralized desktop/preview adapters.
+- [x] Run all JS tests and `make check`; expect PASS.
+- [x] Commit `fix: make frontend asynchronous actions explicit and truthful`; request Sol frontend-workstream review and list live-WebKit scenarios for integration.
