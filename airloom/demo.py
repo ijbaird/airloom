@@ -43,6 +43,9 @@ def demo_sensors(center_lat: float, center_lon: float) -> list[Sensor]:
         aqi = aqi_from_pm25(pm)
         trend = []
         for point, label in enumerate(("1w", "1d", "6h", "1h", "30m", "10m", "Now")):
+            if label == "Now":
+                trend.append({"label": label, "aqi": aqi})
+                continue
             shifted = max(1.0, pm + math.sin(index * 0.8 + point * 0.9) * 5.5)
             trend.append({"label": label, "aqi": aqi_from_pm25(shifted)})
         sensors.append(

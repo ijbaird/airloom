@@ -1,7 +1,9 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
@@ -84,6 +86,53 @@ class StoreTest(unittest.TestCase):
             path.write_text(json.dumps({"favorites": ["123", 7, "abc", True, 7.0]}), encoding="utf-8")
             store = Store(path)
             self.assertEqual(store.data["favorites"], [7, 123])
+
+    def test_huge_json_integer_falls_back_per_field_on_file_load(self):
+        defaults = {
+            "latitude": 45.5152,
+            "longitude": -122.6784,
+            "radius_km": 22.0,
+            "heatmap_threshold_km": 40.0,
+            "alert_threshold": 101,
+        }
+        for key, expected in defaults.items():
+            with self.subTest(field=key):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    path.write_text(json.dumps({
+                        key: 10**400,
+                        "location_name": "Valid setting",
+                        "favorites": [42, "123"],
+                    }), encoding="utf-8")
+                    loaded = Store(path)
+                    self.assertEqual(loaded.data[key], expected)
+                    self.assertEqual(loaded.data["location_name"], "Valid setting")
+                    self.assertEqual(loaded.data["favorites"], [42, 123])
+
+    def test_huge_json_integer_falls_back_per_field_on_apply(self):
+        defaults = {
+            "latitude": 45.5152,
+            "longitude": -122.6784,
+            "radius_km": 22.0,
+            "heatmap_threshold_km": 40.0,
+            "alert_threshold": 101,
+        }
+        for key, expected in defaults.items():
+            with self.subTest(field=key):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    settings = Store(path)
+                    candidate = deepcopy(settings.data)
+                    candidate.update({
+                        key: 10**400,
+                        "location_name": "Valid setting",
+                        "favorites": [42, "123"],
+                    })
+                    saved = settings.apply(candidate)
+                    self.assertEqual(saved[key], expected)
+                    self.assertEqual(saved["location_name"], "Valid setting")
+                    self.assertEqual(saved["favorites"], [42, 123])
+                    self.assertEqual(Store(path).data, saved)
 
     def test_short_api_key_is_not_hinted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -267,6 +316,256 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(store.data["hidden"]["5"], "padded")
             store.hide(6, "y" * 200)
             self.assertEqual(store.data["hidden"]["6"], "y" * 80)
+
+    def test_hostile_favorites_are_dropped_without_losing_valid_entries(self):
+        for bad in (float("nan"), float("inf"), float("-inf"), "²"):
+            with self.subTest(bad=bad):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "favorites": [42, bad, "123"],
+                                "location_name": "Valid setting",
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    loaded = Store(path)
+                    self.assertEqual(loaded.data["favorites"], [42, 123])
+                    self.assertEqual(loaded.data["location_name"], "Valid setting")
+
+    def test_permissive_fixed_temp_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            decoy = path.with_suffix(".tmp")
+            decoy.write_text("decoy", encoding="utf-8")
+            decoy.chmod(0o666)
+            settings = Store(path)
+            settings.save()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(Store(path).data, settings.data)
+            self.assertEqual(decoy.read_text(encoding="utf-8"), "decoy")
+            self.assertEqual(decoy.stat().st_mode & 0o777, 0o666)
+
+    def test_fixed_temp_symlink_and_its_target_are_not_damaged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            victim = Path(directory) / "victim.json"
+            victim.write_text("do not change", encoding="utf-8")
+            decoy = path.with_suffix(".tmp")
+            decoy.symlink_to(victim)
+            settings = Store(path)
+            settings.save()
+            self.assertEqual(victim.read_text(encoding="utf-8"), "do not change")
+            self.assertTrue(decoy.is_symlink())
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(Store(path).data, settings.data)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_apply_sanitizes_persists_and_returns_saved_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            settings = Store(path)
+            settings.data["api_key"] = "keep-secret"
+            settings.save()
+            candidate = deepcopy(settings.data)
+            candidate.update(
+                {
+                    "location_name": "  Candidate  ",
+                    "favorites": [42, "007", float("nan"), "²"],
+                    "interface_scale": 1.25,
+                }
+            )
+            saved = settings.apply(candidate)
+            self.assertEqual(saved["location_name"], "Candidate")
+            self.assertEqual(saved["favorites"], [7, 42])
+            self.assertEqual(saved["interface_scale"], 1.25)
+            self.assertEqual(saved["api_key"], "keep-secret")
+            self.assertEqual(settings.data, saved)
+            self.assertEqual(Store(path).data, saved)
+            candidate["favorites"].append(999)
+            self.assertEqual(settings.data["favorites"], [7, 42])
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_apply_permission_failure_preserves_memory_disk_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            settings = Store(path)
+            settings.data["location_name"] = "Original"
+            settings.save()
+            original = deepcopy(settings.data)
+            original_bytes = path.read_bytes()
+            candidate = deepcopy(settings.data)
+            candidate.update({"location_name": "Changed", "favorites": [9]})
+            with mock.patch("airloom.store.os.replace", side_effect=PermissionError("denied")):
+                with self.assertRaises(PermissionError):
+                    settings.apply(candidate)
+            self.assertEqual(settings.data, original)
+            self.assertEqual(path.read_bytes(), original_bytes)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_save_fsync_failure_preserves_disk_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            settings = Store(path)
+            settings.save()
+            original_bytes = path.read_bytes()
+            settings.data["location_name"] = "Unsaved"
+            with mock.patch("airloom.store.os.fsync", side_effect=PermissionError("denied")):
+                with self.assertRaises(PermissionError):
+                    settings.save()
+            self.assertEqual(path.read_bytes(), original_bytes)
+            self.assertEqual(settings.data["location_name"], "Unsaved")
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_existing_mutators_roll_back_on_permission_failure(self):
+        cases = (
+            ("favorite", lambda settings: settings.toggle_favorite(3)),
+            ("hide", lambda settings: settings.hide(3, "Three")),
+            ("unhide", lambda settings: settings.unhide(1)),
+            ("unhide_all", lambda settings: settings.unhide_all()),
+        )
+        for name, operation in cases:
+            with self.subTest(operation=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    settings = Store(path)
+                    settings.data["favorites"] = [1]
+                    settings.data["hidden"] = {"1": "One", "2": "Two"}
+                    settings.save()
+                    original = deepcopy(settings.data)
+                    original_bytes = path.read_bytes()
+                    with mock.patch(
+                        "airloom.store.os.replace", side_effect=PermissionError("denied")
+                    ):
+                        with self.assertRaises(PermissionError):
+                            operation(settings)
+                    self.assertEqual(settings.data, original)
+                    self.assertEqual(path.read_bytes(), original_bytes)
+                    self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_overlapping_applies_are_serialized_without_temp_leaks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            settings = Store(path)
+            settings.save()
+            first_candidate = deepcopy(settings.data)
+            first_candidate.update({"location_name": "first", "interface_scale": 1.25})
+            second_candidate = deepcopy(settings.data)
+            second_candidate.update({"location_name": "second", "interface_scale": 1.5})
+            real_fsync = os.fsync
+            first_in_fsync = threading.Event()
+            release_first = threading.Event()
+            second_done = threading.Event()
+            second_ready = threading.Event()
+            first_thread = None
+            errors = []
+
+            def controlled_fsync(fd):
+                if threading.current_thread() is first_thread:
+                    first_in_fsync.set()
+                    if not release_first.wait(5):
+                        raise TimeoutError("timed out waiting to release first save")
+                return real_fsync(fd)
+
+            def apply(candidate, done=None, ready=None):
+                if ready is not None:
+                    ready.set()
+                try:
+                    settings.apply(candidate)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    if done is not None:
+                        done.set()
+
+            first_thread = threading.Thread(target=apply, args=(first_candidate,))
+            second_thread = threading.Thread(
+                target=apply, args=(second_candidate, second_done, second_ready))
+            second_started = False
+            second_ready_to_apply = False
+            with mock.patch("airloom.store.os.fsync", controlled_fsync):
+                first_thread.start()
+                entered_fsync = first_in_fsync.wait(2)
+                second_finished_early = None
+                if entered_fsync:
+                    second_thread.start()
+                    second_started = True
+                    second_ready_to_apply = second_ready.wait(2)
+                    second_finished_early = second_done.wait(0.1)
+                release_first.set()
+                first_thread.join(5)
+                if second_started:
+                    second_thread.join(5)
+
+            self.assertTrue(entered_fsync, "first apply did not reach fsync")
+            self.assertTrue(second_ready_to_apply, "second apply was not ready to contend")
+            self.assertFalse(
+                second_finished_early,
+                "second apply completed while the first save was blocked",
+            )
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(settings.data["location_name"], "second")
+            self.assertEqual(settings.data["interface_scale"], 1.5)
+            self.assertEqual(Store(path).data, settings.data)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+
+class SensorIdTest(unittest.TestCase):
+    def test_accepts_positive_integral_ids_through_signed_64_bit_maximum(self):
+        maximum = 2**63 - 1
+        for value, expected in ((1, 1), (1.0, 1), ("007", 7), ("1e3", 1000), (maximum, maximum)):
+            with self.subTest(value=value):
+                self.assertEqual(store.sensor_id(value), expected)
+
+    def test_rejects_nonintegral_nonfinite_nonpositive_and_out_of_range_ids(self):
+        maximum = 2**63 - 1
+        for bad in (
+            None,
+            True,
+            False,
+            0,
+            -1,
+            1.5,
+            "1.5",
+            float("nan"),
+            float("inf"),
+            "²",
+            maximum + 1,
+            str(maximum + 1),
+            "1e999999999",
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(store.sensor_id(bad))
+
+
+class InterfaceScaleTest(unittest.TestCase):
+    def test_defaults_to_one_and_appears_in_public_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Store(Path(directory) / "config.json")
+            self.assertEqual(settings.data["interface_scale"], 1.0)
+            self.assertEqual(settings.public_config()["interface_scale"], 1.0)
+
+    def test_accepts_exactly_the_three_supported_scales(self):
+        for scale in (1.0, 1.25, 1.5):
+            with self.subTest(scale=scale):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    path.write_text(json.dumps({"interface_scale": scale}), encoding="utf-8")
+                    settings = Store(path)
+                    self.assertEqual(settings.data["interface_scale"], scale)
+                    self.assertEqual(settings.public_config()["interface_scale"], scale)
+
+    def test_invalid_scales_fall_back_to_one(self):
+        for bad in (1, 0.5, 1.2, 2.0, "1.25", True, False, None, float("nan"), float("inf")):
+            with self.subTest(bad=bad):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    path.write_text(json.dumps({"interface_scale": bad}), encoding="utf-8")
+                    self.assertEqual(Store(path).data["interface_scale"], 1.0)
 
 
 class RefreshMinutesTest(unittest.TestCase):
