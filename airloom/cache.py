@@ -18,7 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .purpleair import (
-    Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, FetchResult, _integer,
+    Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, FetchResult,
+    PurpleAirError, _integer,
 )
 
 MAX_REGIONS = 50
@@ -137,6 +138,16 @@ class SensorCache:
             self._db = None
             db.close()
             raise
+
+    def prune(self) -> None:
+        """Drop stale observations and invalidate coverage before cache reads."""
+        with self._lock:
+            try:
+                self._prune_locked(self.clock())
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def upsert_rows(self, rows: list[dict]) -> list[int]:
         with self._lock:
@@ -371,13 +382,19 @@ def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
                ttl: float, force: bool = False) -> AreaResult:
     """Serve an area from cache, delta-poll a stale known region, or full-fetch
     a new one. May raise PurpleAirError — the caller owns fallback policy."""
+    cache.prune()
     region = cache.covering_region(bounds, location_filter)
     now = cache.clock()
 
     def rows_in_view() -> list[dict]:
         return [v for v in cache.sensors_in(bounds) if _matches_filter(v, location_filter)]
 
-    if region is not None and not force and now - region.fetched_at < ttl:
+    if (
+        region is not None
+        and not force
+        and now - region.fetched_at < ttl
+        and now - region.metadata_fetched_at < METADATA_MAX_AGE
+    ):
         return AreaResult(rows_in_view(), now - region.fetched_at, False)
     if (
         region is not None
@@ -396,6 +413,9 @@ def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
         if unknown:
             followup = client.fetch_rows(show_only=sorted(unknown))
             followup_rows = followup.rows
+            unresolved = set(cache.unknown_rows(result.rows + followup_rows))
+            if any(sensor_id in unresolved for sensor_id in unknown):
+                raise PurpleAirError("PurpleAir backfill omitted required sensor metadata.")
         cache.apply_delta(region.id, result.rows + followup_rows, result.time_stamp)
         return AreaResult(rows_in_view(), 0.0, True)
     full_bounds = region.bounds if region is not None else bounds
@@ -409,6 +429,7 @@ def fetch_favorites(client, cache: SensorCache, favorite_ids, have_ids,
                     ttl: float, force: bool = False) -> list[dict]:
     """Rows for favorites not already in `have_ids`: cached-fresh ones for free,
     one show_only batch for the rest."""
+    cache.prune()
     missing = [int(i) for i in favorite_ids if int(i) not in have_ids]
     if not missing:
         return []

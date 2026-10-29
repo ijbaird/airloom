@@ -416,6 +416,32 @@ class FetchAreaTest(CacheBase):
         self.assertEqual(len(result.rows), 1)
         self.assertGreaterEqual(result.age, 0.0)
 
+    def test_stale_observation_cannot_use_long_lived_area_cache_hit(self):
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1, name="Original")], 1754680000)
+        self.clock.now += 25 * 3600
+        client = FakeClient([FetchResult([
+            row(1, name="Fresh", last_seen=self.clock.now)
+        ], 1754680300)])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=48 * 3600)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
+        self.assertNotIn("modified_since", client.calls[0])
+        self.assertEqual(result.rows[0]["name"], "Fresh")
+
+    def test_area_cache_hit_expires_metadata_at_24_hours(self):
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1, name="Original")], 1754680000)
+        self.clock.now += 12 * 3600
+        self.cache.upsert_rows([{"sensor_index": 1, "last_seen": self.clock.now}])
+        self.clock.now = 1000 + 24 * 3600
+        client = FakeClient([FetchResult([
+            row(1, name="Current", last_seen=self.clock.now)
+        ], 1754680300)])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=48 * 3600)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
+        self.assertNotIn("modified_since", client.calls[0])
+        self.assertEqual(result.rows[0]["name"], "Current")
+
     def test_stale_hit_delta_polls_with_region_bounds(self):
         big = bounds_around(45.5, -122.6, 50.0)
         self.cache.store_fetch(big, "outdoor", [row(1, humidity=40)], 1754680000)
@@ -467,6 +493,70 @@ class FetchAreaTest(CacheBase):
         self.assertEqual(sorted(r["sensor_index"] for r in result.rows), [1, 2])
         self.assertEqual(self.cache.covering_region(self.bounds, "outdoor").api_time_stamp,
                          1754680300)
+
+    def test_empty_backfill_leaves_rows_and_checkpoint_unchanged_for_retry(self):
+        original_stamp = 1754680000
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1, humidity=40)], original_stamp)
+        self.clock.now += 300
+        delta = FetchResult([
+            {"sensor_index": 1, "last_seen": 1300, "humidity": 60},
+            {"sensor_index": 2, "last_seen": 1300, "pm2.5_cf_1": 9.0},
+        ], 1754680300)
+        client = FakeClient([
+            delta,
+            FetchResult([], 1754680301),
+            delta,
+            FetchResult([row(2, lat=45.52, last_seen=1300)], 1754680302),
+        ])
+        try:
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        except PurpleAirError:
+            pass
+        self.assertEqual(
+            self.cache.covering_region(self.bounds, "outdoor").api_time_stamp,
+            original_stamp,
+        )
+        stored = self.cache.sensors_in(self.bounds)
+        self.assertEqual([r["sensor_index"] for r in stored], [1])
+        self.assertEqual(stored[0]["humidity"], 40)
+
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual(client.calls[2]["modified_since"], original_stamp)
+        self.assertEqual(sorted(r["sensor_index"] for r in result.rows), [1, 2])
+
+    def test_partial_backfill_leaves_rows_and_checkpoint_unchanged_for_retry(self):
+        original_stamp = 1754680000
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1)], original_stamp)
+        self.clock.now += 300
+        delta = FetchResult([
+            {"sensor_index": 2, "last_seen": 1300, "pm2.5_cf_1": 9.0},
+            {"sensor_index": 3, "last_seen": 1300, "pm2.5_cf_1": 10.0},
+        ], 1754680300)
+        client = FakeClient([
+            delta,
+            FetchResult([
+                row(2, lat=45.52, last_seen=1300),
+                {"sensor_index": 3, "latitude": 45.53, "last_seen": 1300},
+            ], 1754680301),
+            delta,
+            FetchResult([
+                row(2, lat=45.52, last_seen=1300),
+                row(3, lat=45.53, last_seen=1300),
+            ], 1754680302),
+        ])
+        try:
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        except PurpleAirError:
+            pass
+        self.assertEqual(
+            self.cache.covering_region(self.bounds, "outdoor").api_time_stamp,
+            original_stamp,
+        )
+        self.assertEqual([r["sensor_index"] for r in self.cache.sensors_in(self.bounds)], [1])
+
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual(client.calls[2]["modified_since"], original_stamp)
+        self.assertEqual(sorted(r["sensor_index"] for r in result.rows), [1, 2, 3])
 
     def test_repeated_empty_deltas_do_not_delay_metadata_snapshot(self):
         self.cache.store_fetch(self.bounds, "outdoor", [row(1, name="Original")], 1754680000)
@@ -557,6 +647,20 @@ class FetchFavoritesTest(CacheBase):
         rows = cache.fetch_favorites(client, self.cache, [5, 6], have_ids={1}, ttl=120)
         self.assertEqual(sorted(r["sensor_index"] for r in rows), [5, 6])
         self.assertEqual(client.calls[0]["show_only"], [6])
+
+    def test_stale_observation_cannot_be_served_fully_from_favorite_cache(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(5, name="Original")], 1754680000)
+        self.clock.now += 25 * 3600
+        client = FakeClient([FetchResult([
+            row(5, name="Fresh", last_seen=self.clock.now)
+        ], 1754680300)])
+        rows = cache.fetch_favorites(
+            client, self.cache, [5], have_ids=set(), ttl=48 * 3600)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["show_only"], [5])
+        self.assertEqual(rows[0]["name"], "Fresh")
+        self.assertIsNone(self.cache.covering_region(bounds, "outdoor"))
 
     def test_no_call_when_everything_is_covered(self):
         client = FakeClient([])
