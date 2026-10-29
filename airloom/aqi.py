@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,18 +31,24 @@ BANDS = (
 )
 
 
-def truncate_pm25(value: float) -> float:
-    """Truncate PM2.5 to one decimal place as required by EPA AQI guidance."""
-    if not math.isfinite(value):
-        return 0.0
-    return float(Decimal(str(max(0.0, value))).quantize(Decimal("0.1"), rounding=ROUND_DOWN))
+def truncate_pm25(value: float | None) -> float | None:
+    """Truncate finite PM2.5 to one decimal place as required by EPA guidance."""
+    if value is None or not math.isfinite(value):
+        return None
+    value = max(0.0, value)
+    try:
+        return float(Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_DOWN))
+    except InvalidOperation:
+        # Floats large enough to exceed Decimal's default quantize precision
+        # have no fractional digits to truncate.
+        return value
 
 
 def aqi_from_pm25(pm25: float | None) -> int | None:
     """Convert a PM2.5 concentration in µg/m³ to the 0–500 US AQI scale."""
-    if pm25 is None:
-        return None
     concentration = truncate_pm25(pm25)
+    if concentration is None:
+        return None
     for band in BANDS:
         if concentration <= band.pm_high:
             value = (
@@ -64,26 +70,68 @@ def band_for_aqi(aqi: int | None) -> AQIBand:
     return BANDS[-1]
 
 
-# The EPA extended (piecewise) correction switches from the US-wide linear fit
-# to a quadratic above this CF=1 concentration, where the linear fit was only
-# validated below it (Barkjohn et al. / EPA AirNow Fire and Smoke Map).
-EPA_QUADRATIC_BREAKPOINT = 343.0
+CORRECTION_VERSION = 2
+
 # Neutral relative humidity assumed when the sensor does not report one; raw
-# CF=1 data over-reports roughly 2x, so an uncorrected fallback is worse.
+# data over-reports roughly 2x, so an uncorrected fallback is worse.
 DEFAULT_HUMIDITY = 50.0
 
 
-def epa_corrected_pm25(cf1: float | None, humidity: float | None) -> float | None:
-    """Apply the US EPA wildfire-smoke correction used for PurpleAir CF=1 data."""
-    if cf1 is None or not math.isfinite(cf1):
+def _cf1_corrected(value: float, humidity: float) -> float:
+    """Barkjohn et al. (2022), §3.1.3, final equations 1–3.
+
+    https://pmc.ncbi.nlm.nih.gov/articles/PMC9784900/#sec3dot1dot3-sensors-22-09669
+    """
+    linear = 0.524 * value - 0.0862 * humidity + 5.75
+    if value < 570.0:
+        return linear
+    quadratic = 4.21e-4 * value * value + 0.392 * value + 3.44
+    if value >= 611.0:
+        return quadratic
+    weight = 0.0244 * value - 13.9
+    return weight * quadratic + (1.0 - weight) * linear
+
+
+def _atm_corrected(value: float, humidity: float) -> float:
+    """Five-piece CF=ATM correction published in PurpleAir API post 6.
+
+    https://community.purpleair.com/t/is-there-a-field-that-returns-data-with-us-epa-pm2-5-conversion-formula-applied/4593/6
+    """
+    if value < 30.0:
+        return 0.524 * value - 0.0862 * humidity + 5.75
+    if value < 50.0:
+        weight = value / 20.0 - 3.0 / 2.0
+        slope = 0.786 * weight + 0.524 * (1.0 - weight)
+        return slope * value - 0.0862 * humidity + 5.75
+    if value < 210.0:
+        return 0.786 * value - 0.0862 * humidity + 5.75
+    if value < 260.0:
+        weight = value / 50.0 - 21.0 / 5.0
+        slope = 0.69 * weight + 0.786 * (1.0 - weight)
+        return (
+            slope * value
+            - 0.0862 * humidity * (1.0 - weight)
+            + 2.966 * weight
+            + 5.75 * (1.0 - weight)
+            + 8.84e-4 * value * value * weight
+        )
+    return 2.966 + 0.69 * value + 8.84e-4 * value * value
+
+
+def epa_corrected_pm25(
+    value: float | None,
+    humidity: float | None,
+    basis: str = "CF1",
+) -> float | None:
+    """Apply the US EPA correction for a PurpleAir CF1 or ATM measurement."""
+    if basis not in ("CF1", "ATM"):
+        raise ValueError("basis must be CF1 or ATM")
+    if value is None or not math.isfinite(value):
         return None
-    cf1 = max(0.0, cf1)
+    value = max(0.0, value)
     if humidity is None or not math.isfinite(humidity):
         humidity = DEFAULT_HUMIDITY
     humidity = max(0.0, min(100.0, humidity))
-    if cf1 < EPA_QUADRATIC_BREAKPOINT:
-        corrected = 0.52 * cf1 - 0.086 * humidity + 5.75
-    else:
-        corrected = 0.46 * cf1 + 3.93e-4 * cf1 * cf1 + 2.97
-    return max(0.0, corrected)
+    corrected = _cf1_corrected(value, humidity) if basis == "CF1" else _atm_corrected(value, humidity)
+    return max(0.0, corrected) if math.isfinite(corrected) else None
 

@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from . import __version__
 from .aqi import aqi_from_pm25, epa_corrected_pm25
-from .geography import Bounds, bounds_around, bounds_contains
+from .geography import Bounds, bounds_around, bounds_contains, split_bounds
 from .models import Sensor
+from .validation import sensor_id
 
 
 API_URL = "https://api.purpleair.com/v1/sensors"
@@ -42,6 +44,7 @@ DATA_FIELDS = (
 TREND_FETCH_FIELDS = (
     "sensor_index",
     "humidity",
+    "location_type",
     "pm2.5_cf_1",
     "pm2.5_10minute",
     "pm2.5_30minute",
@@ -62,6 +65,8 @@ TREND_FIELDS = (
 
 
 MAX_FETCH_SPAN_KM = 200.0
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 
 def cap_bounds(bounds: Bounds, center: tuple[float, float]) -> Bounds:
@@ -69,7 +74,8 @@ def cap_bounds(bounds: Bounds, center: tuple[float, float]) -> Bounds:
     request thousands of sensor rows."""
     height_km = (bounds.north - bounds.south) * 111.0
     mid_lat = (bounds.north + bounds.south) / 2
-    width_km = (bounds.east - bounds.west) * 111.0 * max(0.1, math.cos(math.radians(mid_lat)))
+    longitude_span = sum(part.east - part.west for part in split_bounds(bounds))
+    width_km = longitude_span * 111.0 * max(0.1, math.cos(math.radians(mid_lat)))
     if height_km <= MAX_FETCH_SPAN_KM and width_km <= MAX_FETCH_SPAN_KM:
         return bounds
     return bounds_around(center[0], center[1], MAX_FETCH_SPAN_KM / 2)
@@ -101,7 +107,7 @@ class PurpleAirClient:
         if not self.api_key:
             raise PurpleAirError("A PurpleAir read key is required for live data.")
         if show_only:
-            show_only = [i for i in (_integer(value) for value in show_only) if i is not None]
+            show_only = [i for i in (sensor_id(value) for value in show_only) if i is not None]
         if bounds is None and not show_only:
             raise PurpleAirError("A sensor query needs bounds or sensor ids.")
         params: dict[str, str] = {"fields": ",".join(fields)}
@@ -163,8 +169,14 @@ def parse_rows(payload: dict) -> FetchResult:
 def sensor_from_values(values: dict) -> Sensor | None:
     lat = _number(values.get("latitude"))
     lon = _number(values.get("longitude"))
-    sensor_id = _integer(values.get("sensor_index"))
-    if lat is None or lon is None or sensor_id is None:
+    normalized_id = sensor_id(values.get("sensor_index"))
+    if (
+        lat is None
+        or lon is None
+        or normalized_id is None
+        or not -90.0 <= lat <= 90.0
+        or not -180.0 <= lon <= 180.0
+    ):
         return None
     humidity = _number(values.get("humidity"))
     corrected_pm = epa_corrected_pm25(_number(values.get("pm2.5_cf_1")), humidity)
@@ -173,8 +185,8 @@ def sensor_from_values(values: dict) -> Sensor | None:
     # because the sensor electronics warm the enclosure.
     ambient_temperature = temperature - 8.0 if temperature is not None else None
     return Sensor(
-        sensor_id=sensor_id,
-        name=str(values.get("name") or f"Sensor {sensor_id}"),
+        sensor_id=normalized_id,
+        name=str(values.get("name") or f"Sensor {normalized_id}"),
         latitude=lat,
         longitude=lon,
         aqi=aqi_from_pm25(corrected_pm),
@@ -191,10 +203,18 @@ def sensor_from_values(values: dict) -> Sensor | None:
 
 
 def trend_from_values(values: dict) -> list[dict]:
+    """Correct historical averages using the sensor's reported basis.
+
+    PurpleAir's simple running averages are ATM outdoors and CF1 indoors
+    (API discussion posts 17–19). Applying the current humidity to historical
+    averages is an approximation because historical humidity is unavailable.
+    """
     humidity = _number(values.get("humidity"))
+    average_basis = "CF1" if _integer(values.get("location_type")) == 1 else "ATM"
     trend = []
     for label, key in TREND_FIELDS:
-        point_pm = epa_corrected_pm25(_number(values.get(key)), humidity)
+        basis = "CF1" if label == "Now" else average_basis
+        point_pm = epa_corrected_pm25(_number(values.get(key)), humidity, basis=basis)
         trend.append({"label": label, "aqi": aqi_from_pm25(point_pm)})
     return trend
 
@@ -218,7 +238,7 @@ def _number(value) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -226,10 +246,20 @@ def _number(value) -> float | None:
 def _integer(value) -> int | None:
     if value is None:
         return None
+    if isinstance(value, int):
+        return int(value) if _INT64_MIN <= value <= _INT64_MAX else None
     try:
-        return int(float(value))
-    except (TypeError, ValueError, OverflowError):
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
         return None
+    if (
+        not parsed.is_finite()
+        or parsed < _INT64_MIN
+        or parsed > _INT64_MAX
+        or parsed != parsed.to_integral_value()
+    ):
+        return None
+    return int(parsed)
 
 
 def _rounded(value: float | None) -> float | None:

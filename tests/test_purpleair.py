@@ -107,8 +107,8 @@ class PurpleAirTest(unittest.TestCase):
 
         client = PurpleAirClient("key")
         with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen):
-            client.fetch_sensors(show_only=["42", "abc", 7])
-        self.assertIn("show_only=42%2C7", captured["url"])
+            client.fetch_sensors(show_only=["42", "abc", 7, "7.5", 8.9, 0, -3])
+        self.assertTrue(captured["url"].endswith("show_only=42%2C7"))
 
     def test_show_only_with_no_valid_ids_raises(self):
         with self.assertRaises(PurpleAirError):
@@ -177,8 +177,9 @@ class FieldListTest(unittest.TestCase):
         self.assertIn("confidence", purpleair.MAP_FIELDS)
         self.assertIn("confidence", purpleair.DATA_FIELDS)
 
-    def test_trend_fetch_fields_carry_humidity_for_epa_correction(self):
+    def test_trend_fetch_fields_carry_correction_inputs(self):
         self.assertIn("humidity", purpleair.TREND_FETCH_FIELDS)
+        self.assertIn("location_type", purpleair.TREND_FETCH_FIELDS)
         self.assertIn("pm2.5_1week", purpleair.TREND_FETCH_FIELDS)
 
 
@@ -238,6 +239,71 @@ class SensorFromValuesTest(unittest.TestCase):
         self.assertIsNone(purpleair.sensor_from_values(base).confidence)
         self.assertIsNone(purpleair.sensor_from_values({**base, "confidence": "junk"}).confidence)
 
+    def test_fractional_and_nonpositive_sensor_ids_are_rejected(self):
+        base = {"latitude": 45.5, "longitude": -122.6}
+        for sensor_id in (1.5, "1.5", 0, -1, True, False, float("nan"), float("inf")):
+            with self.subTest(sensor_id=sensor_id):
+                self.assertIsNone(purpleair.sensor_from_values({**base, "sensor_index": sensor_id}))
+
+    def test_large_integer_sensor_id_is_preserved_exactly(self):
+        sensor_id = 9007199254740993
+        sensor = purpleair.sensor_from_values(
+            {"sensor_index": sensor_id, "latitude": 45.5, "longitude": -122.6}
+        )
+        self.assertEqual(sensor.sensor_id, sensor_id)
+
+    def test_sensor_ids_enforce_signed_64_bit_limit_without_losing_boundaries(self):
+        maximum = 2**63 - 1
+        base = {"latitude": 45.5, "longitude": -122.6}
+        for value in (maximum, str(maximum), "9.223372036854775807e18"):
+            with self.subTest(valid=value):
+                sensor = purpleair.sensor_from_values({**base, "sensor_index": value})
+                self.assertEqual(sensor.sensor_id, maximum)
+        for value in ("1e5000", "-1e5000", "9.223372036854775808e18", 2**63, 10**400):
+            with self.subTest(invalid=value):
+                self.assertIsNone(purpleair.sensor_from_values({**base, "sensor_index": value}))
+
+    def test_near_integer_fractional_string_sensor_id_is_rejected(self):
+        sensor = purpleair.sensor_from_values(
+            {"sensor_index": "7.0000000000000001", "latitude": 45.5, "longitude": -122.6}
+        )
+        self.assertIsNone(sensor)
+
+    def test_out_of_range_and_non_finite_coordinates_are_rejected(self):
+        base = {"sensor_index": 7, "latitude": 45.5, "longitude": -122.6}
+        invalid = (
+            {"latitude": 90.1},
+            {"latitude": -90.1},
+            {"longitude": 180.1},
+            {"longitude": -180.1},
+            {"latitude": float("nan")},
+            {"longitude": float("inf")},
+            {"latitude": 10**400},
+            {"longitude": 10**400},
+        )
+        for override in invalid:
+            with self.subTest(override=override):
+                self.assertIsNone(purpleair.sensor_from_values({**base, **override}))
+        self.assertIsNotNone(purpleair.sensor_from_values({**base, "latitude": 90, "longitude": 180}))
+        self.assertIsNotNone(purpleair.sensor_from_values({**base, "latitude": -90, "longitude": -180}))
+
+    def test_huge_measurements_clamp_or_become_unavailable(self):
+        base = {"sensor_index": 7, "latitude": 45.5, "longitude": -122.6, "humidity": 50}
+        huge = purpleair.sensor_from_values({**base, "pm2.5_cf_1": 1e30})
+        self.assertEqual(huge.aqi, 500)
+        overflowing = purpleair.sensor_from_values({**base, "pm2.5_cf_1": 1e308})
+        self.assertIsNone(overflowing.aqi)
+        self.assertIsNone(overflowing.pm25)
+
+    def test_oversized_integer_measurements_become_unavailable(self):
+        base = {"sensor_index": 7, "latitude": 45.5, "longitude": -122.6}
+        concentration = purpleair.sensor_from_values({**base, "pm2.5_cf_1": 10**400})
+        self.assertIsNone(concentration.aqi)
+        self.assertIsNone(concentration.pm25)
+        humidity = purpleair.sensor_from_values({**base, "pm2.5_cf_1": 20, "humidity": 10**400})
+        self.assertIsNone(humidity.humidity)
+        self.assertIsNotNone(humidity.aqi)  # Missing humidity uses the neutral default.
+
     def test_trend_from_values_produces_seven_points(self):
         values = {"sensor_index": 7, "humidity": 40, "pm2.5_cf_1": 4.0,
                   "pm2.5_10minute": 4.2, "pm2.5_30minute": 4.4, "pm2.5_60minute": 4.6,
@@ -246,6 +312,25 @@ class SensorFromValuesTest(unittest.TestCase):
         self.assertEqual([point["label"] for point in trend],
                          ["1w", "1d", "6h", "1h", "30m", "10m", "Now"])
         self.assertTrue(all(isinstance(point["aqi"], int) for point in trend))
+
+    def test_outdoor_and_indoor_trends_use_their_measurement_basis(self):
+        values = {
+            "sensor_index": 7,
+            "humidity": 50,
+            "pm2.5_cf_1": 100,
+            "pm2.5_10minute": 100,
+            "pm2.5_30minute": 100,
+            "pm2.5_60minute": 100,
+            "pm2.5_6hour": 100,
+            "pm2.5_24hour": 100,
+            "pm2.5_1week": 100,
+        }
+        # At RH=50, CF1(100)=53.84 -> AQI 146; ATM(100)=80.04 -> AQI 168.
+        # The explicit pm2.5_cf_1 Now field remains CF1 for both sensor types.
+        outdoor = purpleair.trend_from_values({**values, "location_type": 0})
+        indoor = purpleair.trend_from_values({**values, "location_type": 1})
+        self.assertEqual([point["aqi"] for point in outdoor], [168, 168, 168, 168, 168, 168, 146])
+        self.assertEqual([point["aqi"] for point in indoor], [146, 146, 146, 146, 146, 146, 146])
 
 
 class CapBoundsTest(unittest.TestCase):
@@ -258,6 +343,17 @@ class CapBoundsTest(unittest.TestCase):
         capped = purpleair.cap_bounds(bounds, (40.0, -120.0))
         self.assertEqual(capped, purpleair.bounds_around(40.0, -120.0, 100.0))
         self.assertTrue(purpleair.bounds_contains(bounds, capped))
+
+    def test_narrow_antimeridian_crossing_passes_through(self):
+        bounds = purpleair.Bounds(0.1, 179.9, -0.1, -179.9)
+        self.assertEqual(purpleair.cap_bounds(bounds, (0.0, 180.0)), bounds)
+
+    def test_over_cap_antimeridian_crossing_uses_wrapped_span(self):
+        bounds = purpleair.Bounds(0.1, 100.0, -0.1, -100.0)
+        self.assertEqual(
+            purpleair.cap_bounds(bounds, (0.0, 0.0)),
+            purpleair.bounds_around(0.0, 0.0, 100.0),
+        )
 
 
 if __name__ == "__main__":

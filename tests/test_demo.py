@@ -17,6 +17,12 @@ class DemoTest(unittest.TestCase):
         for sensor in indoor:
             self.assertTrue(sensor.to_dict()["indoor"])
 
+    def test_now_trend_point_matches_displayed_aqi(self):
+        for sensor in demo_sensors(45.5, -122.6):
+            with self.subTest(sensor=sensor.name):
+                now = next(point for point in sensor.trend if point["label"] == "Now")
+                self.assertEqual(now["aqi"], sensor.aqi)
+
 
 if __name__ == "__main__":
     unittest.main()
