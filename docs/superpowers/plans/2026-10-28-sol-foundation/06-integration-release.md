@@ -25,6 +25,7 @@ Cross-workstream contract drift, real WebKit gesture/focus behavior, stale/demo 
 **Files:** Modify only files needed to resolve reviewed contract drift; add `scripts/test-ui-regression` and `tests/test_integration.py`.
 
 - [ ] Merge data → controller → frontend → release hardening, writing failing regression tests for every integration conflict before changing shared code.
+- [ ] Resolve the carried final-review blockers with failing tests: replace native-only publication concurrency with queue-preserving cross-run serialization (no older pending run cancellation), and record/verify each update-repository tar payload's SHA-256 before extraction or key use in both client verification and Pages publication. Hosted queue behavior must be verified before tagging.
 - [ ] Run `make check`; investigate and fix failures by root cause with focused tests.
 - [ ] Add/execute headless scenarios for away-from-home refresh, delayed search, interrupted fly/zoom/pinch, keyboard focus, cached filters, trend retry, demo/stale alerts/labels, reduced motion, preview actions, popup/search/narrow layouts, stripped debug module, and sentinel process/config/cache safety. Include the final frontend review's blocking scaled-search regressions: 320px at 1.25× must not produce 365.5px clipped content, and 375px at 1.5× must not produce 438px clipped content; fix search/container min-width behavior and verify actual browser layout.
 - [ ] Run complete local matrix and record exact results; require zero ResourceWarnings.
