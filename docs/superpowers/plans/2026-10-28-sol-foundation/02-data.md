@@ -84,8 +84,8 @@ Huge finite values, malformed Unicode favorites, preexisting symlinks, locked he
 - `Geocoder(search_url=None, reverse_url=None, clock=..., sleep=...)` with `search(query, limit=5, timeout=10)` and `reverse(...)`; module functions retain compatibility.
 - `AIRLOOM_NOMINATIM_URL` selects a compatible base URL; bounded TTL query cache and finite coordinate validation are required.
 
-- [ ] Add failing tests for NaN/Infinity/out-of-range places, endpoint override, repeated-query cache, empty queries, throttling, and failed-request non-caching.
-- [ ] Run `python3 -m unittest tests.test_geocode -v`; confirm failures.
-- [ ] Implement endpoint normalization/override, bounded cache, validation, and injectable timing without changing the explicit-submit UI contract owned by frontend.
-- [ ] Re-run focused tests; expect PASS and zero requests for empty queries.
-- [ ] Commit `fix: make geocoding validated cacheable and configurable`; run `make check` and request Sol data-workstream review.
+- [x] Add failing tests for NaN/Infinity/out-of-range places, endpoint override, repeated-query cache, empty queries, throttling, and failed-request non-caching.
+- [x] Run `python3 -m unittest tests.test_geocode -v`; confirm failures.
+- [x] Implement endpoint normalization/override, bounded cache, validation, and injectable timing without changing the explicit-submit UI contract owned by frontend.
+- [x] Re-run focused tests; expect PASS and zero requests for empty queries.
+- [x] Commit `fix: make geocoding validated cacheable and configurable`; run `make check` and request Sol data-workstream review.
