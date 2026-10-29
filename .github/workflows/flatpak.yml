@@ -6,6 +6,17 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      allow_older:
+        description: Allow replacement of an older stable release (requires exact tag confirmation)
+        required: false
+        type: boolean
+        default: false
+      confirm_tag:
+        description: Exact older tag to replace (for example v1.2.3)
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -16,6 +27,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify checkout source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
@@ -24,18 +41,81 @@ jobs:
           node-version: '22'
       - name: Install metadata validators
         run: sudo apt-get update && sudo apt-get install -y appstream desktop-file-utils
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-      - name: Check JavaScript
-        run: node --check airloom/resources/app.js
+      - name: Run repository checks
+        run: make check
       - name: Validate desktop metadata
         run: |
           desktop-file-validate packaging/ai.stealthvision.Airloom.desktop
           appstreamcli validate --no-net packaging/ai.stealthvision.Airloom.metainfo.xml
 
+  webkit-ui:
+    name: Headless WebKit UI
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify checkout source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
+      - name: Install headless WebKit dependencies
+        run: dnf install -y python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth
+      # Integration plan 06 (06-integration-release.md) owns
+      # scripts/test-ui-regression. Add its stripped-debug, search, focus, and
+      # alert scenarios to this required release ancestor before tagging; they
+      # do not exist in this branch, which runs only the two scripts below.
+      - name: Run isolated WebKit UI regressions
+        shell: bash
+        env:
+          NO_AT_BRIDGE: "1"
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "${XDG_RUNTIME_DIR}"
+          for script in scripts/test-heatmap scripts/test-save-refresh; do
+            xvfb-run -a -s "-screen 0 1280x800x24" "${script}"
+          done
+
+  release-eligibility:
+    name: Validate release eligibility
+    runs-on: ubuntu-24.04
+    outputs:
+      eligible: ${{ steps.check.outputs.eligible }}
+      source_sha: ${{ steps.check.outputs.source_sha }}
+    steps:
+      - name: Checkout release history
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Check release ref and versions
+        id: check
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          ALLOW_OLDER: ${{ inputs.allow_older }}
+          CONFIRM_TAG: ${{ inputs.confirm_tag }}
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
+          args=(--ref "${GITHUB_REF}" --version-root . --source-sha "${EXPECTED_SOURCE_SHA}")
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${ALLOW_OLDER}" == "true" ]]; then
+            args+=(--allow-older --confirm-tag "${CONFIRM_TAG}")
+          fi
+          python3 scripts/check-release.py "${args[@]}"
+          {
+            echo "eligible=true"
+            echo "source_sha=${EXPECTED_SOURCE_SHA}"
+          } >> "${GITHUB_OUTPUT}"
+
   flatpak:
     name: Flatpak (${{ matrix.arch }})
-    needs: test
+    needs: [test, webkit-ui, release-eligibility]
     strategy:
       fail-fast: false
       matrix:
@@ -46,12 +126,18 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77 # gnome-50
       options: --privileged
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+      - name: Verify checkout source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
       - name: Build Flatpak bundle
-        uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
           bundle: Airloom-${{ matrix.arch }}.flatpak
           manifest-path: packaging/ai.stealthvision.Airloom.yml
@@ -59,10 +145,11 @@ jobs:
           arch: ${{ matrix.arch }}
           branch: stable
           upload-artifact: false
-      - name: Import signing key
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+      - name: Import production signing key
+        if: needs.release-eligibility.outputs.eligible == 'true'
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          AIRLOOM_REQUIRE_PRODUCTION_KEY: "1"
         run: scripts/import-signing-key.sh
       - name: Rebuild bundle with update-repo origin
         shell: bash
@@ -78,7 +165,7 @@ jobs:
               --arch="${{ matrix.arch }}" \
               --gpg-sign="${GPG_KEY_ID}" \
               --gpg-homedir="${GNUPGHOME}"
-            gpg_args=(--gpg-keys="packaging/airloom-flatpak.gpg")
+            gpg_args=(--gpg-keys="${FLATPAK_GPG_PUBLIC_KEY}")
           fi
           flatpak build-bundle repo "Airloom-${{ matrix.arch }}.flatpak" \
             ai.stealthvision.Airloom stable \
@@ -86,84 +173,108 @@ jobs:
             --repo-url="https://ijbaird.github.io/airloom/repo" \
             --runtime-repo="https://dl.flathub.org/repo/flathub.flatpakrepo" \
             "${gpg_args[@]}"
+      - name: Record release provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          runtime_ref="runtime/org.gnome.Platform/${arch}/50"
+          sdk_ref="runtime/org.gnome.Sdk/${arch}/50"
+          runtime_commit="$(flatpak info --arch="${arch}" --show-commit org.gnome.Platform//50)"
+          sdk_commit="$(flatpak info --arch="${arch}" --show-commit org.gnome.Sdk//50)"
+          scripts/record-provenance.sh \
+            --output "Airloom-${arch}.provenance.json" \
+            --source-sha "${EXPECTED_SOURCE_SHA}" \
+            --image-ref "ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77" \
+            --image-digest "sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77" \
+            --runtime-ref "${runtime_ref}" \
+            --runtime-commit "${runtime_commit}" \
+            --sdk-ref "${sdk_ref}" \
+            --sdk-commit "${sdk_commit}" \
+            --tool-version "flatpak=$(flatpak --version)" \
+            --tool-version "flatpak-builder=$(flatpak-builder --version)" \
+            --tool-ref "actions/checkout=3d3c42e5aac5ba805825da76410c181273ba90b1" \
+            --tool-ref "flatpak/flatpak-github-actions/flatpak-builder=79327416609af08178ad73b352877e51450790b3" \
+            --tool-ref "actions/upload-artifact=043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" \
+            --bundle "Airloom-${arch}.flatpak"
       - name: Upload workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: airloom-${{ matrix.arch }}
-          path: Airloom-${{ matrix.arch }}.flatpak
+          path: |
+            Airloom-${{ matrix.arch }}.flatpak
+            Airloom-${{ matrix.arch }}.provenance.json
           if-no-files-found: error
           retention-days: 30
       - name: Archive update-repo artifact
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         run: tar -cf "airloom-repo-${{ matrix.arch }}.tar" repo
       - name: Upload update-repo artifact
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: airloom-repo-${{ matrix.arch }}
-          path: airloom-repo-${{ matrix.arch }}.tar
+          path: |
+            airloom-repo-${{ matrix.arch }}.tar
+            Airloom-${{ matrix.arch }}.provenance.json
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: flatpak
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: airloom-@(x86_64|aarch64)
-          path: dist
-          merge-multiple: true
-      - name: Generate checksums
-        run: cd dist && sha256sum *.flatpak > SHA256SUMS
-      - name: Create release and upload bundles
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/*.flatpak dist/SHA256SUMS \
-              --repo "${GITHUB_REPOSITORY}" \
-              --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" dist/*.flatpak dist/SHA256SUMS \
-              --repo "${GITHUB_REPOSITORY}" \
-              --verify-tag \
-              --generate-notes \
-              --title "Airloom ${GITHUB_REF_NAME#v}"
-          fi
-
-  publish-repo:
-    name: Publish update repository
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: flatpak
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: pages
-      cancel-in-progress: false
+  verify-client:
+    name: Verify signed client (${{ matrix.arch }})
+    needs: [flatpak, release-eligibility]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77 # gnome-50
       options: --privileged
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Checkout release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify checkout source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
+      - name: Download current bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: airloom-${{ matrix.arch }}
+          path: dist
+      - name: Download update-repo artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: airloom-repo-*
           path: repos
+      - name: Verify downloaded artifact provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          args=(
+            --provenance "dist/Airloom-${arch}.provenance.json"
+            --bundle "dist/Airloom-${arch}.flatpak"
+          )
+          for repo_arch in x86_64 aarch64; do
+            args+=(--provenance "repos/airloom-repo-${repo_arch}/Airloom-${repo_arch}.provenance.json")
+          done
+          python3 scripts/check-release-provenance.py \
+            --source-sha "${EXPECTED_SOURCE_SHA}" "${args[@]}"
       - name: Extract update-repo artifacts
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           for dir in repos/airloom-repo-*/; do
             dir="${dir%/}"
             arch="${dir#repos/airloom-repo-}"
@@ -174,16 +285,126 @@ jobs:
             rm -rf "${dir}"
             mv "${dir}.extracted" "${dir}"
           done
-      - name: Import signing key
+      - name: Import production signing key
+        if: needs.release-eligibility.outputs.eligible == 'true'
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          AIRLOOM_REQUIRE_PRODUCTION_KEY: "1"
         run: scripts/import-signing-key.sh
-      - name: Assemble site
-        run: scripts/publish-flatpak-repo.sh _site repos/airloom-repo-x86_64 repos/airloom-repo-aarch64
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: _site
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+      - name: Generate ephemeral signing key
+        if: needs.release-eligibility.outputs.eligible != 'true'
+        env:
+          AIRLOOM_EPHEMERAL_SIGNING_KEY: "1"
+          AIRLOOM_REQUIRE_PRODUCTION_KEY: "0"
+        run: scripts/import-signing-key.sh
+      - name: Select previous supported release
+        shell: bash
+        env:
+          RELEASE_ELIGIBLE: ${{ needs.release-eligibility.outputs.eligible }}
+        run: |
+          set -euo pipefail
+          current_version="$(python3 -c 'from airloom import __version__; print(__version__)')"
+          export CURRENT_VERSION="${current_version}"
+          previous_tag="$(python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          pattern = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+          current = tuple(int(part) for part in os.environ["CURRENT_VERSION"].split("."))
+          candidates = []
+          for tag in subprocess.check_output(["git", "tag", "--list", "v*"], text=True).splitlines():
+              match = pattern.fullmatch(tag)
+              if not match:
+                  continue
+              candidate = tuple(int(part) for part in match.groups())
+              if candidate < current or (
+                  candidate == current and os.environ["RELEASE_ELIGIBLE"] != "true"
+              ):
+                  candidates.append((candidate, tag))
+          if not candidates:
+              raise SystemExit("no previous supported release tag found")
+          print(max(candidates)[1])
+          PY
+          )"
+          {
+            echo "EXPECTED_VERSION=${current_version}"
+            echo "PREVIOUS_TAG=${previous_tag}"
+            echo "PREVIOUS_VERSION=${previous_tag#v}"
+          } >> "${GITHUB_ENV}"
+      - name: Download previous release bundle
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import urllib.request
+
+          tag = os.environ["PREVIOUS_TAG"]
+          arch = os.environ["ARCH"]
+          url = f"https://github.com/ijbaird/airloom/releases/download/{tag}/Airloom-{arch}.flatpak"
+          output = Path("previous") / f"Airloom-{arch}.flatpak"
+          output.parent.mkdir(parents=True, exist_ok=True)
+          with urllib.request.urlopen(url, timeout=120) as response, output.open("wb") as stream:
+              shutil.copyfileobj(response, stream)
+          print(f"Downloaded previous supported release {tag} for {arch}")
+          PY
+      - name: Sign disposable development fixtures
+        if: needs.release-eligibility.outputs.eligible != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          source_repo="repos/airloom-repo-${arch}"
+          flatpak build-sign "${source_repo}" ai.stealthvision.Airloom stable \
+            --arch="${arch}" \
+            --gpg-sign="${GPG_KEY_ID}" \
+            --gpg-homedir="${GNUPGHOME}"
+          flatpak build-bundle "${source_repo}" "dist/Airloom-${arch}.flatpak" \
+            ai.stealthvision.Airloom stable \
+            --arch="${arch}" \
+            --repo-url="https://ijbaird.github.io/airloom/repo" \
+            --runtime-repo="https://dl.flathub.org/repo/flathub.flatpakrepo" \
+            --gpg-keys="${FLATPAK_GPG_PUBLIC_KEY}"
+          echo "Development verification uses an ephemeral key and disposable signed fixtures; uploaded development artifacts remain unsigned." >> "${GITHUB_STEP_SUMMARY}"
+      - name: Assemble verification repository
+        run: PUBKEY_FILE="${FLATPAK_GPG_PUBLIC_KEY}" scripts/publish-flatpak-repo.sh _site repos/airloom-repo-x86_64 repos/airloom-repo-aarch64
+      - name: Verify signed client installation and upgrade
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          scripts/verify-flatpak-release.sh \
+            --bundle "dist/Airloom-${arch}.flatpak" \
+            --previous-bundle "previous/Airloom-${arch}.flatpak" \
+            --repo _site/repo \
+            --arch "${arch}" \
+            --version "${EXPECTED_VERSION}" \
+            --previous-version "${PREVIOUS_VERSION}"
+
+  publication:
+    name: Coordinate stable publication
+    if: needs.release-eligibility.outputs.eligible == 'true'
+    needs: [flatpak, verify-client, release-eligibility, webkit-ui]
+    # A reusable-workflow call remains running until both channels finish, so
+    # this is the only stable-publication contender for the entire run.
+    concurrency:
+      group: stable-publication
+      cancel-in-progress: false
+    # This step-less call sets only the maximum permissions available to the
+    # reusable workflow; each called job opts into its own narrower set.
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      source_sha: ${{ needs.release-eligibility.outputs.source_sha }}
+      allow_older: ${{ inputs.allow_older == true }}
+      confirm_tag: ${{ inputs.confirm_tag || '' }}
+    secrets:
+      FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-prefix="${AIRLOOM_PREFIX:-/usr/local}"
+prefix="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${prefix}/share/airloom${PYTHONPATH:+:${PYTHONPATH}}"
 exec python3 -m airloom "$@"
 
