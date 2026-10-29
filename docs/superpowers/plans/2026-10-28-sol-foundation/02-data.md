@@ -70,11 +70,11 @@ Huge finite values, malformed Unicode favorites, preexisting symlinks, locked he
 - `METADATA_MAX_AGE = 24 * 3600` and `SCHEMA_VERSION = 2` (clearing readings/trends derived by correction v1).
 - `fetch_area(...)` splits crossing bounds via `split_bounds`, dedupes by sensor ID, and only commits checkpoint/freshness after required backfill succeeds.
 
-- [ ] Add failing sequence tests for failed backfill then unchanged retry, prune/revisit, repeated empty deltas >24h, rename/relocation/reclassification, overlapping regions, locked commit rollback, and crossing-bound queries.
-- [ ] Run focused tests; confirm premature checkpoint/stale observations/obsolete metadata.
-- [ ] Bump the schema, stage backfills before one rows+region transaction, prune on all fetch paths using observation `last_seen` rather than rejuvenating it with retrieval time, invalidate regions when rows are pruned, force full snapshots beyond metadata TTL, and merge split queries without global absent-row deletion.
-- [ ] Re-run focused and full Python tests; expect PASS.
-- [ ] Commit `fix: preserve cache coverage and observation freshness`.
+- [x] Add failing sequence tests for failed backfill then unchanged retry, prune/revisit, repeated empty deltas >24h, rename/relocation/reclassification, overlapping regions, locked commit rollback, and crossing-bound queries.
+- [x] Run focused tests; confirm premature checkpoint/stale observations/obsolete metadata.
+- [x] Bump the schema, stage backfills before one rows+region transaction, prune on all fetch paths using observation `last_seen` rather than rejuvenating it with retrieval time, invalidate regions when rows are pruned, force full snapshots beyond metadata TTL, and merge split queries without global absent-row deletion.
+- [x] Re-run focused and full Python tests; expect PASS.
+- [x] Commit `fix: preserve cache coverage and observation freshness`.
 
 ### Task 5: Explicit-submit geocoder foundation
 
