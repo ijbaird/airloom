@@ -2,6 +2,7 @@ import io
 import json
 import math
 import os
+import threading
 import unittest
 from unittest import mock
 
@@ -12,6 +13,13 @@ from airloom.geocode import GeocodeError, Place, reverse, search
 def fake_response(payload):
     return mock.MagicMock(
         __enter__=lambda s: io.StringIO(json.dumps(payload)),
+        __exit__=lambda s, *a: False,
+    )
+
+
+def raw_response(text):
+    return mock.MagicMock(
+        __enter__=lambda s: io.StringIO(text),
         __exit__=lambda s, *a: False,
     )
 
@@ -197,6 +205,116 @@ class GeocoderTest(unittest.TestCase):
         self.assertEqual(spy.call_count, 1)
         self.assertEqual(timing.sleeps, [])
 
+    def test_concurrent_identical_cache_misses_share_one_request(self):
+        payload = [{"lat": "1", "lon": "2", "display_name": "Shared place"}]
+        expected = [Place("Shared place", 1.0, 2.0)]
+        client, _ = make_geocoder()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_done = threading.Event()
+        call_lock = threading.Lock()
+        calls = []
+        results = []
+        errors = []
+
+        def controlled_urlopen(request, timeout=None):
+            with call_lock:
+                calls.append(request.full_url)
+                call_number = len(calls)
+            if call_number == 1:
+                first_started.set()
+                if not release_first.wait(5):
+                    raise TimeoutError("timed out releasing the first request")
+            return fake_response(payload)
+
+        def run(is_second=False):
+            try:
+                results.append(client.search("shared"))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                if is_second:
+                    second_done.set()
+
+        first_thread = threading.Thread(target=run)
+        second_thread = threading.Thread(target=run, args=(True,))
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", side_effect=controlled_urlopen
+        ):
+            first_thread.start()
+            entered_request = first_started.wait(2)
+            second_thread.start()
+            second_finished_early = second_done.wait(0.1)
+            release_first.set()
+            first_thread.join(5)
+            second_thread.join(5)
+
+        self.assertTrue(entered_request, "first search did not reach the request")
+        self.assertFalse(second_finished_early, "second search bypassed the in-flight miss")
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [expected, expected])
+        self.assertEqual(len(calls), 1)
+
+    def test_failed_leader_unblocks_waiter_for_retry_and_later_cache(self):
+        payload = [{"lat": "1", "lon": "2", "display_name": "Recovered place"}]
+        expected = [Place("Recovered place", 1.0, 2.0)]
+        client, _ = make_geocoder()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        call_lock = threading.Lock()
+        calls = []
+        first_errors = []
+        second_results = []
+        second_errors = []
+
+        def controlled_urlopen(request, timeout=None):
+            with call_lock:
+                calls.append(request.full_url)
+                call_number = len(calls)
+            if call_number == 1:
+                first_started.set()
+                if not release_first.wait(5):
+                    raise TimeoutError("timed out releasing the failed request")
+                raise OSError("leader failed")
+            return fake_response(payload)
+
+        def fail_first():
+            try:
+                client.search("retry concurrently")
+            except BaseException as error:
+                first_errors.append(error)
+
+        def retry_second():
+            try:
+                second_results.append(client.search("retry concurrently"))
+            except BaseException as error:
+                second_errors.append(error)
+
+        first_thread = threading.Thread(target=fail_first)
+        second_thread = threading.Thread(target=retry_second)
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", side_effect=controlled_urlopen
+        ):
+            first_thread.start()
+            entered_request = first_started.wait(2)
+            second_thread.start()
+            release_first.set()
+            first_thread.join(5)
+            second_thread.join(5)
+            cached = client.search("retry concurrently")
+
+        self.assertTrue(entered_request, "failed search did not reach the request")
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(len(first_errors), 1)
+        self.assertIsInstance(first_errors[0], GeocodeError)
+        self.assertEqual(second_errors, [])
+        self.assertEqual(second_results, [expected])
+        self.assertEqual(cached, expected)
+        self.assertEqual(len(calls), 2)
+
     def test_cached_query_expires_after_five_minutes(self):
         client, timing = make_geocoder()
         with mock.patch.object(geocode.urllib.request, "urlopen", return_value=fake_response([])) as spy:
@@ -260,6 +378,34 @@ class GeocoderTest(unittest.TestCase):
             with self.assertRaises(GeocodeError):
                 client.search("retry")
             self.assertEqual(client.search("retry"), [Place("Recovered place", 1.0, 2.0)])
+        self.assertEqual(spy.call_count, 2)
+
+    def test_malformed_json_is_not_cached_and_next_request_retries(self):
+        payload = [{"lat": "1", "lon": "2", "display_name": "Recovered place"}]
+        client, _ = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request,
+            "urlopen",
+            side_effect=[raw_response("{not json"), fake_response(payload)],
+        ) as spy:
+            with self.assertRaises(GeocodeError):
+                client.search("malformed")
+            self.assertEqual(
+                client.search("malformed"), [Place("Recovered place", 1.0, 2.0)])
+        self.assertEqual(spy.call_count, 2)
+
+    def test_non_list_payload_is_not_cached_and_next_request_retries(self):
+        payload = [{"lat": "1", "lon": "2", "display_name": "Recovered place"}]
+        client, _ = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request,
+            "urlopen",
+            side_effect=[fake_response({"error": "bad"}), fake_response(payload)],
+        ) as spy:
+            with self.assertRaises(GeocodeError):
+                client.search("non-list")
+            self.assertEqual(
+                client.search("non-list"), [Place("Recovered place", 1.0, 2.0)])
         self.assertEqual(spy.call_count, 2)
 
 

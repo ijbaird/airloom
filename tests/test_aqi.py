@@ -63,6 +63,21 @@ class AQITest(unittest.TestCase):
             with self.subTest(branch=name):
                 self.assertAlmostEqual(epa_corrected_pm25(value, humidity), expected, places=9)
 
+    def test_cf1_correction_exact_and_adjacent_threshold_fixtures(self):
+        # Independently evaluated with Decimal from Barkjohn equations 1–3.
+        fixtures = (
+            (569.99, 300.11476),
+            (570.0, 300.6283432),
+            (570.01, 300.6491163521206724),
+            (610.99, 400.7514228748386476),
+            (611.0, 400.120141),
+            (611.01, 400.1292056621),
+        )
+        for value, expected in fixtures:
+            with self.subTest(value=value):
+                self.assertAlmostEqual(
+                    epa_corrected_pm25(value, 50, basis="CF1"), expected, places=9)
+
     def test_cf1_correction_quadratic_ignores_humidity(self):
         self.assertEqual(epa_corrected_pm25(700, 10), epa_corrected_pm25(700, 90))
 
@@ -84,6 +99,27 @@ class AQITest(unittest.TestCase):
         for name, value, expected in fixtures:
             with self.subTest(branch=name):
                 self.assertAlmostEqual(epa_corrected_pm25(value, 50, basis="ATM"), expected, places=9)
+
+    def test_atm_correction_exact_and_adjacent_threshold_fixtures(self):
+        # Independently evaluated with Decimal from the published ATM equations.
+        fixtures = (
+            (29.99, 17.15476),
+            (30.0, 17.16),
+            (30.01, 17.16917131),
+            (49.99, 40.72559131),
+            (50.0, 40.74),
+            (50.01, 40.74786),
+            (209.99, 166.49214),
+            (210.0, 166.5),
+            (210.01, 166.51193063057768),
+            (259.99, 242.10563913574232),
+            (260.0, 242.1244),
+            (260.01, 242.1358968884),
+        )
+        for value, expected in fixtures:
+            with self.subTest(value=value):
+                self.assertAlmostEqual(
+                    epa_corrected_pm25(value, 50, basis="ATM"), expected, places=9)
 
     def test_epa_correction_rejects_unknown_basis(self):
         with self.assertRaises(ValueError):

@@ -54,6 +54,7 @@ class Geocoder:
         self._throttle_lock = threading.Lock()
         self._cache = OrderedDict()
         self._cache_lock = threading.Lock()
+        self._search_lock = threading.Lock()
 
     def search(self, query: str, limit: int = 5, timeout: int = 10) -> list[Place]:
         query = query.strip()
@@ -63,19 +64,24 @@ class Geocoder:
         cached = self._cached(key)
         if cached is not None:
             return cached
-        payload = self._request(
-            self.search_url,
-            {"q": query, "format": "jsonv2", "limit": str(limit)},
-            timeout,
-        )
-        if not isinstance(payload, list):
-            raise GeocodeError("Unexpected geocoder response.")
-        places = []
-        for row in payload:
-            if isinstance(row, dict) and (place := _place_from(row)):
-                places.append(place)
-        self._store_cached(key, places)
-        return places
+        with self._search_lock:
+            # A concurrent miss may have populated this key while we waited.
+            cached = self._cached(key)
+            if cached is not None:
+                return cached
+            payload = self._request(
+                self.search_url,
+                {"q": query, "format": "jsonv2", "limit": str(limit)},
+                timeout,
+            )
+            if not isinstance(payload, list):
+                raise GeocodeError("Unexpected geocoder response.")
+            places = []
+            for row in payload:
+                if isinstance(row, dict) and (place := _place_from(row)):
+                    places.append(place)
+            self._store_cached(key, places)
+            return places
 
     def reverse(self, latitude: float, longitude: float, timeout: int = 10) -> str:
         coordinates = _coordinates(latitude, longitude)

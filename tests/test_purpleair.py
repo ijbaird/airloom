@@ -241,7 +241,7 @@ class SensorFromValuesTest(unittest.TestCase):
 
     def test_fractional_and_nonpositive_sensor_ids_are_rejected(self):
         base = {"latitude": 45.5, "longitude": -122.6}
-        for sensor_id in (1.5, "1.5", 0, -1, float("nan"), float("inf")):
+        for sensor_id in (1.5, "1.5", 0, -1, True, False, float("nan"), float("inf")):
             with self.subTest(sensor_id=sensor_id):
                 self.assertIsNone(purpleair.sensor_from_values({**base, "sensor_index": sensor_id}))
 
@@ -343,6 +343,17 @@ class CapBoundsTest(unittest.TestCase):
         capped = purpleair.cap_bounds(bounds, (40.0, -120.0))
         self.assertEqual(capped, purpleair.bounds_around(40.0, -120.0, 100.0))
         self.assertTrue(purpleair.bounds_contains(bounds, capped))
+
+    def test_narrow_antimeridian_crossing_passes_through(self):
+        bounds = purpleair.Bounds(0.1, 179.9, -0.1, -179.9)
+        self.assertEqual(purpleair.cap_bounds(bounds, (0.0, 180.0)), bounds)
+
+    def test_over_cap_antimeridian_crossing_uses_wrapped_span(self):
+        bounds = purpleair.Bounds(0.1, 100.0, -0.1, -100.0)
+        self.assertEqual(
+            purpleair.cap_bounds(bounds, (0.0, 0.0)),
+            purpleair.bounds_around(0.0, 0.0, 100.0),
+        )
 
 
 if __name__ == "__main__":

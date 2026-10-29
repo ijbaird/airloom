@@ -87,6 +87,53 @@ class StoreTest(unittest.TestCase):
             store = Store(path)
             self.assertEqual(store.data["favorites"], [7, 123])
 
+    def test_huge_json_integer_falls_back_per_field_on_file_load(self):
+        defaults = {
+            "latitude": 45.5152,
+            "longitude": -122.6784,
+            "radius_km": 22.0,
+            "heatmap_threshold_km": 40.0,
+            "alert_threshold": 101,
+        }
+        for key, expected in defaults.items():
+            with self.subTest(field=key):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    path.write_text(json.dumps({
+                        key: 10**400,
+                        "location_name": "Valid setting",
+                        "favorites": [42, "123"],
+                    }), encoding="utf-8")
+                    loaded = Store(path)
+                    self.assertEqual(loaded.data[key], expected)
+                    self.assertEqual(loaded.data["location_name"], "Valid setting")
+                    self.assertEqual(loaded.data["favorites"], [42, 123])
+
+    def test_huge_json_integer_falls_back_per_field_on_apply(self):
+        defaults = {
+            "latitude": 45.5152,
+            "longitude": -122.6784,
+            "radius_km": 22.0,
+            "heatmap_threshold_km": 40.0,
+            "alert_threshold": 101,
+        }
+        for key, expected in defaults.items():
+            with self.subTest(field=key):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.json"
+                    settings = Store(path)
+                    candidate = deepcopy(settings.data)
+                    candidate.update({
+                        key: 10**400,
+                        "location_name": "Valid setting",
+                        "favorites": [42, "123"],
+                    })
+                    saved = settings.apply(candidate)
+                    self.assertEqual(saved[key], expected)
+                    self.assertEqual(saved["location_name"], "Valid setting")
+                    self.assertEqual(saved["favorites"], [42, 123])
+                    self.assertEqual(Store(path).data, saved)
+
     def test_short_api_key_is_not_hinted(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
@@ -411,6 +458,7 @@ class StoreTest(unittest.TestCase):
             first_in_fsync = threading.Event()
             release_first = threading.Event()
             second_done = threading.Event()
+            second_ready = threading.Event()
             first_thread = None
             errors = []
 
@@ -421,7 +469,9 @@ class StoreTest(unittest.TestCase):
                         raise TimeoutError("timed out waiting to release first save")
                 return real_fsync(fd)
 
-            def apply(candidate, done=None):
+            def apply(candidate, done=None, ready=None):
+                if ready is not None:
+                    ready.set()
                 try:
                     settings.apply(candidate)
                 except BaseException as error:
@@ -431,8 +481,10 @@ class StoreTest(unittest.TestCase):
                         done.set()
 
             first_thread = threading.Thread(target=apply, args=(first_candidate,))
-            second_thread = threading.Thread(target=apply, args=(second_candidate, second_done))
+            second_thread = threading.Thread(
+                target=apply, args=(second_candidate, second_done, second_ready))
             second_started = False
+            second_ready_to_apply = False
             with mock.patch("airloom.store.os.fsync", controlled_fsync):
                 first_thread.start()
                 entered_fsync = first_in_fsync.wait(2)
@@ -440,6 +492,7 @@ class StoreTest(unittest.TestCase):
                 if entered_fsync:
                     second_thread.start()
                     second_started = True
+                    second_ready_to_apply = second_ready.wait(2)
                     second_finished_early = second_done.wait(0.1)
                 release_first.set()
                 first_thread.join(5)
@@ -447,6 +500,7 @@ class StoreTest(unittest.TestCase):
                     second_thread.join(5)
 
             self.assertTrue(entered_fsync, "first apply did not reach fsync")
+            self.assertTrue(second_ready_to_apply, "second apply was not ready to contend")
             self.assertFalse(
                 second_finished_early,
                 "second apply completed while the first save was blocked",

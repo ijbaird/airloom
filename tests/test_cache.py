@@ -241,6 +241,41 @@ class UpsertTest(CacheBase):
         self.assertIsNotNone(touched)
         self.assertEqual(touched.api_time_stamp, 1754680300)
 
+    def test_hostile_ids_do_not_raise_or_alias_an_existing_sqlite_key(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        hostile_ids = (
+            float("nan"), float("inf"), float("-inf"), 10**400,
+            1.5, "1.5", True, False,
+        )
+        for hostile_id in hostile_ids:
+            with self.subTest(sensor_id=hostile_id):
+                self.assertEqual(self.cache.upsert_rows([row(hostile_id, name="Hostile")]), [])
+                stored = self.cache.sensors_in(bounds)
+                self.assertEqual([item["sensor_index"] for item in stored], [1])
+                self.assertEqual(stored[0]["name"], "S1")
+
+    def test_string_ids_are_normalized_at_the_cache_boundary(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.assertEqual(self.cache.upsert_rows([row("2")]), [])
+        stored = self.cache.sensors_in(bounds)
+        self.assertEqual([item["sensor_index"] for item in stored], [2])
+        self.assertIsInstance(stored[0]["sensor_index"], int)
+
+    def test_invalid_coordinates_are_unresolved_and_never_stored(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        invalid_coordinates = (
+            {"latitude": 91}, {"latitude": float("nan")},
+            {"longitude": 181}, {"longitude": float("inf")},
+            {"latitude": 10**400},
+        )
+        for index, override in enumerate(invalid_coordinates, start=10):
+            with self.subTest(override=override):
+                hostile = row(index, **override)
+                self.assertEqual(self.cache.unknown_rows([hostile]), [index])
+                self.assertEqual(self.cache.upsert_rows([hostile]), [index])
+                self.assertEqual(self.cache.sensors_in(bounds), [])
+
 
 class FreshSensorsTest(CacheBase):
     def test_fresh_vs_stale(self):
@@ -558,6 +593,32 @@ class FetchAreaTest(CacheBase):
         self.assertEqual(client.calls[2]["modified_since"], original_stamp)
         self.assertEqual(sorted(r["sensor_index"] for r in result.rows), [1, 2, 3])
 
+    def test_invalid_backfill_coordinates_leave_rows_freshness_and_checkpoint_unchanged(self):
+        original_stamp = 1754680000
+        self.cache.store_fetch(
+            self.bounds, "outdoor", [row(1, humidity=40)], original_stamp)
+        original_region = self.cache.covering_region(self.bounds, "outdoor")
+        original_row = self.cache.sensors_in(self.bounds)
+        original_fetched_at = self.cache._db.execute(
+            "SELECT fetched_at FROM sensors WHERE sensor_index = 1").fetchone()[0]
+        self.clock.now += 300
+        client = FakeClient([
+            FetchResult([
+                {"sensor_index": 1, "last_seen": 1300, "humidity": 60},
+                {"sensor_index": 2, "last_seen": 1300, "pm2.5_cf_1": 9.0},
+            ], 1754680300),
+            FetchResult([row(2, latitude=91, last_seen=1300)], 1754680301),
+        ])
+        with self.assertRaisesRegex(PurpleAirError, "required sensor metadata"):
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual(self.cache.covering_region(self.bounds, "outdoor"), original_region)
+        self.assertEqual(self.cache.sensors_in(self.bounds), original_row)
+        self.assertEqual(
+            self.cache._db.execute(
+                "SELECT fetched_at FROM sensors WHERE sensor_index = 1").fetchone()[0],
+            original_fetched_at,
+        )
+
     def test_repeated_empty_deltas_do_not_delay_metadata_snapshot(self):
         self.cache.store_fetch(self.bounds, "outdoor", [row(1, name="Original")], 1754680000)
         client = FakeClient([
@@ -592,6 +653,47 @@ class FetchAreaTest(CacheBase):
         self.assertEqual(stored[0]["location_type"], 1)
         self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
         self.assertNotIn("modified_since", client.calls[0])
+
+    def test_empty_authoritative_snapshot_removes_recently_refreshed_omitted_sensor(self):
+        self.cache.store_fetch(
+            self.bounds, "outdoor", [row(1, location_type=0)], 1754680000)
+        self.clock.now = 1000 + 12 * 3600
+        self.cache.upsert_rows([{"sensor_index": 1, "last_seen": self.clock.now}])
+        self.clock.now = 1000 + 24 * 3600
+        client = FakeClient([FetchResult([], 1754680300)])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=48 * 3600)
+        self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
+        self.assertNotIn("modified_since", client.calls[0])
+        self.assertEqual(result.rows, [])
+        self.assertEqual(self.cache.sensors_in(self.bounds), [])
+
+    def test_omission_reclassification_preserves_other_filters_and_overlapping_regions(self):
+        outside = Bounds(46.0, -122.6, 45.0, -122.0)
+        self.cache.store_fetch(self.bounds, "outdoor", [
+            row(1, location_type=0),
+            row(2, lat=45.51, location_type=1),
+            row(3, lat=45.51, lon=-122.2, location_type=0),
+        ], 1754680000)
+        self.cache.store_fetch(outside, "outdoor", [
+            row(3, lat=45.51, lon=-122.2, location_type=0),
+        ], 1754680001)
+        self.clock.now = 1000 + 12 * 3600
+        self.cache.upsert_rows([
+            {"sensor_index": sensor_id, "last_seen": self.clock.now}
+            for sensor_id in (1, 2, 3)
+        ])
+        self.clock.now = 1000 + 24 * 3600
+        client = FakeClient([FetchResult([], 1754680300)])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=48 * 3600)
+        self.assertEqual(result.rows, [])
+        remaining = self.cache.sensors_in(Bounds(47.0, -180.0, 44.0, 180.0))
+        self.assertEqual(sorted(item["sensor_index"] for item in remaining), [2, 3])
+        self.assertEqual(
+            [item["sensor_index"] for item in self.cache.sensors_in(outside)
+             if item["location_type"] == 0],
+            [3],
+        )
+        self.assertIsNotNone(self.cache.covering_region(outside, "outdoor"))
 
     def test_overlapping_full_snapshot_preserves_absent_rows_outside_bounds(self):
         left = Bounds(46.0, -123.0, 45.0, -122.4)
@@ -666,3 +768,25 @@ class FetchFavoritesTest(CacheBase):
         client = FakeClient([])
         self.assertEqual(cache.fetch_favorites(client, self.cache, [5], have_ids={5}, ttl=120), [])
         self.assertEqual(client.calls, [])
+
+    def test_hostile_favorite_ids_are_ignored_and_string_ids_are_normalized(self):
+        client = FakeClient([FetchResult([row(2)], 1754680060)])
+        rows = cache.fetch_favorites(
+            client,
+            self.cache,
+            [float("nan"), float("inf"), 10**400, 1.5, True, False, "2"],
+            have_ids=set(),
+            ttl=120,
+        )
+        self.assertEqual(client.calls[0]["show_only"], [2])
+        self.assertEqual([item["sensor_index"] for item in rows], [2])
+        self.assertEqual(list(self.cache.fresh_sensors(["2"], max_age=120)), [2])
+
+    def test_invalid_favorite_backfill_does_not_replace_valid_cached_metadata(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(5, name="Valid")], 1754680000)
+        original = self.cache.sensors_in(bounds)
+        self.clock.now += 300
+        client = FakeClient([FetchResult([row(5, name="Invalid", latitude=91)], 1754680300)])
+        cache.fetch_favorites(client, self.cache, [5], have_ids=set(), ttl=120, force=True)
+        self.assertEqual(self.cache.sensors_in(bounds), original)

@@ -13,6 +13,7 @@ from . import __version__
 from .aqi import aqi_from_pm25, epa_corrected_pm25
 from .geography import Bounds, bounds_around, bounds_contains, split_bounds
 from .models import Sensor
+from .validation import sensor_id
 
 
 API_URL = "https://api.purpleair.com/v1/sensors"
@@ -73,7 +74,8 @@ def cap_bounds(bounds: Bounds, center: tuple[float, float]) -> Bounds:
     request thousands of sensor rows."""
     height_km = (bounds.north - bounds.south) * 111.0
     mid_lat = (bounds.north + bounds.south) / 2
-    width_km = (bounds.east - bounds.west) * 111.0 * max(0.1, math.cos(math.radians(mid_lat)))
+    longitude_span = sum(part.east - part.west for part in split_bounds(bounds))
+    width_km = longitude_span * 111.0 * max(0.1, math.cos(math.radians(mid_lat)))
     if height_km <= MAX_FETCH_SPAN_KM and width_km <= MAX_FETCH_SPAN_KM:
         return bounds
     return bounds_around(center[0], center[1], MAX_FETCH_SPAN_KM / 2)
@@ -105,7 +107,7 @@ class PurpleAirClient:
         if not self.api_key:
             raise PurpleAirError("A PurpleAir read key is required for live data.")
         if show_only:
-            show_only = [i for i in (_sensor_id(value) for value in show_only) if i is not None]
+            show_only = [i for i in (sensor_id(value) for value in show_only) if i is not None]
         if bounds is None and not show_only:
             raise PurpleAirError("A sensor query needs bounds or sensor ids.")
         params: dict[str, str] = {"fields": ",".join(fields)}
@@ -167,11 +169,11 @@ def parse_rows(payload: dict) -> FetchResult:
 def sensor_from_values(values: dict) -> Sensor | None:
     lat = _number(values.get("latitude"))
     lon = _number(values.get("longitude"))
-    sensor_id = _sensor_id(values.get("sensor_index"))
+    normalized_id = sensor_id(values.get("sensor_index"))
     if (
         lat is None
         or lon is None
-        or sensor_id is None
+        or normalized_id is None
         or not -90.0 <= lat <= 90.0
         or not -180.0 <= lon <= 180.0
     ):
@@ -183,8 +185,8 @@ def sensor_from_values(values: dict) -> Sensor | None:
     # because the sensor electronics warm the enclosure.
     ambient_temperature = temperature - 8.0 if temperature is not None else None
     return Sensor(
-        sensor_id=sensor_id,
-        name=str(values.get("name") or f"Sensor {sensor_id}"),
+        sensor_id=normalized_id,
+        name=str(values.get("name") or f"Sensor {normalized_id}"),
         latitude=lat,
         longitude=lon,
         aqi=aqi_from_pm25(corrected_pm),
@@ -258,11 +260,6 @@ def _integer(value) -> int | None:
     ):
         return None
     return int(parsed)
-
-
-def _sensor_id(value) -> int | None:
-    sensor_id = _integer(value)
-    return sensor_id if sensor_id is not None and sensor_id > 0 else None
 
 
 def _rounded(value: float | None) -> float | None:

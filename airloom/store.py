@@ -6,8 +6,9 @@ import os
 import tempfile
 import threading
 from copy import deepcopy
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+from .validation import sensor_id
 
 
 DEFAULT_CONFIG = {
@@ -38,33 +39,16 @@ def _default_config_dir() -> Path:
     return base / "airloom"
 
 
-def sensor_id(value) -> int | None:
-    """Return a positive, signed-64-bit sensor ID, or None for hostile input."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if 0 < value <= 2**63 - 1 else None
-    try:
-        parsed = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    if (
-        not parsed.is_finite()
-        or parsed <= 0
-        or parsed > 2**63 - 1
-        or parsed != parsed.to_integral_value()
-    ):
-        return None
-    return int(parsed)
-
-
 def _sanitize(data: dict) -> dict:
     clean = deepcopy(DEFAULT_CONFIG)
 
     def number(key, low, high):
         value = data.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            value = float(value)
+            try:
+                value = float(value)
+            except OverflowError:
+                return
             if math.isfinite(value) and low <= value <= high:
                 clean[key] = value
 

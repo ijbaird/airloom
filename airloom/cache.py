@@ -19,8 +19,9 @@ from pathlib import Path
 
 from .purpleair import (
     Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, FetchResult,
-    PurpleAirError, _integer,
+    PurpleAirError, _integer, _number,
 )
+from .validation import sensor_id
 
 MAX_REGIONS = 50
 SENSOR_MAX_AGE = 24 * 3600.0
@@ -75,6 +76,19 @@ def _default_cache_dir() -> Path:
 
 class CacheError(RuntimeError):
     """The cache could not be opened without destroying valid data."""
+
+
+def _coordinates(values: dict) -> tuple[float, float] | None:
+    latitude = _number(values.get("latitude"))
+    longitude = _number(values.get("longitude"))
+    if (
+        latitude is None
+        or longitude is None
+        or not -90.0 <= latitude <= 90.0
+        or not -180.0 <= longitude <= 180.0
+    ):
+        return None
+    return latitude, longitude
 
 
 class SensorCache:
@@ -166,40 +180,41 @@ class SensorCache:
             order: list[int] = []
             merged_by_id: dict[int, dict] = {}
             for values in rows:
-                sensor_id = values.get("sensor_index")
-                if not isinstance(sensor_id, (int, float)):
+                normalized_id = sensor_id(values.get("sensor_index"))
+                if normalized_id is None:
                     continue
-                sensor_id = int(sensor_id)
-                if sensor_id not in merged_by_id:
-                    order.append(sensor_id)
+                if normalized_id not in merged_by_id:
+                    order.append(normalized_id)
                     cursor = self._db.execute(
-                        "SELECT data FROM sensors WHERE sensor_index = ?", (sensor_id,))
+                        "SELECT data FROM sensors WHERE sensor_index = ?", (normalized_id,))
                     existing = cursor.fetchone()
-                    merged_by_id[sensor_id] = dict(json.loads(existing[0])) if existing else {}
-                merged_by_id[sensor_id].update(values)
+                    merged_by_id[normalized_id] = dict(json.loads(existing[0])) if existing else {}
+                merged_by_id[normalized_id].update(values)
+                merged_by_id[normalized_id]["sensor_index"] = normalized_id
             return [
-                sensor_id for sensor_id in order
-                if not isinstance(merged_by_id[sensor_id].get("latitude"), (int, float))
-                or not isinstance(merged_by_id[sensor_id].get("longitude"), (int, float))
+                normalized_id for normalized_id in order
+                if _coordinates(merged_by_id[normalized_id]) is None
             ]
 
     def _upsert_locked(self, rows: list[dict]) -> list[int]:
         now = self.clock()
         unknown: list[int] = []
         for values in rows:
-            sensor_id = values.get("sensor_index")
-            if not isinstance(sensor_id, (int, float)):
+            normalized_id = sensor_id(values.get("sensor_index"))
+            if normalized_id is None:
                 continue
-            sensor_id = int(sensor_id)
             cursor = self._db.execute(
-                "SELECT data, observed_at FROM sensors WHERE sensor_index = ?", (sensor_id,))
+                "SELECT data, observed_at FROM sensors WHERE sensor_index = ?", (normalized_id,))
             existing = cursor.fetchone()
             merged = dict(json.loads(existing[0])) if existing else {}
             merged.update(values)
-            lat, lon = merged.get("latitude"), merged.get("longitude")
-            if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
-                unknown.append(sensor_id)
+            merged["sensor_index"] = normalized_id
+            coordinates = _coordinates(merged)
+            if coordinates is None:
+                unknown.append(normalized_id)
                 continue
+            lat, lon = coordinates
+            merged["latitude"], merged["longitude"] = lat, lon
             last_seen = _integer(merged.get("last_seen"))
             observed_at = (
                 float(last_seen) if last_seen is not None
@@ -211,15 +226,39 @@ class SensorCache:
                 " latitude = excluded.latitude, longitude = excluded.longitude,"
                 " data = excluded.data, fetched_at = excluded.fetched_at,"
                 " observed_at = excluded.observed_at",
-                (sensor_id, float(lat), float(lon), json.dumps(merged), now, observed_at),
+                (normalized_id, lat, lon, json.dumps(merged), now, observed_at),
             )
         return unknown
+
+    def _reconcile_locked(self, bounds: Bounds, location_filter: str,
+                          rows: list[dict]) -> None:
+        """Apply an authoritative snapshot's absence only to its own query scope."""
+        present = {
+            normalized for values in rows
+            if (normalized := sensor_id(values.get("sensor_index"))) is not None
+        }
+        candidates: dict[int, dict] = {}
+        for part in split_bounds(bounds):
+            cursor = self._db.execute(
+                "SELECT sensor_index, data FROM sensors WHERE latitude BETWEEN ? AND ?"
+                " AND longitude BETWEEN ? AND ?",
+                (part.south, part.north, part.west, part.east),
+            )
+            for sensor_index, data in cursor:
+                values = json.loads(data)
+                if sensor_index not in present and _matches_filter(values, location_filter):
+                    candidates[sensor_index] = values
+        self._db.executemany(
+            "DELETE FROM sensors WHERE sensor_index = ?",
+            ((sensor_index,) for sensor_index in candidates),
+        )
 
     def store_fetch(self, bounds: Bounds, location_filter: str,
                     rows: list[dict], api_time_stamp: int | None) -> None:
         with self._lock:
             try:
                 self._upsert_locked(rows)
+                self._reconcile_locked(bounds, location_filter, rows)
                 now = self.clock()
                 cursor = self._db.execute(
                     "INSERT INTO regions (north, west, south, east, location_filter,"
@@ -288,7 +327,7 @@ class SensorCache:
             return list(rows_by_id.values())
 
     def fresh_sensors(self, ids, max_age: float) -> dict[int, dict]:
-        wanted = [int(i) for i in ids]
+        wanted = [normalized for value in ids if (normalized := sensor_id(value)) is not None]
         if not wanted:
             return {}
         with self._lock:
@@ -369,11 +408,11 @@ def _fetch_rows(client, bounds: Bounds, **kwargs) -> FetchResult:
         result = client.fetch_rows(bounds=part, **kwargs)
         stamps.append(result.time_stamp)
         for values in result.rows:
-            sensor_id = _integer(values.get("sensor_index"))
-            if sensor_id is None:
+            normalized_id = sensor_id(values.get("sensor_index"))
+            if normalized_id is None:
                 unkeyed.append(values)
             else:
-                rows_by_id[sensor_id] = values
+                rows_by_id[normalized_id] = values
     time_stamp = min(stamps) if stamps and all(stamp is not None for stamp in stamps) else None
     return FetchResult([*rows_by_id.values(), *unkeyed], time_stamp)
 
@@ -430,7 +469,13 @@ def fetch_favorites(client, cache: SensorCache, favorite_ids, have_ids,
     """Rows for favorites not already in `have_ids`: cached-fresh ones for free,
     one show_only batch for the rest."""
     cache.prune()
-    missing = [int(i) for i in favorite_ids if int(i) not in have_ids]
+    normalized_have = {
+        normalized for value in have_ids if (normalized := sensor_id(value)) is not None
+    }
+    missing = [
+        normalized for value in favorite_ids
+        if (normalized := sensor_id(value)) is not None and normalized not in normalized_have
+    ]
     if not missing:
         return []
     cached = {} if force else cache.fresh_sensors(missing, ttl)
