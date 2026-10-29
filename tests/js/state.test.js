@@ -1302,3 +1302,30 @@ test("an older trend request cannot overwrite newer explicit state", () => {
   });
   assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
 });
+
+test("a newer empty publication preserves an exhausted retry budget", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  receiveSensors(app, [fixtureSensor(1, {
+    last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  })], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 1, status: "error", reading_last_seen: 100, trend: [] });
+  const retry = app.elements.get("trend-retry");
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    retry.click();
+    app.context.Airloom.receive("trend", { sensor_id: 1, request_id: attempt + 1, status: "error", reading_last_seen: 100, trend: [] });
+  }
+  assert.equal(retry.disabled, true);
+
+  receiveSensors(app, [fixtureSensor(1, { aqi: 90, last_seen: 200, trend: [] })], { config: { has_api_key: true } });
+  assert.match(app.elements.get("chart").innerHTML, /Trend not loaded/);
+  assert.equal(retry.hidden, true);
+
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 5, status: "error", reading_last_seen: 200, trend: [] });
+  assert.equal(retry.hidden, false);
+  assert.equal(retry.disabled, true);
+  assert.equal(retry.textContent, "Retry limit reached");
+  retry.click();
+  assert.equal(app.messages.filter((message) => message.action === "select" && message.id === 1).length, 3);
+});

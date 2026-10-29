@@ -213,7 +213,7 @@
     if (inlineSuccess) {
       state.trends.set(sensor.id, { status: "loaded", trend: sensor.trend, retries: 0, readingLastSeen, requestId: 0, source: "inline" });
     } else if (!previous || readingLastSeen > previous.readingLastSeen) {
-      state.trends.set(sensor.id, { status: "idle", trend: [], retries: 0, readingLastSeen, requestId: 0, source: "publication" });
+      state.trends.set(sensor.id, { status: "idle", trend: [], retries: previous?.retries ?? 0, readingLastSeen, requestId: 0, source: "publication" });
     }
   }
 
@@ -495,8 +495,7 @@
     let status = payload.status;
     const trend = Array.isArray(payload.trend) ? payload.trend : [];
     if (status === "loaded" && !trend.some((point) => Number.isFinite(point.aqi))) status = "unavailable";
-    const newReading = !previous || readingLastSeen > previous.readingLastSeen;
-    const retries = newReading || status === "loaded" || status === "unavailable" ? 0 : previous.retries;
+    const retries = status === "loaded" ? 0 : (previous?.retries ?? 0);
     state.trends.set(sensorId, { status, trend, retries, readingLastSeen, requestId, source: "event" });
     if (status === "loaded") sensor.trend = trend;
     if (sensorId === state.selectedId) renderDetail();
