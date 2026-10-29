@@ -196,6 +196,27 @@
     }
   }
 
+  function readingVersion(value) {
+    const timestamp = Number(value);
+    return Number.isFinite(timestamp) ? timestamp : 0;
+  }
+
+  function syncTrendWithSensor(sensor) {
+    const previous = state.trends.get(sensor.id);
+    const readingLastSeen = readingVersion(sensor.last_seen);
+    // An explicit event is authoritative for its reading. Only a genuinely
+    // newer sensor publication may replace it with inline data or idle state.
+    if (previous && readingLastSeen <= previous.readingLastSeen) {
+      if (previous.source === "event" || readingLastSeen < previous.readingLastSeen) return;
+    }
+    const inlineSuccess = Array.isArray(sensor.trend) && sensor.trend.some((point) => Number.isFinite(point.aqi));
+    if (inlineSuccess) {
+      state.trends.set(sensor.id, { status: "loaded", trend: sensor.trend, retries: 0, readingLastSeen, requestId: 0, source: "inline" });
+    } else if (!previous || readingLastSeen > previous.readingLastSeen) {
+      state.trends.set(sensor.id, { status: "idle", trend: [], retries: 0, readingLastSeen, requestId: 0, source: "publication" });
+    }
+  }
+
   function applySensors(payload) {
     const area = Array.isArray(payload.area) ? payload.area : (payload.items || []);
     const favorites = Array.isArray(payload.favorites) ? payload.favorites : [];
@@ -212,11 +233,7 @@
     state.source = payload.source || "Demo data";
     state.stale = payload.stale;
     state.config = { ...state.config, ...(payload.config || {}) };
-    for (const sensor of state.sensors) {
-      if (Array.isArray(sensor.trend) && sensor.trend.length) {
-        state.trends.set(sensor.id, { status: "loaded", trend: sensor.trend, retries: 0 });
-      }
-    }
+    for (const sensor of state.sensors) syncTrendWithSensor(sensor);
     stampPlaceName();
     applyInterfaceScale();
     $("#data-source").textContent = state.source;
@@ -464,15 +481,24 @@
 
   function applyTrend(payload) {
     const sensorId = Number(payload.sensor_id);
-    if (!Number.isInteger(sensorId) || !["idle", "loading", "loaded", "unavailable", "error"].includes(payload.status)) return;
-    const previous = state.trends.get(sensorId) || { retries: 0 };
+    const requestId = Number(payload.request_id);
+    if (!Number.isInteger(sensorId) || !Number.isInteger(requestId) || payload.reading_last_seen === undefined || !["idle", "loading", "loaded", "unavailable", "error"].includes(payload.status)) return;
+    const sensor = state.sensors.find((item) => item.id === sensorId);
+    if (!sensor) return;
+    const readingLastSeen = readingVersion(payload.reading_last_seen);
+    if (readingLastSeen !== readingVersion(sensor.last_seen)) return;
+    const previous = state.trends.get(sensorId);
+    if (previous) {
+      if (readingLastSeen < previous.readingLastSeen) return;
+      if (readingLastSeen === previous.readingLastSeen && previous.source === "event" && requestId < previous.requestId) return;
+    }
     let status = payload.status;
     const trend = Array.isArray(payload.trend) ? payload.trend : [];
     if (status === "loaded" && !trend.some((point) => Number.isFinite(point.aqi))) status = "unavailable";
-    const retries = status === "loaded" || status === "unavailable" ? 0 : previous.retries;
-    state.trends.set(sensorId, { status, trend, retries });
-    const sensor = state.sensors.find((item) => item.id === sensorId);
-    if (sensor && status === "loaded") sensor.trend = trend;
+    const newReading = !previous || readingLastSeen > previous.readingLastSeen;
+    const retries = newReading || status === "loaded" || status === "unavailable" ? 0 : previous.retries;
+    state.trends.set(sensorId, { status, trend, retries, readingLastSeen, requestId, source: "event" });
+    if (status === "loaded") sensor.trend = trend;
     if (sensorId === state.selectedId) renderDetail();
   }
 
@@ -481,6 +507,7 @@
     const trend = state.trends.get(sensorId);
     if (!trend || trend.status !== "error" || trend.retries >= 3) return;
     trend.retries++;
+    trend.requestId++;
     trend.status = "loading";
     if (desktopMode) bridge({ action: "select", id: sensorId });
     renderDetail();

@@ -1010,9 +1010,9 @@ test("closing Preferences invalidates pending home search responses", () => {
 test("trend unavailable is terminal instead of indefinite loading", () => {
   const app = loadApp();
   configureMap(app, { has_api_key: true });
-  receiveSensors(app, [fixtureSensor(1)], { config: { has_api_key: true } });
+  receiveSensors(app, [fixtureSensor(1, { last_seen: 100 })], { config: { has_api_key: true } });
 
-  app.context.Airloom.receive("trend", { sensor_id: 1, status: "unavailable", trend: [] });
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 1, status: "unavailable", reading_last_seen: 100, trend: [] });
 
   assert.match(app.elements.get("chart").innerHTML, /Trend unavailable/);
   assert.doesNotMatch(app.elements.get("chart").innerHTML, /Loading trend/);
@@ -1022,11 +1022,13 @@ test("trend unavailable is terminal instead of indefinite loading", () => {
 test("trend loaded renders its rolling-average points", () => {
   const app = loadApp();
   configureMap(app, { has_api_key: true });
-  receiveSensors(app, [fixtureSensor(1)], { config: { has_api_key: true } });
+  receiveSensors(app, [fixtureSensor(1, { last_seen: 100 })], { config: { has_api_key: true } });
 
   app.context.Airloom.receive("trend", {
     sensor_id: 1,
+    request_id: 1,
     status: "loaded",
+    reading_last_seen: 100,
     trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
   });
 
@@ -1037,8 +1039,8 @@ test("trend loaded renders its rolling-average points", () => {
 test("trend errors allow at most three manual retries", () => {
   const app = loadApp();
   configureMap(app, { has_api_key: true });
-  receiveSensors(app, [fixtureSensor(1)], { config: { has_api_key: true } });
-  app.context.Airloom.receive("trend", { sensor_id: 1, status: "error", trend: [] });
+  receiveSensors(app, [fixtureSensor(1, { last_seen: 100 })], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 1, status: "error", reading_last_seen: 100, trend: [] });
   const retry = app.elements.get("trend-retry");
   assert.ok(retry, "an error should expose a manual retry control");
   assert.equal(retry.hidden, false);
@@ -1046,7 +1048,7 @@ test("trend errors allow at most three manual retries", () => {
   for (let attempt = 1; attempt <= 3; attempt++) {
     retry.click();
     assert.equal(app.messages.filter((message) => message.action === "select" && message.id === 1).length, attempt);
-    app.context.Airloom.receive("trend", { sensor_id: 1, status: "error", trend: [] });
+    app.context.Airloom.receive("trend", { sensor_id: 1, request_id: attempt + 1, status: "error", reading_last_seen: 100, trend: [] });
   }
   assert.equal(retry.disabled, true);
   retry.click();
@@ -1057,13 +1059,13 @@ test("trend errors allow at most three manual retries", () => {
 test("rolling-average charts name the actual current comparison", () => {
   const app = loadApp();
   configureMap(app);
-  receiveSensors(app, [fixtureSensor(1, { trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }] })]);
+  receiveSensors(app, [fixtureSensor(1, { last_seen: 100, trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }] })]);
   const period = app.elements.get("chart-period");
   assert.ok(period, "the chart should expose its comparison label");
   assert.equal(period.textContent, "Current vs 1-week average");
   assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
 
-  receiveSensors(app, [fixtureSensor(1, { trend: [{ label: "1d", aqi: 30 }, { label: "Now", aqi: 28 }] })]);
+  receiveSensors(app, [fixtureSensor(1, { last_seen: 200, trend: [{ label: "1d", aqi: 30 }, { label: "Now", aqi: 28 }] })]);
   assert.equal(app.elements.get("chart-period").textContent, "Current vs 1-day average");
   assert.equal(app.elements.get("trend-direction").textContent, "Holding steady");
 });
@@ -1157,4 +1159,146 @@ test("preview demo Now point equals the displayed current AQI", () => {
 
   assert.equal(app.elements.get("aqi-number").textContent, "34");
   assert.equal(app.elements.get("trend-direction").textContent, "Down 9 points");
+});
+
+test("a newer empty reading invalidates a loaded trend and rejects its late events", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  receiveSensors(app, [fixtureSensor(1, {
+    aqi: 48,
+    last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  })], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: 1,
+    status: "loaded",
+    reading_last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+
+  receiveSensors(app, [fixtureSensor(1, { aqi: 90, last_seen: 200, trend: [] })], { config: { has_api_key: true } });
+
+  assert.equal(app.elements.get("aqi-number").textContent, "90");
+  assert.match(app.elements.get("chart").innerHTML, /Trend not loaded/);
+  assert.equal(app.elements.get("trend-direction").textContent, "—");
+  assert.equal(app.elements.get("chart-period").textContent, "Rolling averages");
+
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: 2,
+    status: "loaded",
+    reading_last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+  assert.match(app.elements.get("chart").innerHTML, /Trend not loaded/);
+  assert.equal(app.elements.get("trend-direction").textContent, "—");
+});
+
+test("same-reading inline arrays cannot replace an explicit loaded event", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  const publication = () => fixtureSensor(1, {
+    aqi: 48,
+    last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 45 }],
+  });
+  receiveSensors(app, [publication()], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: 1,
+    status: "loaded",
+    reading_last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+
+  receiveSensors(app, [publication()], { config: { has_api_key: true } });
+
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+  assert.equal(app.elements.get("chart-period").textContent, "Current vs 1-week average");
+});
+
+test("same-reading inline arrays cannot erase unavailable", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  const publication = fixtureSensor(1, {
+    last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+  receiveSensors(app, [publication], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 1, status: "unavailable", reading_last_seen: 100, trend: [] });
+
+  receiveSensors(app, [publication], { config: { has_api_key: true } });
+
+  assert.match(app.elements.get("chart").innerHTML, /Trend unavailable/);
+  assert.doesNotMatch(app.elements.get("chart").innerHTML, /<svg/);
+  assert.equal(app.elements.get("trend-direction").textContent, "—");
+  assert.equal(app.elements.get("trend-retry").hidden, true);
+});
+
+test("same-reading publications preserve retries and only newer success resets them", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  const publication = fixtureSensor(1, {
+    aqi: 48,
+    last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+  receiveSensors(app, [publication], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 1, status: "error", reading_last_seen: 100, trend: [] });
+  const retry = app.elements.get("trend-retry");
+
+  receiveSensors(app, [publication], { config: { has_api_key: true } });
+  assert.equal(retry.hidden, false);
+  assert.match(app.elements.get("chart").innerHTML, /Trend unavailable/);
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    retry.click();
+    assert.equal(app.messages.filter((message) => message.action === "select" && message.id === 1).length, attempt);
+    receiveSensors(app, [publication], { config: { has_api_key: true } });
+    assert.match(app.elements.get("chart").innerHTML, /Loading trend/);
+    assert.equal(retry.hidden, true);
+
+    app.context.Airloom.receive("trend", { sensor_id: 1, request_id: attempt + 1, status: "error", reading_last_seen: 100, trend: [] });
+    receiveSensors(app, [publication], { config: { has_api_key: true } });
+    assert.match(app.elements.get("chart").innerHTML, /Trend unavailable/);
+    assert.equal(retry.hidden, false);
+    assert.equal(retry.disabled, attempt === 3);
+  }
+
+  receiveSensors(app, [fixtureSensor(1, {
+    aqi: 90,
+    last_seen: 200,
+    trend: [{ label: "1w", aqi: 80 }, { label: "Now", aqi: 90 }],
+  })], { config: { has_api_key: true } });
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 10 points");
+  assert.equal(retry.hidden, true);
+
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 5, status: "error", reading_last_seen: 200, trend: [] });
+  assert.equal(retry.disabled, false);
+  retry.click();
+  assert.equal(app.messages.filter((message) => message.action === "select" && message.id === 1).length, 4);
+});
+
+test("an older trend request cannot overwrite newer explicit state", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  receiveSensors(app, [fixtureSensor(1, { last_seen: 100 })], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 2, status: "loading", reading_last_seen: 100, trend: [] });
+
+  app.context.Airloom.receive("trend", { sensor_id: 1, request_id: 1, status: "error", reading_last_seen: 100, trend: [] });
+
+  assert.match(app.elements.get("chart").innerHTML, /Loading trend/);
+  assert.equal(app.elements.get("trend-retry").hidden, true);
+
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: 3,
+    status: "loaded",
+    reading_last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
 });
