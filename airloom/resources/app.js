@@ -7,6 +7,7 @@
     areaSensors: [],
     favoriteSensors: null,
     coverage: null,
+    fetchedBounds: null,
     selectedId: null,
     previewHidden: [],
     config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", interface_scale: 1, hidden: [] },
@@ -217,6 +218,25 @@
     }
   }
 
+  function publicationBounds(payload) {
+    const candidates = [payload.coverage?.bounds, payload.fetch_bounds, payload.bounds, payload.coverage];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== "object") continue;
+      const bounds = {
+        north: candidate.north, west: candidate.west,
+        south: candidate.south, east: candidate.east,
+      };
+      try {
+        AirloomCore.splitBounds(bounds);
+        return bounds;
+      } catch {
+        // A payload without geographic coverage cannot supersede the last
+        // successfully fetched region.
+      }
+    }
+    return null;
+  }
+
   function applySensors(payload) {
     const area = Array.isArray(payload.area) ? payload.area : (payload.items || []);
     const favorites = Array.isArray(payload.favorites) ? payload.favorites : [];
@@ -229,6 +249,7 @@
     state.areaSensors = Array.isArray(payload.area) ? area : state.sensors;
     state.favoriteSensors = Array.isArray(payload.favorites) ? favorites : null;
     state.coverage = payload.coverage || null;
+    state.fetchedBounds = publicationBounds(payload) || state.fetchedBounds;
     state.selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
     state.source = payload.source || "Demo data";
     state.stale = payload.stale;
@@ -249,30 +270,47 @@
     renderDetail();
   }
 
-  function hasLimitedCoverage() {
-    return state.coverage?.capped === true || state.coverage?.complete === false;
+  function hasLimitedCoverage(view = mapViewport()) {
+    if (state.coverage?.capped === true || state.coverage?.complete === false) return true;
+    if (!state.fetchedBounds || !view.width) return false;
+    return !AirloomCore.boundsContain(state.fetchedBounds, geographicBounds(view));
   }
 
   function summaryTitle(base) {
     return hasLimitedCoverage() ? `${base} · Limited coverage` : base;
   }
 
-  function renderProvenance() {
+  function stampProvenance(id, label) {
+    const element = $(`#${id}`);
+    element.hidden = !label;
+    element.textContent = label;
+  }
+
+  function summaryProvenanceLabel() {
     const source = (state.source || "").toLowerCase();
     const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
-    let label = "";
-    if (source.includes("demo") || state.areaSensors.some((sensor) => sensor.origin === "demo")) label = "Demo data";
-    else if (state.stale === true || legacyStale) label = "Stale cached data";
-    else if (source.includes("cached") || state.areaSensors.some((sensor) => sensor.delivery === "cache")) label = "Cached data";
-    for (const id of ["summary-provenance", "detail-provenance"]) {
-      const element = $(`#${id}`);
-      element.hidden = !label;
-      element.textContent = label;
-    }
+    if (source.includes("demo") || state.areaSensors.some((sensor) => sensor.origin === "demo")) return "Demo data";
+    if (state.stale === true || legacyStale) return "Stale cached data";
+    if (source.includes("cached") || state.areaSensors.some((sensor) => sensor.delivery === "cache")) return "Cached data";
+    return "";
+  }
+
+  function detailProvenanceLabel(sensor) {
+    if (!sensor) return "";
+    if (sensor.origin === "demo") return "Demo data";
+    if (sensor.stale === true) return "Stale cached data";
+    if (sensor.remote_favorite === true) return sensor.delivery === "cache" ? "Cached data" : "";
+
+    const source = (state.source || "").toLowerCase();
+    const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
+    if (source.includes("demo")) return "Demo data";
+    if (state.stale === true || legacyStale) return "Stale cached data";
+    if (sensor.delivery === "cache" || source.includes("cached")) return "Cached data";
+    return "";
   }
 
   function renderSummary(view = mapViewport()) {
-    renderProvenance();
+    stampProvenance("summary-provenance", summaryProvenanceLabel());
     const limited = hasLimitedCoverage();
     $("#coverage-status").hidden = !limited;
     $("#coverage-status").textContent = limited ? "Limited coverage" : "";
@@ -458,6 +496,7 @@
 
   function renderDetail() {
     const sensor = selectedSensor();
+    stampProvenance("detail-provenance", detailProvenanceLabel(sensor));
     if (!sensor) {
       hideDetail();
       return;
@@ -1001,6 +1040,10 @@
     const from = { ...state.center };
     const targetLon = AirloomCore.nearestLongitude(lon, from.lon);
     clearTimeout(pinchSettleTimer);
+    // A flight supersedes the whole active pinch, not only its zoom animation.
+    // Late change/end events from that gesture must not start another zoom.
+    pinch = null;
+    nativePinchStartZoom = null;
     cancelZoomAnimation();
     const token = navigation.begin("fly");
     if (prefersReducedMotion() || durationMs <= 0) {
@@ -1190,6 +1233,7 @@
         }
       }
       box.hidden = true;
+      if (button.dataset.kind === "place") $("#search").focus();
     }));
   }
 
@@ -1207,6 +1251,7 @@
       $("#home-place-status").textContent = `Fixed: ${place.name}`;
       box.hidden = true;
       invalidatePlaceSearch("home");
+      $("#home-place-input").focus();
     }));
   }
 

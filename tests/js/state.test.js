@@ -9,6 +9,33 @@ const vm = require("node:vm");
 const indexPath = require.resolve("../../airloom/resources/index.html");
 const cssPath = require.resolve("../../airloom/resources/app.css");
 
+function cssDeclaration(selector, property, { narrow = false } = {}) {
+  const css = fs.readFileSync(cssPath, "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  const base = css.split("@media")[0];
+  const narrowCss = css.split("@media (max-width: 640px) {")[1]?.split("@media (prefers-color-scheme:")[0] || "";
+  const sources = narrow ? [narrowCss, base] : [base];
+  const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const source of sources) {
+    for (const match of source.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const selectors = match[1].split(",").map((value) => value.trim());
+      if (!selectors.includes(selector)) continue;
+      const declaration = match[2].match(new RegExp(`(?:^|;)\\s*${escape(property)}\\s*:\\s*([^;]+)`));
+      if (declaration) return declaration[1].trim();
+    }
+  }
+  return null;
+}
+
+function computedCssPixels(selector, property, scale, options = {}) {
+  const value = cssDeclaration(selector, property, options);
+  assert.ok(value, `${selector} must declare ${property}`);
+  const scaled = value.match(/^calc\(\s*(-?[\d.]+)px\s*\*\s*var\(--interface-scale\)\s*\)$/);
+  if (scaled) return Number(scaled[1]) * scale;
+  const fixed = value.match(/^(-?[\d.]+)px$/);
+  assert.ok(fixed, `${selector} ${property} must resolve to pixels; got ${value}`);
+  return Number(fixed[1]);
+}
+
 function createGate() {
   const { NavigationGate } = require("../../airloom/resources/state.js");
   return new NavigationGate();
@@ -462,6 +489,48 @@ test("native pinch cancels an in-flight recenter", () => {
   assertCenter(app, expected);
 });
 
+test("flight invalidates active DOM pinch changes and end settlement", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.document.dispatch("gesturestart", { clientX: 256, clientY: 256 });
+  app.document.dispatch("gesturechange", { clientX: 256, clientY: 256, scale: 2 });
+  app.context.Airloom.receive("location", {
+    latitude: 10,
+    longitude: 20,
+    name: "Flight target",
+    source: "fixed",
+  });
+  const flightZoom = app.context.Airloom.debugState().zoom;
+
+  app.document.dispatch("gesturechange", { clientX: 256, clientY: 256, scale: 8 });
+  app.document.dispatch("gestureend", { clientX: 256, clientY: 256 });
+  app.runAnimationFrames(600);
+
+  assertCenter(app, { lat: 10, lon: 20 });
+  assert.equal(app.context.Airloom.debugState().zoom, flightZoom);
+});
+
+test("flight invalidates active native pinch changes and end settlement", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.context.Airloom.receive("pinch", { phase: "begin", x: 256, y: 256 });
+  app.context.Airloom.receive("pinch", { phase: "change", x: 256, y: 256, scale: 2 });
+  app.context.Airloom.receive("location", {
+    latitude: 10,
+    longitude: 20,
+    name: "Flight target",
+    source: "fixed",
+  });
+  const flightZoom = app.context.Airloom.debugState().zoom;
+
+  app.context.Airloom.receive("pinch", { phase: "change", x: 256, y: 256, scale: 8 });
+  app.context.Airloom.receive("pinch", { phase: "end", x: 256, y: 256 });
+  app.runAnimationFrames(600);
+
+  assertCenter(app, { lat: 10, lon: 20 });
+  assert.equal(app.context.Airloom.debugState().zoom, flightZoom);
+});
+
 test("a new flight supersedes pending zoom animation", () => {
   const app = loadApp();
   configureMap(app);
@@ -735,6 +804,32 @@ test("interface scale config updates the root scale hook without page zoom", () 
   assert.equal(app.context.Airloom.debugState().viewportScale, null);
 });
 
+test("interface scale changes computed sensor, AQI, chart, preference, and control sizes", () => {
+  const cases = [
+    [".sensor-copy strong", "font-size", 13],
+    [".sensor-copy small", "font-size", 10],
+    [".aqi-number", "font-size", 70],
+    [".chart-heading span", "font-size", 10],
+    [".form-grid > label:not(.checkbox)", "font-size", 11],
+    [".form-grid input[type=\"text\"]", "height", 39],
+    [".form-grid select", "height", 39],
+    [".map-controls button", "height", 38],
+    [".dialog-actions button", "height", 38],
+  ];
+  for (const scale of [1, 1.25, 1.5]) {
+    for (const [selector, property, baseline] of cases) {
+      assert.equal(computedCssPixels(selector, property, scale), baseline * scale, `${selector} ${property} at ${scale}x`);
+    }
+    assert.equal(computedCssPixels(".tile", "width", scale), 256, "tile width must stay in map coordinates");
+    assert.equal(computedCssPixels(".tile", "height", scale), 256, "tile height must stay in map coordinates");
+  }
+});
+
+test("scaled preference selects retain visible keyboard focus", () => {
+  assert.ok(cssDeclaration("select:focus-visible", "outline"));
+  assert.ok(cssDeclaration(".form-grid select:focus", "box-shadow"));
+});
+
 test("popup placement clamps horizontally and flips below near the viewport top", () => {
   const app = loadApp();
   configureMap(app, { heatmap_threshold_km: 1000 });
@@ -764,11 +859,15 @@ test("search overlay stacks above ordinary sensor and detail panels", () => {
   assert.ok(searchZ > detailZ, `search z-index ${searchZ} must exceed ${detailZ}`);
 });
 
-test("narrow layout stacks summary below a full-width top search", () => {
+test("narrow layout computes scaled top controls below a full-width search", () => {
   const css = fs.readFileSync(cssPath, "utf8");
   const narrow = css.split("@media (max-width: 640px) {")[1]?.split("@media (prefers-color-scheme:")[0] || "";
   assert.match(narrow, /\.search-overlay\s*\{[^}]*width:\s*calc\(100vw - 20px\)/);
-  assert.match(narrow, /\.summary-chip\s*\{[^}]*top:\s*64px;[^}]*left:\s*10px;[^}]*right:\s*auto;/);
+  for (const scale of [1, 1.25, 1.5]) {
+    assert.equal(computedCssPixels(".summary-chip", "top", scale, { narrow: true }), 64 * scale);
+    assert.equal(computedCssPixels(".summary-chip .summary-score", "height", scale, { narrow: true }), 40 * scale);
+    assert.equal(computedCssPixels(".search-pill svg", "width", scale, { narrow: true }), 17 * scale);
+  }
 });
 
 test("demo and coverage provenance remain visible near AQI", () => {
@@ -791,6 +890,50 @@ test("demo and coverage provenance remain visible near AQI", () => {
   assert.equal(app.elements.get("coverage-status").hidden, false);
   receiveSensors(app, [fixtureSensor(1)], { coverage: { capped: false, complete: true } });
   assert.equal(app.elements.get("coverage-status").hidden, true);
+});
+
+test("selecting a demo favorite does not inherit the live area summary provenance", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { origin: "live", delivery: "network" })],
+    favorites: [fixtureSensor(2, { origin: "demo", delivery: "network", favorite: true })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    stale: false,
+  });
+  const summary = app.elements.get("summary-provenance");
+  const detail = app.elements.get("detail-provenance");
+  assert.equal(summary.hidden, true);
+  assert.equal(detail.hidden, true);
+
+  app.elements.get("favorites-list").querySelectorAll(".sensor-row")[0].click();
+
+  assert.equal(summary.hidden, true, "a remote favorite must not change the area summary label");
+  assert.equal(detail.hidden, false);
+  assert.equal(detail.textContent, "Demo data");
+});
+
+test("mixed stale area and cached favorite publications retain their own provenance", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { origin: "live", delivery: "cache" })],
+    favorites: [fixtureSensor(2, { origin: "live", delivery: "cache", favorite: true })],
+    selected_id: 2,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+  const summary = app.elements.get("summary-provenance");
+  const detail = app.elements.get("detail-provenance");
+  assert.equal(summary.textContent, "Stale cached data");
+  assert.equal(detail.textContent, "Cached data", "area stale metadata must not relabel a separate favorite fetch");
+
+  app.elements.get("sensor-list").querySelectorAll(".sensor-row")[0].click();
+  assert.equal(summary.textContent, "Stale cached data");
+  assert.equal(detail.textContent, "Stale cached data", "selecting the area reading applies the area stale metadata");
 });
 
 test("actual legacy cached fallback payload is labeled stale", () => {
@@ -980,6 +1123,54 @@ test("a place response with the wrong context is ignored", () => {
   });
   assert.equal(results.hidden, false);
   assert.match(results.innerHTML, /Main Portland/);
+});
+
+test("main place selection hides results and restores focus to search", () => {
+  const app = loadApp();
+  configureMap(app);
+  const search = app.elements.get("search");
+  search.value = "Paris";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+  app.context.Airloom.receive("places", {
+    request_id: 1,
+    context: "main",
+    query: "Paris",
+    results: [{ name: "Paris, France", latitude: 48.85, longitude: 2.35 }],
+  });
+  const results = app.elements.get("search-results");
+  const place = results.querySelectorAll("button")[0];
+  place.focus();
+
+  place.click();
+
+  assert.equal(results.hidden, true);
+  assert.equal(app.document.activeElement, search);
+});
+
+test("home place selection hides results and restores focus to its search input", () => {
+  const app = loadApp();
+  configureMap(app);
+  openSettings(app, { home_mode: "fixed" });
+  const input = app.elements.get("home-place-input");
+  input.value = "Paris";
+  input.dispatch("input", { target: input });
+  input.dispatch("keydown", { key: "Enter" });
+  app.context.Airloom.receive("places", {
+    request_id: 1,
+    context: "home",
+    query: "Paris",
+    results: [{ name: "Paris, France", latitude: 48.85, longitude: 2.35 }],
+  });
+  const results = app.elements.get("home-place-results");
+  const place = results.querySelectorAll("button")[0];
+  place.focus();
+
+  place.click();
+
+  assert.equal(results.hidden, true);
+  assert.equal(app.document.activeElement, input);
+  assert.equal(app.elements.get("settings-form").elements.home_lat.value, 48.85);
 });
 
 test("closing Preferences invalidates pending home search responses", () => {

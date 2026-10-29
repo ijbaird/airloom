@@ -23,6 +23,17 @@ test("splitBounds returns noncrossing bounds as one piece", () => {
   assert.deepEqual(AirloomCore.splitBounds(bounds), [bounds]);
 });
 
+test("boundsContain compares crossing and full-world geographic coverage", () => {
+  const crossing = { north: 20, west: 170, south: -20, east: -170 };
+  assert.equal(AirloomCore.boundsContain(crossing, { north: 10, west: 175, south: -10, east: 179 }), true);
+  assert.equal(AirloomCore.boundsContain(crossing, { north: 10, west: -179, south: -10, east: -175 }), true);
+  assert.equal(AirloomCore.boundsContain(crossing, { north: 10, west: 175, south: -10, east: -175 }), true);
+  assert.equal(AirloomCore.boundsContain(crossing, { north: 10, west: -169, south: -10, east: -160 }), false);
+  const world = { north: 85, west: -180, south: -85, east: 180 };
+  assert.equal(AirloomCore.boundsContain(world, crossing), true);
+  assert.equal(AirloomCore.boundsContain(crossing, world), false);
+});
+
 test("splitBounds rejects non-finite, out-of-range, and inverted views", () => {
   const valid = { north: 10, west: -20, south: -10, east: 20 };
   for (const field of Object.keys(valid)) {
@@ -651,6 +662,62 @@ test("capped coverage is visible near the summary and clears for complete covera
   assert.match(app.elements.get("summary-chip").title, /limited coverage/i);
 
   app.context.Airloom.receive("sensors", { ...payload, coverage: { capped: false, complete: true } });
+  assert.equal(status.hidden, true);
+});
+
+test("viewport departure marks coverage limited before a delayed replacement arrives", () => {
+  const app = loadApp();
+  configureMap(app, 0);
+  const payload = {
+    items: [fixtureSensor(1, 0, 20)],
+    selected_id: 1,
+    source: "PurpleAir live",
+    coverage: { north: 0.09, west: -0.09, south: -0.09, east: 0.09, capped: false, complete: true },
+  };
+  app.context.Airloom.receive("sensors", payload);
+  const status = app.elements.get("coverage-status");
+  assert.equal(status.hidden, true);
+
+  const panel = app.elements.get("map-panel");
+  panel.dispatch("pointerdown", { clientX: 256, clientY: 256, pointerId: 1, buttons: 1 });
+  panel.dispatch("pointermove", { clientX: 0, clientY: 256, pointerId: 1, buttons: 1 });
+  panel.dispatch("pointerup", { clientX: 0, clientY: 256, pointerId: 1, buttons: 0 });
+  assert.equal(status.hidden, false, "leaving fetched bounds must be visible before the fetch timer fires");
+  assert.equal(status.textContent, "Limited coverage");
+
+  app.runTimers();
+  app.context.Airloom.receive("error", { message: "Replacement fetch failed" });
+  app.context.Airloom.receive("loading", { active: false });
+  assert.equal(status.hidden, false, "a failed replacement must not restore complete coverage");
+
+  app.context.Airloom.receive("sensors", {
+    ...payload,
+    coverage: { bounds: { north: 0.2, west: -0.2, south: -0.2, east: 0.2 }, capped: false, complete: true },
+  });
+  assert.equal(status.hidden, true, "a delayed replacement covering the current viewport clears the warning");
+});
+
+test("coverage comparison handles antimeridian views and full-world replacements", () => {
+  const app = loadApp();
+  configureMap(app, 179.9);
+  app.context.Airloom.debugZoomTo(8);
+  const payload = {
+    items: [fixtureSensor(1, -179.9, 20)],
+    selected_id: 1,
+    source: "PurpleAir live",
+    coverage: { north: 2, west: 178, south: -2, east: -178, capped: false, complete: true },
+  };
+  app.context.Airloom.receive("sensors", payload);
+  const status = app.elements.get("coverage-status");
+  assert.equal(status.hidden, true);
+
+  app.context.Airloom.debugZoomTo(3);
+  assert.equal(status.hidden, false, "a world viewport exceeds the crossing fetch on both arms");
+
+  app.context.Airloom.receive("sensors", {
+    ...payload,
+    coverage: { north: 85.0511, west: -180, south: -85.0511, east: 180, capped: false, complete: true },
+  });
   assert.equal(status.hidden, true);
 });
 
