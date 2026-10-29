@@ -66,8 +66,8 @@ Regular-file socket paths, live sockets, unrelated running apps, custom DESTDIR/
 
 **Files:** Create `scripts/verify-flatpak-release.sh`, `tests/test_release.py`; modify `.github/workflows/flatpak.yml`, `scripts/import-signing-key.sh`, `RELEASE.md`.
 
-- [ ] Add failing static/dry-run tests asserting production public-key fingerprint match, ephemeral PR key, verified bundle origin/version, signed-repo install, previous-version upgrade, wrong-key rejection, and both release jobs depend on verification.
-- [ ] Run focused tests; confirm missing client gate.
-- [ ] Implement isolated client verification with no `--no-gpg-verify`, using ephemeral keys outside protected releases and production key matching on tags. Assemble test repos before publication and record explicit evidence.
-- [ ] Run all locally runnable script/workflow tests; expect PASS. Push only after Sol approves; CI must execute real Flatpak gates.
-- [ ] Commit `ci: verify signed Flatpak installation before publication`; request Sol release-workstream review.
+- [x] Add failing static/dry-run tests asserting production public-key fingerprint match, ephemeral PR key, verified bundle origin/version, signed-repo install, previous-version upgrade, wrong-key rejection, and both release jobs depend on verification.
+- [x] Run focused tests; confirm missing client gate.
+- [x] Implement isolated client verification with no `--no-gpg-verify`, using ephemeral keys outside protected releases and production key matching on tags. Assemble test repos before publication and record explicit evidence.
+- [x] Run all locally runnable script/workflow tests; expect PASS. Push only after Sol approves; CI must execute real Flatpak gates.
+- [x] Commit `ci: verify signed Flatpak installation before publication`; request Sol release-workstream review.
