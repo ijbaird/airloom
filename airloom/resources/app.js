@@ -17,7 +17,10 @@
     drag: null,
     query: "",
     placeResults: [],
-    homeSearchActive: false,
+    placeRequests: { main: null, home: null },
+    nextPlaceRequestId: 0,
+    trends: new Map(),
+    settingsSavePending: false,
     positioned: false,
     // Name of the area currently in view (reverse-geocoded by Python);
     // overrides the configured home name on the summary chip until replaced.
@@ -27,27 +30,62 @@
     detailReturnFocus: null,
   };
 
+  const desktopMode = Boolean(window.webkit?.messageHandlers?.airloom);
   const bridge = (message) => {
-    if (window.webkit?.messageHandlers?.airloom) {
-      window.webkit.messageHandlers.airloom.postMessage(JSON.stringify(message));
-    }
+    if (desktopMode) window.webkit.messageHandlers.airloom.postMessage(JSON.stringify(message));
   };
+
+  const desktopAdapter = {
+    favorite(id) { bridge({ action: "favorite", id }); },
+    refresh() { bridge({ action: "refresh" }); },
+    saveSettings(settings) {
+      if (state.settingsSavePending) return;
+      state.settingsSavePending = true;
+      $("#save-settings").disabled = true;
+      bridge({ action: "save-settings", ...settings });
+    },
+    placeSearch(query, context, requestId) {
+      bridge({ action: "place-search", query, request_id: requestId, context });
+    },
+  };
+  const previewAdapter = {
+    favorite(id) { togglePreviewFavorite(id); },
+    refresh() { refreshPreview(); },
+    saveSettings(settings) {
+      const { api_key, clear_api_key, ...supported } = settings;
+      const config = { ...supported };
+      if (config.home_mode === "fixed") {
+        config.latitude = Number(config.home_lat);
+        config.longitude = Number(config.home_lon);
+      }
+      delete config.home_lat;
+      delete config.home_lon;
+      applyConfig(config);
+      renderAll();
+      $("#settings-dialog").close();
+      announce("Preferences applied to this browser preview only; they are not saved on disk.");
+    },
+    placeSearch(query, context) {
+      const message = "Remote place search is unavailable in browser preview; use the Airloom desktop app.";
+      announce("Remote place search requires the Airloom desktop app.");
+      if (context === "home") renderHomePlaceResults([], message);
+      else renderSearchResults([], message);
+    },
+  };
+  const actions = desktopMode ? desktopAdapter : previewAdapter;
 
   window.Airloom = {
     receive(event, payload) {
       if (event === "config") applyConfig(payload);
       if (event === "sensors") applySensors(payload);
       if (event === "loading") document.body.classList.toggle("loading", payload.active);
-      if (event === "error") toast(payload.message);
+      if (event === "error") handleError(payload);
       if (event === "open-settings") openSettings(payload);
       if (event === "location") applyLocation(payload);
       if (event === "view-name" && payload.name) { state.viewName = payload.name; stampPlaceName(); }
       if (event === "pinch") nativePinch(payload);
-      if (event === "places") {
-        if (state.homeSearchActive) {
-          if (payload.query === $("#home-place-input").value.trim()) renderHomePlaceResults(payload.results || [], payload.error);
-        } else if (payload.query === state.query.trim()) renderSearchResults(payload.results || [], payload.error);
-      }
+      if (event === "trend") applyTrend(payload);
+      if (event === "places") applyPlaces(payload);
     },
     // Small, legitimate debug accessors used by the debug port (see
     // airloom/debugport.py and app.py's _debug_* handlers) to read and
@@ -151,6 +189,11 @@
     stampFilterChip();
     applyInterfaceScale();
     renderMap();
+    if (state.settingsSavePending) {
+      state.settingsSavePending = false;
+      $("#save-settings").disabled = false;
+      if ($("#settings-dialog").open) $("#settings-dialog").close();
+    }
   }
 
   function applySensors(payload) {
@@ -169,6 +212,11 @@
     state.source = payload.source || "Demo data";
     state.stale = payload.stale;
     state.config = { ...state.config, ...(payload.config || {}) };
+    for (const sensor of state.sensors) {
+      if (Array.isArray(sensor.trend) && sensor.trend.length) {
+        state.trends.set(sensor.id, { status: "loaded", trend: sensor.trend, retries: 0 });
+      }
+    }
     stampPlaceName();
     applyInterfaceScale();
     $("#data-source").textContent = state.source;
@@ -414,10 +462,45 @@
     renderChart(sensor);
   }
 
+  function applyTrend(payload) {
+    const sensorId = Number(payload.sensor_id);
+    if (!Number.isInteger(sensorId) || !["idle", "loading", "loaded", "unavailable", "error"].includes(payload.status)) return;
+    const previous = state.trends.get(sensorId) || { retries: 0 };
+    let status = payload.status;
+    const trend = Array.isArray(payload.trend) ? payload.trend : [];
+    if (status === "loaded" && !trend.some((point) => Number.isFinite(point.aqi))) status = "unavailable";
+    const retries = status === "loaded" || status === "unavailable" ? 0 : previous.retries;
+    state.trends.set(sensorId, { status, trend, retries });
+    const sensor = state.sensors.find((item) => item.id === sensorId);
+    if (sensor && status === "loaded") sensor.trend = trend;
+    if (sensorId === state.selectedId) renderDetail();
+  }
+
+  function retryTrend() {
+    const sensorId = state.selectedId;
+    const trend = state.trends.get(sensorId);
+    if (!trend || trend.status !== "error" || trend.retries >= 3) return;
+    trend.retries++;
+    trend.status = "loading";
+    if (desktopMode) bridge({ action: "select", id: sensorId });
+    renderDetail();
+  }
+
   function renderChart(sensor) {
-    const points = (sensor.trend || []).filter((point) => Number.isFinite(point.aqi));
+    const trendState = state.trends.get(sensor.id);
+    const status = trendState?.status || (state.config.has_api_key ? "loading" : "unavailable");
+    const retries = trendState?.retries || 0;
+    const retry = $("#trend-retry");
+    retry.hidden = status !== "error";
+    retry.disabled = status === "error" && retries >= 3;
+    retry.textContent = retries >= 3 ? "Retry limit reached" : "Retry";
+    $("#chart-period").textContent = "Rolling averages";
+    const points = (status === "loaded" ? (trendState?.trend || sensor.trend || []) : []).filter((point) => Number.isFinite(point.aqi));
     if (!points.length) {
-      const message = state.config.has_api_key ? "Loading trend…" : "No trend available";
+      let message = "Trend unavailable";
+      if (status === "loading") message = "Loading trend…";
+      else if (status === "idle") message = "Trend not loaded";
+      else if (status === "error" && retries >= 3) message = "Trend unavailable after 3 retries";
       $("#chart").innerHTML = `<div class="empty-state">${message}</div>`;
       $("#trend-direction").textContent = "—";
       return;
@@ -431,12 +514,16 @@
     }));
     const line = coordinates.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
     const area = `${line} L${coordinates.at(-1).x},${height - padBottom} L${coordinates[0].x},${height - padBottom} Z`;
-    const labels = coordinates.map((point) => `<text x="${point.x}" y="${height - 4}" text-anchor="middle">${point.label}</text>`).join("");
+    const labels = coordinates.map((point) => `<text x="${point.x}" y="${height - 4}" text-anchor="middle">${escapeHtml(point.label)}</text>`).join("");
     const dots = coordinates.map((point) => `<circle class="dot" cx="${point.x}" cy="${point.y}" r="3.5" fill="${sensor.color}"/>`).join("");
     $("#chart").innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
       <line class="grid" x1="0" y1="${height - padBottom}" x2="${width}" y2="${height - padBottom}"/>
       <path class="area" d="${area}" fill="${sensor.color}"/><path class="line" d="${line}" stroke="${sensor.color}"/>${dots}${labels}
     </svg>`;
+    const comparisonLabels = { "1w": "1-week average", "1d": "1-day average", "6h": "6-hour average", "1h": "1-hour average", "30m": "30-minute average", "10m": "10-minute average" };
+    if (points.at(-1).label === "Now" && comparisonLabels[points[0].label]) {
+      $("#chart-period").textContent = `Current vs ${comparisonLabels[points[0].label]}`;
+    }
     const delta = points.at(-1).aqi - points[0].aqi;
     $("#trend-direction").textContent = Math.abs(delta) < 4 ? "Holding steady" : delta > 0 ? `Up ${delta} points` : `Down ${Math.abs(delta)} points`;
   }
@@ -924,7 +1011,14 @@
 
   function openSettings(config = state.config) {
     if ($("#settings-dialog").open) return;
+    state.settingsSavePending = false;
+    $("#save-settings").disabled = false;
     const form = $("#settings-form");
+    $("#settings-intro").textContent = desktopMode
+      ? "Use demo readings immediately, or add your own PurpleAir read key for live public sensors."
+      : "Browser preview preferences apply to this tab only. PurpleAir keys and remote place search require the desktop app.";
+    form.elements.api_key.disabled = !desktopMode;
+    form.elements.clear_api_key.disabled = !desktopMode;
     for (const field of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;
@@ -983,6 +1077,14 @@
     if ($("#settings-dialog").open) renderHiddenList();
   }
 
+  function handleError(payload) {
+    if (state.settingsSavePending) {
+      state.settingsSavePending = false;
+      $("#save-settings").disabled = false;
+    }
+    toast(payload.message);
+  }
+
   function toast(message) {
     const item = document.createElement("div");
     item.className = "toast";
@@ -1009,8 +1111,35 @@
     return String(value).replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   }
 
+  function invalidatePlaceSearch(context) {
+    state.placeRequests[context] = null;
+    if (context === "main") state.placeResults = [];
+  }
+
+  function submitPlaceSearch(context) {
+    const input = context === "home" ? $("#home-place-input") : $("#search");
+    const query = input.value.trim();
+    invalidatePlaceSearch(context);
+    if (query.length < 2) return;
+    const requestId = ++state.nextPlaceRequestId;
+    state.placeRequests[context] = { requestId, query };
+    actions.placeSearch(query, context, requestId);
+  }
+
+  function applyPlaces(payload) {
+    const context = payload.context;
+    if (context !== "main" && context !== "home") return;
+    const request = state.placeRequests[context];
+    if (!request || payload.request_id !== request.requestId || payload.query !== request.query) return;
+    if (context === "home" && !$("#settings-dialog").open) return;
+    state.placeRequests[context] = null;
+    if (context === "home") renderHomePlaceResults(payload.results || [], payload.error);
+    else renderSearchResults(payload.results || [], payload.error);
+  }
+
   function renderSearchResults(places, error) {
     const box = $("#search-results");
+    state.placeResults = places;
     const query = state.query.trim().toLowerCase();
     const sensors = query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query)).slice(0, 4) : [];
     if (!sensors.length && !places.length && !error) { box.hidden = true; box.innerHTML = ""; return; }
@@ -1020,7 +1149,6 @@
     if (error) html += `<div class="group">${escapeHtml(error)}</div>`;
     box.innerHTML = html;
     box.hidden = false;
-    state.placeResults = places;
     box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
       if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true, { surface: "search" }); }
       else {
@@ -1052,7 +1180,7 @@
       form.elements.location_name.value = place.name.split(",")[0];
       $("#home-place-status").textContent = `Fixed: ${place.name}`;
       box.hidden = true;
-      state.homeSearchActive = false;
+      invalidatePlaceSearch("home");
     }));
   }
 
@@ -1062,22 +1190,48 @@
     return readings.map((aqi, index) => {
       const band = AirloomCore.bandForAQI(aqi);
       const angle = index * 2.399963;
-      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category: band.label, color: band.color, foreground: band.foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, indoor: index % 5 === 2, guidance: band.guidance, trend: ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) })) };
+      const trend = ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) }));
+      trend[trend.length - 1] = { label: "Now", aqi };
+      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category: band.label, color: band.color, foreground: band.foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, indoor: index % 5 === 2, guidance: band.guidance, trend };
     });
   }
 
-  let placeTimer = null;
+  function togglePreviewFavorite(id) {
+    const sensor = state.sensors.find((item) => item.id === id);
+    if (!sensor) return;
+    sensor.favorite = !sensor.favorite;
+    renderAll();
+    reconcilePopup();
+    announce(`${sensor.name} ${sensor.favorite ? "added to" : "removed from"} preview favorites.`);
+  }
+
+  function refreshPreview() {
+    const previous = new Map([...state.sensors, ...state.previewHidden].map((sensor) => [sensor.id, sensor]));
+    const hiddenIds = new Set((state.config.hidden || []).map((sensor) => sensor.id));
+    const preview = browserPreviewData().map((sensor) => ({
+      ...sensor,
+      favorite: previous.has(sensor.id) ? previous.get(sensor.id).favorite : sensor.favorite,
+    }));
+    state.previewHidden = preview.filter((sensor) => hiddenIds.has(sensor.id));
+    const visible = preview.filter((sensor) => !hiddenIds.has(sensor.id));
+    const selectedId = visible.some((sensor) => sensor.id === state.selectedId) ? state.selectedId : visible[0]?.id ?? null;
+    state.config.hidden = state.previewHidden.map((sensor) => ({ id: sensor.id, name: sensor.name }));
+    applySensors({ items: visible, selected_id: selectedId, source: "Browser preview · Demo data", config: state.config });
+    announce("Browser preview demo data refreshed locally.");
+  }
+
   $("#search").addEventListener("input", (event) => {
     state.query = event.target.value;
+    invalidatePlaceSearch("main");
     renderLists();
     renderMapMarkers();
     reconcilePopup();
     renderSearchResults([]);
-    clearTimeout(placeTimer);
-    if (state.query.trim().length >= 3) placeTimer = setTimeout(() => bridge({ action: "place-search", query: state.query.trim() }), 450);
   });
   $("#search").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && state.query.trim().length >= 2) bridge({ action: "place-search", query: state.query.trim() });
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    submitPlaceSearch("main");
   });
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
@@ -1093,8 +1247,9 @@
       }
     }
   });
-  $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
-  $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
+  $("#footer-refresh").addEventListener("click", () => actions.refresh());
+  $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) actions.favorite(state.selectedId); });
+  $("#trend-retry").addEventListener("click", retryTrend);
   $("#hide-button").addEventListener("click", () => {
     if (state.selectedId === null) return;
     const id = state.selectedId;
@@ -1110,7 +1265,7 @@
     renderDetail();
     $("#close-detail").focus();
   });
-  $("#popup-favorite").addEventListener("click", () => { if (state.popupId !== null) { if (window.webkit?.messageHandlers?.airloom) bridge({ action: "favorite", id: state.popupId }); else { const sensor = state.sensors.find((s) => s.id === state.popupId); if (sensor) { sensor.favorite = !sensor.favorite; renderAll(); showPopup(sensor); } } } });
+  $("#popup-favorite").addEventListener("click", () => { if (state.popupId !== null) actions.favorite(state.popupId); });
   $("#popup-hide").addEventListener("click", () => {
     if (state.popupId === null) return;
     const id = state.popupId;
@@ -1253,29 +1408,37 @@
 
   $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
-  $("#settings-dialog").addEventListener("close", () => { state.homeSearchActive = false; });
+  $("#settings-dialog").addEventListener("close", () => {
+    invalidatePlaceSearch("home");
+    $("#home-place-results").hidden = true;
+    $("#home-place-results").innerHTML = "";
+    state.settingsSavePending = false;
+    $("#save-settings").disabled = false;
+  });
   document.querySelectorAll('input[name="home_mode"]').forEach((radio) => radio.addEventListener("change", () => {
     $("#home-place-row").hidden = $("#settings-form").elements.home_mode.value !== "fixed";
   }));
-  let homePlaceTimer = null;
-  $("#home-place-input").addEventListener("input", (event) => {
-    clearTimeout(homePlaceTimer);
-    const query = event.target.value.trim();
-    if (query.length >= 3) homePlaceTimer = setTimeout(() => { state.homeSearchActive = true; bridge({ action: "place-search", query }); }, 450);
+  $("#home-place-input").addEventListener("input", () => {
+    invalidatePlaceSearch("home");
+    $("#home-place-results").hidden = true;
+    $("#home-place-results").innerHTML = "";
+  });
+  $("#home-place-input").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    submitPlaceSearch("home");
   });
   $("#settings-form").addEventListener("submit", (event) => {
     const submitter = event.submitter;
     if (!submitter || submitter.id !== "save-settings") return;
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    bridge({
-      action: "save-settings",
+    actions.saveSettings({
       api_key: form.get("api_key"), clear_api_key: form.get("clear_api_key") === "on",
       confidence_filter: form.get("confidence_filter") === "on",
       home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
       radius_km: form.get("radius_km"), heatmap_threshold_km: form.get("heatmap_threshold_km"), alert_threshold: form.get("alert_threshold"), refresh_minutes: form.get("refresh_minutes"), temperature_unit: form.get("temperature_unit"),
     });
-    $("#settings-dialog").close();
   });
   new ResizeObserver(() => renderMap()).observe($("#map-panel"));
   bridge({ action: "ready" });

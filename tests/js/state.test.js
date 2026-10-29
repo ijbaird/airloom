@@ -60,6 +60,7 @@ class FakeElement {
     this.open = false;
     this.value = "";
     this.checked = false;
+    this.disabled = false;
     this.clientWidth = 0;
     this.clientHeight = 0;
     this.dataset = {};
@@ -157,6 +158,12 @@ class FakeElement {
     for (const listener of this.listeners.get(type) || []) listener(event);
   }
   click() { this.dispatch("click"); }
+  showModal() { this.open = true; }
+  close(returnValue = "") {
+    this.open = false;
+    this.returnValue = returnValue;
+    this.dispatch("close");
+  }
   setAttribute(name, value) {
     const setting = String(value);
     this.attributes[name] = setting;
@@ -203,7 +210,7 @@ class FakeElement {
   }
 }
 
-function loadApp({ reducedMotion = false } = {}) {
+function loadApp({ reducedMotion = false, preview = false } = {}) {
   const html = fs.readFileSync(indexPath, "utf8");
   const elements = new Map();
   for (const match of html.matchAll(/<([a-z][\w-]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)) {
@@ -240,6 +247,17 @@ function loadApp({ reducedMotion = false } = {}) {
     element.ownerDocument = document;
     return element;
   };
+  const settingsForm = elements.get("settings-form");
+  for (const name of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes", "home_lat", "home_lon", "location_name"]) {
+    settingsForm.elements[name] = new FakeElement("input");
+  }
+  for (const name of ["api_key", "clear_api_key", "confidence_filter"]) {
+    const field = new FakeElement("input");
+    field.type = name === "api_key" ? "password" : "checkbox";
+    settingsForm.elements[name] = field;
+  }
+  settingsForm.elements.home_mode = { value: "auto" };
+  settingsForm.elements.temperature_unit = { value: "F" };
   document.elementFromPoint = () => null;
 
   const timers = new Map();
@@ -277,12 +295,22 @@ function loadApp({ reducedMotion = false } = {}) {
     Event: class {},
     KeyboardEvent: class {},
     PointerEvent: class {},
-    FormData: class {},
-    webkit: {
-      messageHandlers: {
-        airloom: { postMessage: (message) => messages.push(JSON.parse(message)) },
-      },
+    FormData: class {
+      constructor(form) { this.form = form; }
+      get(name) {
+        const field = this.form.elements[name];
+        if (!field) return null;
+        if (field.type === "checkbox") return field.checked ? "on" : null;
+        return field.value;
+      }
     },
+    ...(preview ? {} : {
+      webkit: {
+        messageHandlers: {
+          airloom: { postMessage: (message) => messages.push(JSON.parse(message)) },
+        },
+      },
+    }),
   };
   context.window = context;
   context.globalThis = context;
@@ -297,6 +325,11 @@ function loadApp({ reducedMotion = false } = {}) {
     document,
     elements,
     messages,
+    runTimers() {
+      const pending = [...timers.values()];
+      timers.clear();
+      for (const callback of pending) callback();
+    },
     runAnimationFrames(now) {
       const pending = [...animationFrames.values()];
       animationFrames.clear();
@@ -311,6 +344,24 @@ function configureMap(app, extra = {}) {
     longitude: 0,
     location_name: "Test area",
     heatmap_threshold_km: 40,
+    ...extra,
+  });
+}
+
+function openSettings(app, extra = {}) {
+  app.context.Airloom.receive("open-settings", {
+    latitude: 0,
+    longitude: 0,
+    location_name: "Test area",
+    radius_km: 22,
+    alert_threshold: 101,
+    heatmap_threshold_km: 40,
+    refresh_minutes: 2,
+    temperature_unit: "F",
+    confidence_filter: true,
+    home_mode: "auto",
+    has_api_key: false,
+    api_key_hint: "",
     ...extra,
   });
 }
@@ -788,4 +839,322 @@ test("Sensors count matches nearby rows when favorites are a separate collection
   assert.equal(app.elements.get("favorite-count").textContent, "1");
   assert.equal(app.elements.get("sensor-list").querySelectorAll(".sensor-row").length, 2);
   assert.equal(app.elements.get("sensor-count").textContent, "2");
+});
+
+test("reconcileKeyed tolerates text and comment children", () => {
+  const { reconcileKeyed } = require("../../airloom/resources/state.js");
+  const document = new FakeElement("document");
+  document.activeElement = null;
+  const container = new FakeElement("div");
+  container.ownerDocument = document;
+  const makeTextNode = () => ({
+    parentNode: container,
+    isConnected: true,
+    contains: () => false,
+    remove() {
+      const index = container.childNodes.indexOf(this);
+      if (index >= 0) container.childNodes.splice(index, 1);
+      this.parentNode = null;
+      this.isConnected = false;
+    },
+  });
+  container.childNodes.push(makeTextNode(), makeTextNode());
+  const create = (item) => {
+    const node = new FakeElement("button");
+    node.ownerDocument = document;
+    node.textContent = item.name;
+    return node;
+  };
+
+  assert.doesNotThrow(() => reconcileKeyed(container, [{ id: 1, name: "One" }], (item) => item.id, create, () => {}));
+  assert.deepEqual(container.childNodes.map((node) => node.dataset.key), ["1"]);
+  assert.equal(container.childNodes[0].textContent, "One");
+});
+
+test("main search typing filters locally without remote geocoding", () => {
+  const app = loadApp();
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1, { name: "Alpha Station" }), fixtureSensor(2, { name: "Beta Station" })]);
+  const search = app.elements.get("search");
+  search.value = "Alpha";
+  search.dispatch("input", { target: search });
+
+  app.runTimers();
+
+  assert.equal(app.context.Airloom.debugState().visibleCount, 1);
+  assert.equal(app.messages.filter((message) => message.action === "place-search").length, 0);
+});
+
+test("home search typing sends no remote geocoding", () => {
+  const app = loadApp();
+  configureMap(app);
+  openSettings(app);
+  const input = app.elements.get("home-place-input");
+  input.value = "Portland";
+  input.dispatch("input", { target: input });
+
+  app.runTimers();
+
+  assert.equal(app.messages.filter((message) => message.action === "place-search").length, 0);
+});
+
+test("main search submit sends one identified main-context request", () => {
+  const app = loadApp();
+  const search = app.elements.get("search");
+  search.value = "Portland";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+
+  const requests = app.messages.filter((message) => message.action === "place-search");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].query, "Portland");
+  assert.equal(requests[0].context, "main");
+  assert.equal(Number.isInteger(requests[0].request_id), true);
+});
+
+test("home search submit sends one identified home-context request", () => {
+  const app = loadApp();
+  configureMap(app);
+  openSettings(app);
+  const input = app.elements.get("home-place-input");
+  input.value = "Portland";
+  input.dispatch("input", { target: input });
+  input.dispatch("keydown", { key: "Enter" });
+
+  const requests = app.messages.filter((message) => message.action === "place-search");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].query, "Portland");
+  assert.equal(requests[0].context, "home");
+  assert.equal(Number.isInteger(requests[0].request_id), true);
+});
+
+test("an older same-query place response cannot replace the newest request", () => {
+  const app = loadApp();
+  const search = app.elements.get("search");
+  search.value = "Paris";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+  search.dispatch("keydown", { key: "Enter" });
+  const results = app.elements.get("search-results");
+
+  app.context.Airloom.receive("places", {
+    request_id: 1,
+    context: "main",
+    query: "Paris",
+    results: [{ name: "Obsolete Paris", latitude: 48.85, longitude: 2.35 }],
+  });
+  assert.equal(results.hidden, true);
+
+  app.context.Airloom.receive("places", {
+    request_id: 2,
+    context: "main",
+    query: "Paris",
+    results: [{ name: "Current Paris", latitude: 48.85, longitude: 2.35 }],
+  });
+  assert.equal(results.hidden, false);
+  assert.match(results.innerHTML, /Current Paris/);
+  assert.doesNotMatch(results.innerHTML, /Obsolete Paris/);
+});
+
+test("a place response with the wrong context is ignored", () => {
+  const app = loadApp();
+  const search = app.elements.get("search");
+  search.value = "Portland";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+  const results = app.elements.get("search-results");
+
+  app.context.Airloom.receive("places", {
+    request_id: 1,
+    context: "home",
+    query: "Portland",
+    results: [{ name: "Wrong context", latitude: 45.5, longitude: -122.6 }],
+  });
+  assert.equal(results.hidden, true);
+
+  app.context.Airloom.receive("places", {
+    request_id: 1,
+    context: "main",
+    query: "Portland",
+    results: [{ name: "Main Portland", latitude: 45.5, longitude: -122.6 }],
+  });
+  assert.equal(results.hidden, false);
+  assert.match(results.innerHTML, /Main Portland/);
+});
+
+test("closing Preferences invalidates pending home search responses", () => {
+  const app = loadApp();
+  configureMap(app);
+  const search = app.elements.get("search");
+  search.value = "Paris";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+  openSettings(app);
+  const home = app.elements.get("home-place-input");
+  home.value = "Paris";
+  home.dispatch("input", { target: home });
+  home.dispatch("keydown", { key: "Enter" });
+  app.elements.get("close-settings").click();
+
+  app.context.Airloom.receive("places", {
+    request_id: 2,
+    context: "home",
+    query: "Paris",
+    results: [{ name: "Closed home result", latitude: 48.85, longitude: 2.35 }],
+  });
+
+  assert.equal(app.elements.get("home-place-results").hidden, true);
+  assert.equal(app.elements.get("search-results").hidden, true);
+});
+
+test("trend unavailable is terminal instead of indefinite loading", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  receiveSensors(app, [fixtureSensor(1)], { config: { has_api_key: true } });
+
+  app.context.Airloom.receive("trend", { sensor_id: 1, status: "unavailable", trend: [] });
+
+  assert.match(app.elements.get("chart").innerHTML, /Trend unavailable/);
+  assert.doesNotMatch(app.elements.get("chart").innerHTML, /Loading trend/);
+  assert.equal(app.elements.get("trend-direction").textContent, "—");
+});
+
+test("trend loaded renders its rolling-average points", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  receiveSensors(app, [fixtureSensor(1)], { config: { has_api_key: true } });
+
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    status: "loaded",
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+
+  assert.match(app.elements.get("chart").innerHTML, /<svg/);
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+});
+
+test("trend errors allow at most three manual retries", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  receiveSensors(app, [fixtureSensor(1)], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", { sensor_id: 1, status: "error", trend: [] });
+  const retry = app.elements.get("trend-retry");
+  assert.ok(retry, "an error should expose a manual retry control");
+  assert.equal(retry.hidden, false);
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    retry.click();
+    assert.equal(app.messages.filter((message) => message.action === "select" && message.id === 1).length, attempt);
+    app.context.Airloom.receive("trend", { sensor_id: 1, status: "error", trend: [] });
+  }
+  assert.equal(retry.disabled, true);
+  retry.click();
+  assert.equal(app.messages.filter((message) => message.action === "select" && message.id === 1).length, 3);
+  assert.match(app.elements.get("chart").innerHTML, /Trend unavailable/);
+});
+
+test("rolling-average charts name the actual current comparison", () => {
+  const app = loadApp();
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1, { trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }] })]);
+  const period = app.elements.get("chart-period");
+  assert.ok(period, "the chart should expose its comparison label");
+  assert.equal(period.textContent, "Current vs 1-week average");
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+
+  receiveSensors(app, [fixtureSensor(1, { trend: [{ label: "1d", aqi: 30 }, { label: "Now", aqi: 28 }] })]);
+  assert.equal(app.elements.get("chart-period").textContent, "Current vs 1-day average");
+  assert.equal(app.elements.get("trend-direction").textContent, "Holding steady");
+});
+
+test("preview detail favorite toggles local state and pressed state", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  const favorite = app.elements.get("favorite-button");
+  assert.equal(favorite.getAttribute("aria-pressed"), "true");
+
+  favorite.click();
+  assert.equal(favorite.getAttribute("aria-pressed"), "false");
+  favorite.click();
+  assert.equal(favorite.getAttribute("aria-pressed"), "true");
+});
+
+test("preview Refresh reloads demo data locally and says so", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+
+  app.elements.get("footer-refresh").click();
+
+  assert.equal(app.elements.get("data-source").textContent, "Browser preview · Demo data");
+  assert.equal(app.elements.get("ui-status").textContent, "Browser preview demo data refreshed locally.");
+});
+
+test("preview preferences apply supported values locally without claiming persistence", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  form.elements.temperature_unit.value = "C";
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+
+  assert.equal(app.elements.get("temperature").textContent, "18°C");
+  assert.match(app.elements.get("ui-status").textContent, /browser preview only/i);
+  assert.equal(app.elements.get("settings-dialog").open, false);
+});
+
+test("preview settings disable unsupported API-key persistence with an explanation", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+
+  openSettings(app);
+
+  assert.equal(app.elements.get("settings-form").elements.api_key.disabled, true);
+  assert.match(app.elements.get("settings-intro").textContent, /browser preview/i);
+});
+
+test("preview place submission explains that remote search needs the desktop app", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  const search = app.elements.get("search");
+  search.value = "Portland";
+  search.dispatch("input", { target: search });
+
+  search.dispatch("keydown", { key: "Enter" });
+
+  assert.match(app.elements.get("ui-status").textContent, /desktop app/i);
+  assert.match(app.elements.get("search-results").innerHTML, /unavailable in browser preview/i);
+});
+
+test("desktop preferences stay open until a config acknowledges persistence", () => {
+  const app = loadApp();
+  configureMap(app);
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  const dialog = app.elements.get("settings-dialog");
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+  assert.equal(app.messages.filter((message) => message.action === "save-settings").length, 1);
+  assert.equal(dialog.open, true);
+
+  app.context.Airloom.receive("error", { message: "Could not save preferences" });
+  assert.equal(dialog.open, true);
+  assert.equal(app.elements.get("save-settings").disabled, false);
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+  app.context.Airloom.receive("config", { latitude: 0, longitude: 0, location_name: "Test area" });
+  assert.equal(dialog.open, false);
+});
+
+test("preview demo Now point equals the displayed current AQI", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  const row = app.elements.get("sensor-list").querySelectorAll(".sensor-row").find((item) => item.dataset.id === "8001");
+  assert.ok(row);
+
+  row.click();
+
+  assert.equal(app.elements.get("aqi-number").textContent, "34");
+  assert.equal(app.elements.get("trend-direction").textContent, "Down 9 points");
 });

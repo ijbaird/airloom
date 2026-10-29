@@ -153,7 +153,11 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .chart-heading > div { display: flex; flex-direction: column; gap: 3px; }
 .chart-heading span { color: var(--muted); font-size: 10px; }
 .chart-heading strong { font-size: 12px; }
-.chart-period { padding-top: 2px; }
+.chart-comparison { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
+.chart-period { padding-top: 2px; text-align: right; }
+.trend-retry { border: 0; border-radius: 6px; padding: 3px 7px; background: var(--soft); color: var(--accent); font: inherit; font-size: 10px; font-weight: 750; cursor: pointer; }
+.trend-retry:disabled { color: var(--muted); cursor: default; }
+.trend-retry[hidden] { display: none; }
 .chart { height: 112px; position: relative; }
 .chart svg { width: 100%; height: 100%; overflow: visible; }
 .chart .grid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 4; }

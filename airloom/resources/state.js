@@ -40,7 +40,7 @@
     let focused = null;
 
     for (const node of children) {
-      const nodeKey = node.dataset.key;
+      const nodeKey = node.dataset?.key;
       if (nodeKey !== undefined) existing.set(String(nodeKey), node);
       if (active && (node === active || node.contains(active))) {
         focused = { key: nodeKey, surface, element: active };
