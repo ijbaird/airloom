@@ -69,6 +69,16 @@ def repository_tags(root: Path) -> list[str]:
     return [tag for tag in result.stdout.splitlines() if TAG_PATTERN.fullmatch(tag)]
 
 
+def git_commit(root: Path, revision: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", f"{revision}^{{commit}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
 def version_key(version: str) -> tuple[int, int, int]:
     match = VERSION_PATTERN.fullmatch(version)
     if not match:
@@ -76,7 +86,7 @@ def version_key(version: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in match.groups())
 
 
-def validate(args: argparse.Namespace) -> tuple[str, str]:
+def validate(args: argparse.Namespace) -> tuple[str, str, str]:
     ref = args.ref
     tag = ref.removeprefix("refs/tags/")
     if not TAG_PATTERN.fullmatch(tag):
@@ -102,6 +112,21 @@ def validate(args: argparse.Namespace) -> tuple[str, str]:
         raise ReleaseError(f"tag {tag!r} does not exist in repository history")
     if not tags:
         raise ReleaseError("no stable release tags found in repository history")
+
+    checkout_sha = git_commit(root, "HEAD")
+    source_sha = args.source_sha or checkout_sha
+    if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ReleaseError("--source-sha must be a full lowercase Git commit SHA")
+    if checkout_sha != source_sha:
+        raise ReleaseError(
+            f"checkout commit {checkout_sha} does not match intended source {source_sha}"
+        )
+    tag_sha = git_commit(root, f"refs/tags/{tag}")
+    if tag_sha != source_sha:
+        raise ReleaseError(
+            f"tag {tag} peeled commit {tag_sha} does not match intended source {source_sha}"
+        )
+
     latest = max(tags, key=lambda candidate: version_key(candidate[1:]))
     if version_key(version) < version_key(latest[1:]):
         if not args.allow_older:
@@ -118,18 +143,19 @@ def validate(args: argparse.Namespace) -> tuple[str, str]:
         if args.confirm_tag != tag:
             raise ReleaseError("--confirm-tag must exactly match the release tag")
 
-    return tag, version
+    return tag, version, source_sha
 
 
 def main() -> int:
     parser = ReleaseArgumentParser(description=__doc__)
     parser.add_argument("--ref", required=True)
     parser.add_argument("--version-root", required=True)
+    parser.add_argument("--source-sha")
     parser.add_argument("--allow-older", action="store_true")
     parser.add_argument("--confirm-tag")
     try:
         args = parser.parse_args()
-        tag, version = validate(args)
+        tag, version, source_sha = validate(args)
     except (ReleaseError, OSError, SyntaxError, ET.ParseError, subprocess.SubprocessError) as error:
         print(f"release eligibility denied: {error}", file=sys.stderr)
         return 1
@@ -137,6 +163,7 @@ def main() -> int:
     print("release_eligible=true")
     print(f"release_tag={tag}")
     print(f"version={version}")
+    print(f"source_sha={source_sha}")
     return 0
 
 

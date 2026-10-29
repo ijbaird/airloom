@@ -27,6 +27,23 @@ def job_condition(block):
     return " ".join(line.strip() for line in match.group(1).splitlines()) if match else ""
 
 
+def job_needs(source, job_name):
+    match = re.search(r"(?m)^    needs: \[([^]]*)\]$", job_block(source, job_name))
+    return [item.strip() for item in match.group(1).split(",")] if match else []
+
+
+def job_ancestors(source, job_name):
+    ancestors = set()
+    pending = list(job_needs(source, job_name))
+    while pending:
+        ancestor = pending.pop()
+        if ancestor in ancestors:
+            continue
+        ancestors.add(ancestor)
+        pending.extend(job_needs(source, ancestor))
+    return ancestors
+
+
 def context_value(context, path):
     value = context
     for part in path.split("."):
@@ -90,6 +107,35 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertNotIn("secrets.", ui_job)
         self.assertNotRegex(ui_job, r"(?i)purpleair.*api.*key|api.*key.*purpleair")
 
+    def test_webkit_ui_is_an_ancestor_of_both_publication_channels(self):
+        source = workflow("flatpak.yml")
+        coordinator = job_block(source, "publication")
+        self.assertIn("webkit-ui", job_ancestors(source, "publication"))
+        self.assertIn("uses: ./.github/workflows/publish.yml", coordinator)
+
+        publish_path = WORKFLOWS / "publish.yml"
+        publish = publish_path.read_text(encoding="utf-8") if publish_path.exists() else ""
+        self.assertTrue(job_block(publish, "release"), "GitHub release channel is missing")
+        self.assertTrue(job_block(publish, "publish-repo"), "Pages channel is missing")
+        self.assertEqual(job_needs(publish, "publish-repo"), ["release"])
+
+    def test_integration_plan_06_owns_remaining_ui_scenarios_before_tagging(self):
+        ui_job = job_block(workflow("flatpak.yml"), "webkit-ui")
+        for expected in (
+            "06-integration-release.md",
+            "scripts/test-ui-regression",
+            "stripped-debug",
+            "search",
+            "focus",
+            "alert",
+            "before tagging",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, ui_job)
+        release_guide = (PROJECT / "RELEASE.md").read_text(encoding="utf-8")
+        self.assertIn("scripts/test-ui-regression", release_guide)
+        self.assertRegex(release_guide, r"(?i)before tagging|do not tag")
+
     def test_claude_review_runs_only_for_same_repository_human_prs(self):
         review_job = job_block(workflow("claude-code-review.yml"), "claude-review")
         condition = job_condition(review_job)
@@ -125,10 +171,13 @@ class WorkflowContractTest(unittest.TestCase):
                 references = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", source)
                 self.assertTrue(references, "expected action references")
                 for reference in references:
+                    if reference.startswith("./"):
+                        self.assertRegex(reference, r"^\./\.github/workflows/[A-Za-z0-9_.-]+\.yml$")
+                        continue
                     self.assertRegex(reference, r"@[0-9a-f]{40}$")
 
     def test_offered_deploy_pages_update_is_pinned_to_the_offered_sha(self):
-        source = workflow("flatpak.yml")
+        source = workflow("flatpak.yml") + workflow("publish.yml")
         self.assertIn(f"actions/deploy-pages@{DEPLOY_PAGES_SHA}", source)
 
     def test_offered_flatpak_builder_update_is_pinned_to_the_offered_sha(self):

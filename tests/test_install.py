@@ -160,6 +160,9 @@ class BuildVersionTest(unittest.TestCase):
             environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
             environment["FLATPAK_BUILDER"] = "/bin/true"
             environment["TMPDIR"] = str(root / "tmp")
+            environment["AIRLOOM_DIST_DIR"] = str(fixture / "dist")
+            environment["AIRLOOM_BUILD_DIR"] = str(root / "build-dir")
+            environment["AIRLOOM_REPO_DIR"] = str(root / "flatpak-repo")
             result = subprocess.run(
                 [str(fixture / "scripts" / "build-flatpak.sh")],
                 cwd=fixture,

@@ -1,9 +1,11 @@
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -175,13 +177,12 @@ class DebugScriptIsolationTest(unittest.TestCase):
             "import time\nwhile True:\n    time.sleep(1)\n",
             encoding="utf-8",
         )
-        unrelated = subprocess.Popen(
+        unrelated = self._launch_owned_process(
             [sys.executable, "-m", "airloom"],
             cwd=unrelated_project,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        self.addCleanup(self._stop_owned_process, unrelated)
 
         tmpdir = self.root / "tmp"
         tmpdir.mkdir()
@@ -195,14 +196,21 @@ class DebugScriptIsolationTest(unittest.TestCase):
             "AIRLOOM_TEST_ENV_RECORD": str(record),
             "AIRLOOM_TEST_SENTINEL_PID": str(unrelated.pid),
         }
-        completed = subprocess.run(
+        launched = self._launch_owned_process(
             [sys.executable, str(scripts / script_name)],
             cwd=project,
             env=env,
             text=True,
-            capture_output=True,
-            timeout=20,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = launched.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            self._stop_owned_process(launched)
+            raise
+        completed = subprocess.CompletedProcess(
+            launched.args, launched.returncode, stdout, stderr
         )
         self.assertEqual(
             completed.returncode,
@@ -228,13 +236,70 @@ class DebugScriptIsolationTest(unittest.TestCase):
             os.kill(child["pid"], 0)
         self.assertIsNone(unrelated.poll(), "the GUI launcher terminated an unrelated Airloom process")
 
+    def test_owned_process_cleanup_terminates_the_entire_process_group(self):
+        record = self.root / "owned-child.pid"
+        parent_program = (
+            "import subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(60)']); "
+            "open(sys.argv[1], 'w').write(str(child.pid)); "
+            "time.sleep(60)"
+        )
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parent_program, str(record)],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(self._stop_owned_process, parent)
+        deadline = time.monotonic() + 2
+        while not record.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_pid = int(record.read_text(encoding="utf-8"))
+        self.addCleanup(self._kill_owned_pid, child_pid)
+
+        self._stop_owned_process(parent)
+
+        self.assertIsNotNone(parent.poll())
+        self.assertTrue(self._process_is_stopped(child_pid), "owned child survived launcher cleanup")
+
+    def _process_is_stopped(self, pid: int) -> bool:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
+                if state == "Z":
+                    return True
+            except FileNotFoundError:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _kill_owned_pid(self, pid: int) -> None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def _launch_owned_process(self, *args, **kwargs) -> subprocess.Popen:
+        process = subprocess.Popen(*args, start_new_session=True, **kwargs)
+        self.addCleanup(self._stop_owned_process, process)
+        return process
+
     def _stop_owned_process(self, process: subprocess.Popen) -> None:
-        if process.poll() is None:
-            process.terminate()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            process.kill()
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
             process.wait(timeout=2)
 
 

@@ -27,6 +27,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify checkout source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
@@ -49,8 +55,18 @@ jobs:
       image: fedora:44
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify checkout source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
       - name: Install headless WebKit dependencies
         run: dnf install -y python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth
+      # Integration plan 06 (06-integration-release.md) owns
+      # scripts/test-ui-regression. Add its stripped-debug, search, focus, and
+      # alert scenarios to this required release ancestor before tagging; they
+      # do not exist in this branch, which runs only the two scripts below.
       - name: Run isolated WebKit UI regressions
         shell: bash
         env:
@@ -68,11 +84,13 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       eligible: ${{ steps.check.outputs.eligible }}
+      source_sha: ${{ steps.check.outputs.source_sha }}
     steps:
       - name: Checkout release history
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Check release ref and versions
         id: check
@@ -81,18 +99,23 @@ jobs:
         env:
           ALLOW_OLDER: ${{ inputs.allow_older }}
           CONFIRM_TAG: ${{ inputs.confirm_tag }}
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          args=(--ref "${GITHUB_REF}" --version-root .)
+          test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
+          args=(--ref "${GITHUB_REF}" --version-root . --source-sha "${EXPECTED_SOURCE_SHA}")
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${ALLOW_OLDER}" == "true" ]]; then
             args+=(--allow-older --confirm-tag "${CONFIRM_TAG}")
           fi
           python3 scripts/check-release.py "${args[@]}"
-          echo "eligible=true" >> "${GITHUB_OUTPUT}"
+          {
+            echo "eligible=true"
+            echo "source_sha=${EXPECTED_SOURCE_SHA}"
+          } >> "${GITHUB_OUTPUT}"
 
   flatpak:
     name: Flatpak (${{ matrix.arch }})
-    needs: [test, release-eligibility]
+    needs: [test, webkit-ui, release-eligibility]
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +130,12 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+      - name: Verify checkout source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
       - name: Build Flatpak bundle
         uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
@@ -146,6 +175,8 @@ jobs:
             "${gpg_args[@]}"
       - name: Record release provenance
         shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
         run: |
           set -euo pipefail
           arch="${{ matrix.arch }}"
@@ -155,7 +186,7 @@ jobs:
           sdk_commit="$(flatpak info --arch="${arch}" --show-commit org.gnome.Sdk//50)"
           scripts/record-provenance.sh \
             --output "Airloom-${arch}.provenance.json" \
-            --source-sha "${GITHUB_SHA}" \
+            --source-sha "${EXPECTED_SOURCE_SHA}" \
             --image-ref "ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77" \
             --image-digest "sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77" \
             --runtime-ref "${runtime_ref}" \
@@ -183,7 +214,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: airloom-repo-${{ matrix.arch }}
-          path: airloom-repo-${{ matrix.arch }}.tar
+          path: |
+            airloom-repo-${{ matrix.arch }}.tar
+            Airloom-${{ matrix.arch }}.provenance.json
           if-no-files-found: error
           retention-days: 7
 
@@ -206,7 +239,12 @@ jobs:
       - name: Checkout release history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
           fetch-depth: 0
+      - name: Verify checkout source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
       - name: Download current bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -217,6 +255,22 @@ jobs:
         with:
           pattern: airloom-repo-*
           path: repos
+      - name: Verify downloaded artifact provenance
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-eligibility.outputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          args=(
+            --provenance "dist/Airloom-${arch}.provenance.json"
+            --bundle "dist/Airloom-${arch}.flatpak"
+          )
+          for repo_arch in x86_64 aarch64; do
+            args+=(--provenance "repos/airloom-repo-${repo_arch}/Airloom-${repo_arch}.provenance.json")
+          done
+          python3 scripts/check-release-provenance.py \
+            --source-sha "${EXPECTED_SOURCE_SHA}" "${args[@]}"
       - name: Extract update-repo artifacts
         shell: bash
         run: |
@@ -332,123 +386,25 @@ jobs:
             --version "${EXPECTED_VERSION}" \
             --previous-version "${PREVIOUS_VERSION}"
 
-  release:
-    name: Publish GitHub release
+  publication:
+    name: Coordinate stable publication
     if: needs.release-eligibility.outputs.eligible == 'true'
-    needs: [flatpak, verify-client, release-eligibility]
-    runs-on: ubuntu-24.04
+    needs: [flatpak, verify-client, release-eligibility, webkit-ui]
+    # A reusable-workflow call remains running until both channels finish, so
+    # this is the only stable-publication contender for the entire run.
     concurrency:
       group: stable-publication
       cancel-in-progress: false
+    # This step-less call sets only the maximum permissions available to the
+    # reusable workflow; each called job opts into its own narrower set.
     permissions:
       contents: write
-    steps:
-      - name: Checkout release history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Revalidate release eligibility
-        shell: bash
-        env:
-          ALLOW_OLDER: ${{ inputs.allow_older }}
-          CONFIRM_TAG: ${{ inputs.confirm_tag }}
-        run: |
-          set -euo pipefail
-          git fetch --force --tags origin
-          args=(--ref "${GITHUB_REF}" --version-root .)
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${ALLOW_OLDER}" == "true" ]]; then
-            args+=(--allow-older --confirm-tag "${CONFIRM_TAG}")
-          fi
-          python3 scripts/check-release.py "${args[@]}"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: airloom-@(x86_64|aarch64)
-          path: dist
-          merge-multiple: true
-      - name: Generate checksums
-        run: cd dist && sha256sum *.flatpak > SHA256SUMS
-      - name: Create release and upload bundles
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/*.flatpak dist/SHA256SUMS dist/*.provenance.json \
-              --repo "${GITHUB_REPOSITORY}" \
-              --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" dist/*.flatpak dist/SHA256SUMS dist/*.provenance.json \
-              --repo "${GITHUB_REPOSITORY}" \
-              --verify-tag \
-              --generate-notes \
-              --title "Airloom ${GITHUB_REF_NAME#v}"
-          fi
-
-  publish-repo:
-    name: Publish update repository
-    if: needs.release-eligibility.outputs.eligible == 'true'
-    needs: [flatpak, verify-client, release-eligibility]
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: stable-publication
-      cancel-in-progress: false
-    container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77 # gnome-50
-      options: --privileged
-    permissions:
-      contents: read
       pages: write
       id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Checkout release history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Revalidate release eligibility
-        shell: bash
-        env:
-          ALLOW_OLDER: ${{ inputs.allow_older }}
-          CONFIRM_TAG: ${{ inputs.confirm_tag }}
-        run: |
-          set -euo pipefail
-          git fetch --force --tags origin
-          args=(--ref "${GITHUB_REF}" --version-root .)
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${ALLOW_OLDER}" == "true" ]]; then
-            args+=(--allow-older --confirm-tag "${CONFIRM_TAG}")
-          fi
-          python3 scripts/check-release.py "${args[@]}"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: airloom-repo-*
-          path: repos
-      - name: Extract update-repo artifacts
-        shell: bash
-        run: |
-          set -e
-          for dir in repos/airloom-repo-*/; do
-            dir="${dir%/}"
-            arch="${dir#repos/airloom-repo-}"
-            tar -xf "${dir}/airloom-repo-${arch}.tar" -C "${dir}"
-            rm -f "${dir}/airloom-repo-${arch}.tar"
-            rm -rf "${dir}.extracted"
-            mv "${dir}/repo" "${dir}.extracted"
-            rm -rf "${dir}"
-            mv "${dir}.extracted" "${dir}"
-          done
-      - name: Import production signing key
-        if: needs.release-eligibility.outputs.eligible == 'true'
-        env:
-          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
-          AIRLOOM_REQUIRE_PRODUCTION_KEY: "1"
-        run: scripts/import-signing-key.sh
-      - name: Assemble site
-        run: PUBKEY_FILE="${FLATPAK_GPG_PUBLIC_KEY}" scripts/publish-flatpak-repo.sh _site repos/airloom-repo-x86_64 repos/airloom-repo-aarch64
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: _site
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+    uses: ./.github/workflows/publish.yml
+    with:
+      source_sha: ${{ needs.release-eligibility.outputs.source_sha }}
+      allow_older: ${{ inputs.allow_older == true }}
+      confirm_tag: ${{ inputs.confirm_tag || '' }}
+    secrets:
+      FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}

@@ -16,10 +16,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHECK_RELEASE = PROJECT_ROOT / "scripts" / "check-release.py"
+CHECK_PROVENANCE = PROJECT_ROOT / "scripts" / "check-release-provenance.py"
 RECORD_PROVENANCE = PROJECT_ROOT / "scripts" / "record-provenance.sh"
 IMPORT_SIGNING_KEY = PROJECT_ROOT / "scripts" / "import-signing-key.sh"
 VERIFY_CLIENT = PROJECT_ROOT / "scripts" / "verify-flatpak-release.sh"
 WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "flatpak.yml"
+PUBLISH_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "publish.yml"
 SOURCE_SHA = "a" * 40
 RUNTIME_COMMIT = "b" * 64
 SDK_COMMIT = "c" * 64
@@ -240,6 +242,47 @@ class ReleaseEligibilityTest(unittest.TestCase):
         with release_checkout(tags=("v1.2.2",)) as root:
             self.assert_denied(check_release(root, "refs/tags/v1.2.3"))
 
+    def test_moved_tag_is_denied_for_the_captured_source_commit(self):
+        with release_checkout() as root:
+            intended = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            initial = check_release(
+                root, "refs/tags/v1.2.3", "--source-sha", intended
+            )
+            self.assert_eligible(initial)
+            self.assertIn(f"source_sha={intended}", initial.stdout)
+
+            run_git(root, "commit", "--allow-empty", "-qm", "same version, new source")
+            moved = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            run_git(root, "tag", "-f", "v1.2.3", moved)
+            run_git(root, "reset", "--hard", intended)
+
+            publication = check_release(
+                root, "refs/tags/v1.2.3", "--source-sha", intended
+            )
+            self.assert_denied(publication)
+            self.assertIn("tag v1.2.3 peeled commit", publication.stderr)
+            self.assertIn("does not match intended source", publication.stderr)
+
+    def test_annotated_tag_is_peeled_to_the_intended_source_commit(self):
+        with release_checkout(tags=("v1.2.2",)) as root:
+            run_git(root, "tag", "-a", "v1.2.3", "-m", "release v1.2.3")
+            intended = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            tag_object = subprocess.check_output(
+                ["git", "rev-parse", "refs/tags/v1.2.3"], cwd=root, text=True
+            ).strip()
+            self.assertNotEqual(tag_object, intended)
+
+            result = check_release(
+                root, "refs/tags/v1.2.3", "--source-sha", intended
+            )
+            self.assert_eligible(result)
+
 
 class ProvenanceTest(unittest.TestCase):
     def assert_denied(self, result: subprocess.CompletedProcess) -> None:
@@ -354,6 +397,57 @@ class ProvenanceTest(unittest.TestCase):
             )
             self.assert_denied(result)
             self.assertFalse(output.exists())
+
+
+class ProvenanceValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="airloom-provenance-check-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.bundle = self.root / "Airloom-x86_64.flatpak"
+        self.bundle.write_bytes(b"same-version fixture bundle\n")
+        self.provenance = self.root / "Airloom-x86_64.provenance.json"
+        result = subprocess.run(
+            provenance_command(self.provenance, self.bundle),
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def check(self, source_sha=SOURCE_SHA, *, bundle=True, provenance=None):
+        command = [
+            sys.executable,
+            str(CHECK_PROVENANCE),
+            "--source-sha",
+            source_sha,
+            "--provenance",
+            str(provenance or self.provenance),
+        ]
+        if bundle:
+            command.extend(("--bundle", str(self.bundle)))
+        return subprocess.run(
+            command, cwd=PROJECT_ROOT, capture_output=True, text=True
+        )
+
+    def test_matching_source_and_bundle_checksum_are_accepted(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_repository_provenance_is_bound_without_a_sibling_bundle(self):
+        result = self.check(bundle=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_same_version_artifact_from_a_different_commit_is_rejected(self):
+        result = self.check("e" * 40)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("source_sha", result.stderr)
+
+    def test_stale_bundle_does_not_match_recorded_checksum(self):
+        self.bundle.write_bytes(b"replacement bytes under the old tag\n")
+        result = self.check()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("checksum", result.stderr)
 
 
 class SigningKeyTest(unittest.TestCase):
@@ -794,11 +888,17 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = WORKFLOW.read_text(encoding="utf-8")
+        cls.publish_source = (
+            PUBLISH_WORKFLOW.read_text(encoding="utf-8")
+            if PUBLISH_WORKFLOW.exists()
+            else ""
+        )
         cls.eligibility = job_block(cls.source, "release-eligibility")
         cls.flatpak = job_block(cls.source, "flatpak")
         cls.verify = job_block(cls.source, "verify-client")
-        cls.release = job_block(cls.source, "release")
-        cls.publish = job_block(cls.source, "publish-repo")
+        cls.coordinator = job_block(cls.source, "publication")
+        cls.release = job_block(cls.publish_source, "release")
+        cls.publish = job_block(cls.publish_source, "publish-repo")
 
     def test_dispatch_exposes_typed_older_release_confirmation(self):
         self.assertRegex(
@@ -817,16 +917,18 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertTrue(self.eligibility, "release-eligibility job is missing")
         checkout = step_block(self.eligibility, "Checkout release history")
         self.assertIn("fetch-depth: 0", checkout)
+        self.assertIn("ref: ${{ github.sha }}", checkout)
         self.assertIn("--ref", self.eligibility)
         self.assertIn("--version-root", self.eligibility)
-        self.assertIn("needs: [test, release-eligibility]", self.flatpak)
+        self.assertIn('--source-sha "${EXPECTED_SOURCE_SHA}"', self.eligibility)
+        self.assertIn('echo "source_sha=${EXPECTED_SOURCE_SHA}"', self.eligibility)
+        self.assertIn("needs: [test, webkit-ui, release-eligibility]", self.flatpak)
 
     def test_production_and_ephemeral_signing_keys_are_explicitly_separated(self):
         eligible = "needs.release-eligibility.outputs.eligible == 'true'"
         for job_name, job in (
             ("flatpak", self.flatpak),
             ("verify-client", self.verify),
-            ("publish-repo", self.publish),
         ):
             with self.subTest(job=job_name):
                 production = step_block(job, "Import production signing key")
@@ -834,6 +936,11 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                 self.assertIn("AIRLOOM_REQUIRE_PRODUCTION_KEY", production)
                 self.assertIn("secrets.FLATPAK_GPG_PRIVATE_KEY", production)
                 self.assertIn("scripts/import-signing-key.sh", production)
+        publication_key = step_block(self.publish, "Import production signing key")
+        self.assertIn("AIRLOOM_REQUIRE_PRODUCTION_KEY", publication_key)
+        self.assertIn("secrets.FLATPAK_GPG_PRIVATE_KEY", publication_key)
+        self.assertIn("scripts/import-signing-key.sh", publication_key)
+        self.assertNotIn("needs.release-eligibility", publication_key)
         ephemeral = step_block(self.verify, "Generate ephemeral signing key")
         self.assertIn("needs.release-eligibility.outputs.eligible != 'true'", ephemeral)
         self.assertIn("AIRLOOM_EPHEMERAL_SIGNING_KEY", ephemeral)
@@ -842,14 +949,18 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
 
     def test_only_eligible_releases_can_publish_after_client_verification(self):
         eligible = "if: needs.release-eligibility.outputs.eligible == 'true'"
-        self.assertIn(eligible, self.release)
-        self.assertIn(eligible, self.publish)
+        self.assertIn(eligible, self.coordinator)
         self.assertTrue(self.verify, "verify-client job is missing")
         self.assertIn("needs: [flatpak, release-eligibility]", self.verify)
+        self.assertIn(
+            "needs: [flatpak, verify-client, release-eligibility, webkit-ui]",
+            self.coordinator,
+        )
+        self.assertIn("uses: ./.github/workflows/publish.yml", self.coordinator)
+        self.assertIn("needs: [release]", self.publish)
         for job in (self.release, self.publish):
-            self.assertIn(
-                "needs: [flatpak, verify-client, release-eligibility]", job
-            )
+            self.assertIn("scripts/check-release.py", job)
+            self.assertIn('--source-sha "${EXPECTED_SOURCE_SHA}"', job)
 
     def test_client_gate_assembles_signed_test_repo_and_verifies_every_architecture(self):
         for architecture in ("x86_64", "aarch64"):
@@ -917,6 +1028,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                     "ALLOW_OLDER: ${{ inputs.allow_older }}",
                     "CONFIRM_TAG: ${{ inputs.confirm_tag }}",
                     '--confirm-tag "${CONFIRM_TAG}"',
+                    '--source-sha "${EXPECTED_SOURCE_SHA}"',
                 ):
                     self.assertIn(expected, revalidation)
                 self.assertLess(
@@ -924,15 +1036,19 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                     job.index(f"name: {first_publication_step}"),
                 )
 
-    def test_publication_jobs_share_non_cancelling_cross_tag_serialization(self):
-        for job_name, job in (("release", self.release), ("publish-repo", self.publish)):
-            with self.subTest(job=job_name):
-                self.assertIn(
-                    "    concurrency:\n"
-                    "      group: stable-publication\n"
-                    "      cancel-in-progress: false\n",
-                    job,
-                )
+    def test_one_synchronous_coordinator_owns_cross_tag_publication_serialization(self):
+        self.assertIn(
+            "    concurrency:\n"
+            "      group: stable-publication\n"
+            "      cancel-in-progress: false\n",
+            self.coordinator,
+        )
+        self.assertIn("uses: ./.github/workflows/publish.yml", self.coordinator)
+        self.assertNotIn("concurrency:", self.release)
+        self.assertNotIn("concurrency:", self.publish)
+        combined = self.source + "\n" + self.publish_source
+        self.assertEqual(combined.count("group: stable-publication"), 1)
+        self.assertIn("needs: [release]", self.publish)
 
     def test_release_provenance_is_recorded_uploaded_and_attached(self):
         record = step_block(self.flatpak, "Record release provenance")
@@ -951,8 +1067,72 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             with self.subTest(argument=argument):
                 self.assertIn(argument, record)
         self.assertIn("flatpak info", record)
+        self.assertIn('--source-sha "${EXPECTED_SOURCE_SHA}"', record)
+        self.assertNotIn('--source-sha "${GITHUB_SHA}"', record)
         self.assertIn("provenance.json", step_block(self.flatpak, "Upload workflow artifact"))
+        self.assertIn(
+            "provenance.json",
+            step_block(self.flatpak, "Upload update-repo artifact"),
+        )
         self.assertIn("dist/*.provenance.json", self.release)
+
+    def test_downloaded_artifacts_are_bound_before_signing_or_publication(self):
+        for job, later_step in (
+            (self.verify, "Import production signing key"),
+            (self.release, "Create release and upload bundles"),
+            (self.publish, "Import production signing key"),
+        ):
+            with self.subTest(step=later_step):
+                self.assertIn("scripts/check-release-provenance.py", job)
+                self.assertIn('--source-sha "${EXPECTED_SOURCE_SHA}"', job)
+                self.assertLess(
+                    job.index("name: Verify downloaded artifact provenance"),
+                    job.index(f"name: {later_step}"),
+                )
+        release_check = step_block(self.release, "Verify downloaded artifact provenance")
+        self.assertIn("--bundle", release_check)
+        self.assertIn("for arch in x86_64 aarch64", release_check)
+        self.assertIn('dist/Airloom-${arch}.flatpak', release_check)
+        self.assertIn('dist/Airloom-${arch}.provenance.json', release_check)
+
+    def test_every_checkout_is_pinned_and_verified_against_one_source_commit(self):
+        for job_name, job in (
+            ("test", job_block(self.source, "test")),
+            ("webkit-ui", job_block(self.source, "webkit-ui")),
+            ("release-eligibility", self.eligibility),
+            ("flatpak", self.flatpak),
+            ("verify-client", self.verify),
+            ("release", self.release),
+            ("publish-repo", self.publish),
+        ):
+            with self.subTest(job=job_name):
+                self.assertIn("actions/checkout@", job)
+                self.assertRegex(job, r"(?m)^          ref: \$\{\{")
+                self.assertIn("git rev-parse HEAD", job)
+                self.assertIn("EXPECTED_SOURCE_SHA", job)
+        self.assertIn("outputs:\n      eligible:", self.eligibility)
+        self.assertIn("source_sha: ${{ steps.check.outputs.source_sha }}", self.eligibility)
+
+    def test_publication_permissions_and_secrets_remain_channel_scoped(self):
+        self.assertIn("permissions:\n      contents: write", self.release)
+        self.assertNotIn("pages: write", self.release)
+        self.assertNotIn("id-token: write", self.release)
+        self.assertNotIn("FLATPAK_GPG_PRIVATE_KEY", self.release)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", self.release)
+
+        self.assertIn("pages: write", self.publish)
+        self.assertIn("id-token: write", self.publish)
+        self.assertIn("contents: read", self.publish)
+        self.assertNotIn("contents: write", self.publish)
+        self.assertIn("secrets.FLATPAK_GPG_PRIVATE_KEY", self.publish)
+        self.assertNotIn("GH_TOKEN", self.publish)
+        self.assertIn(
+            "FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}",
+            self.coordinator,
+        )
+        for permission in ("contents: write", "pages: write", "id-token: write"):
+            with self.subTest(coordinator_permission=permission):
+                self.assertIn(permission, self.coordinator)
 
     def test_release_container_is_pinned_to_a_resolved_image_digest(self):
         self.assertRegex(
