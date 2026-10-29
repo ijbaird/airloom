@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import gi
@@ -32,7 +34,8 @@ from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 
 from . import __version__
 from .bridge import decode_message
-from .cache import SensorCache, fetch_area, fetch_favorites
+from .cache import CacheError, SensorCache, fetch_area, fetch_favorites
+from .controller import ApplicationController, RefreshRequest
 # Release bundles strip airloom/debugport.py (see packaging/*.yml), so debug
 # support degrades to "absent" rather than erroring when the module is gone.
 try:
@@ -42,15 +45,15 @@ except ImportError:  # pragma: no cover — only true in stripped release builds
     validate_command = None
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
+from .geography import Bounds, bounds_around, bounds_contains, split_bounds
 from .location import GeoClueLocator, is_coarse_fix
-from .models import Sensor, passes_confidence
+from .models import Sensor
+from .presentation import alert_transitions, visible_sensors
 from .purpleair import (
+    MAP_FIELDS,
     TREND_FETCH_FIELDS,
-    Bounds,
     PurpleAirClient,
     PurpleAirError,
-    bounds_around,
-    bounds_contains,
     cap_bounds,
     sensor_from_values,
     trend_from_values,
@@ -72,10 +75,106 @@ RESOURCE_DIR = Path(__file__).parent / "resources"
 LOCATOR_FOCUS_FALLBACK_SECONDS = 20
 
 
-def _filter_demo(sensors: list[Sensor], mode: str) -> list[Sensor]:
-    if mode not in ("indoor", "outdoor"):
-        return sensors
-    return [sensor for sensor in sensors if sensor.indoor == (mode == "indoor")]
+@dataclass(slots=True)
+class RefreshOutcome:
+    """Worker-owned readings and transport metadata for one refresh request."""
+
+    request: RefreshRequest
+    sensors: list[Sensor]
+    area_ids: set[int]
+    monitoring_ids: set[int]
+    source: str
+    origin: str
+    delivery: str
+    error: str | None
+    stale: bool
+    bounds: Bounds
+    capped: bool
+    provenance: dict[int, tuple[str, str]]
+
+
+def _open_sensor_cache() -> tuple[SensorCache | None, str | None]:
+    """Open persistence without making a cache failure fatal to live data."""
+    try:
+        return SensorCache(), None
+    except CacheError as exc:
+        warning = f"{exc}. Continuing without persistent caching."
+        print(f"Airloom: {warning}", file=sys.stderr)
+        return None, warning
+
+
+def _coverage_payload(requested: Bounds, fetched: Bounds) -> dict:
+    return {
+        "north": fetched.north,
+        "west": fetched.west,
+        "south": fetched.south,
+        "east": fetched.east,
+        "capped": requested != fetched,
+    }
+
+
+def _view_from_message(message: dict) -> tuple[Bounds, tuple[float, float]]:
+    view = Bounds(
+        float(message["north"]),
+        float(message["west"]),
+        float(message["south"]),
+        float(message["east"]),
+    )
+    center = (float(message["lat"]), float(message["lon"]))
+    if not (
+        all(math.isfinite(value) for value in center)
+        and -90 <= center[0] <= 90
+        and -180 <= center[1] <= 180
+    ):
+        raise ValueError("view center is outside its valid range")
+    return view, center
+
+
+def _presentation_collections(
+    sensors: list[Sensor],
+    *,
+    area_ids: set[int],
+    monitoring_ids: set[int],
+    hidden_ids: set[int],
+    confidence_filter: bool,
+    location_filter: str,
+) -> tuple[list[Sensor], list[Sensor], list[Sensor]]:
+    """Apply display rules once, keeping area and favorite inputs distinct."""
+    area = [sensor for sensor in sensors if sensor.sensor_id in area_ids]
+    remote = [
+        sensor
+        for sensor in sensors
+        if sensor.sensor_id in monitoring_ids
+        and sensor.sensor_id not in area_ids
+        and sensor.favorite
+    ]
+    visible = visible_sensors(
+        [*area, *remote],
+        hidden_ids=hidden_ids,
+        confidence_filter=confidence_filter,
+        location_filter=location_filter,
+    )
+    visible_ids = {sensor.sensor_id for sensor in visible}
+    visible_area = [sensor for sensor in area if sensor.sensor_id in visible_ids]
+    favorites = [sensor for sensor in visible if sensor.favorite]
+    return visible, visible_area, favorites
+
+
+def _sensor_payload(sensor: Sensor, *, remote_favorite: bool) -> dict:
+    payload = sensor.to_dict()
+    payload["remote_favorite"] = remote_favorite
+    return payload
+
+
+def _sensors_from_rows(rows) -> list[Sensor]:
+    sensors = []
+    seen = set()
+    for values in rows:
+        sensor = sensor_from_values(values)
+        if sensor is not None and sensor.sensor_id not in seen:
+            sensors.append(sensor)
+            seen.add(sensor.sensor_id)
+    return sensors
 
 
 def _no_sensors_message(mode: str) -> str:
@@ -85,6 +184,170 @@ def _no_sensors_message(mode: str) -> str:
 
 def _age_label(seconds: float) -> str:
     return "just now" if seconds < 90 else f"{int(seconds // 60)} min ago"
+
+
+def _fetch_readings(
+    config: dict,
+    cache: SensorCache | None,
+    request: RefreshRequest,
+    bounds: Bounds,
+    ttl: float,
+) -> RefreshOutcome:
+    """Fetch and cache in the worker; publication is authorized separately."""
+    mode = config.get("location_filter", "outdoor")
+    origin = "live" if config.get("api_key") else "demo"
+    delivery = "network"
+    source = "PurpleAir live" if origin == "live" else "Demo data"
+    error = None
+    stale = False
+    sensors: list[Sensor] = []
+    area_ids: set[int] = set()
+    monitoring_ids: set[int] = set()
+    provenance: dict[int, tuple[str, str]] = {}
+
+    try:
+        if config.get("api_key"):
+            client = PurpleAirClient(config["api_key"])
+            try:
+                cached_favorite_ids: set[int] = set()
+                if cache is None:
+                    area_rows = []
+                    for part in split_bounds(bounds):
+                        result = client.fetch_rows(
+                            bounds=part,
+                            location_filter=mode,
+                            fields=MAP_FIELDS,
+                        )
+                        area_rows.extend(result.rows)
+                    area_polled = True
+                    area_age = 0.0
+                else:
+                    area = fetch_area(client, cache, bounds, mode, ttl, request.force)
+                    area_rows = list(area.rows)
+                    area_polled = area.polled
+                    area_age = area.age
+
+                area_sensors = _sensors_from_rows(area_rows)
+                area_ids = {sensor.sensor_id for sensor in area_sensors}
+                missing_favorites = [
+                    sensor_id
+                    for sensor_id in request.favorite_ids
+                    if sensor_id not in area_ids
+                ]
+                favorite_rows = []
+                if missing_favorites:
+                    if cache is None:
+                        favorite_rows = client.fetch_rows(
+                            show_only=sorted(missing_favorites)
+                        ).rows
+                    else:
+                        if not request.force:
+                            cached_favorite_ids = set(
+                                cache.fresh_sensors(missing_favorites, ttl)
+                            )
+                        favorite_rows = fetch_favorites(
+                            client,
+                            cache,
+                            request.favorite_ids,
+                            area_ids,
+                            ttl,
+                            request.force,
+                        )
+
+                favorite_sensors = _sensors_from_rows(favorite_rows)
+                monitoring_ids = {
+                    sensor.sensor_id
+                    for sensor in favorite_sensors
+                    if sensor.sensor_id not in area_ids
+                }
+                sensors = [
+                    *area_sensors,
+                    *[
+                        sensor
+                        for sensor in favorite_sensors
+                        if sensor.sensor_id not in area_ids
+                    ],
+                ]
+                area_delivery = "network" if area_polled else "cache"
+                provenance = {
+                    sensor.sensor_id: ("live", area_delivery)
+                    for sensor in area_sensors
+                }
+                provenance.update(
+                    {
+                        sensor.sensor_id: (
+                            "live",
+                            "cache"
+                            if sensor.sensor_id in cached_favorite_ids
+                            else "network",
+                        )
+                        for sensor in favorite_sensors
+                        if sensor.sensor_id not in area_ids
+                    }
+                )
+                delivery = area_delivery
+                source = (
+                    "PurpleAir live"
+                    if area_polled
+                    else f"PurpleAir · cached {_age_label(area_age)}"
+                )
+                if not sensors:
+                    error = _no_sensors_message(mode)
+            except PurpleAirError as exc:
+                stale_rows = [] if cache is None else cache.sensors_in(bounds)
+                stale_sensors = _sensors_from_rows(stale_rows)
+                if stale_sensors:
+                    # Retrieval is degraded, but each observation keeps its own
+                    # last_seen timestamp for alert freshness decisions.
+                    sensors = stale_sensors
+                    area_ids = {sensor.sensor_id for sensor in stale_sensors}
+                    monitoring_ids = set()
+                    provenance = {
+                        sensor.sensor_id: ("live", "cache")
+                        for sensor in stale_sensors
+                    }
+                    origin = "live"
+                    delivery = "cache"
+                    stale = True
+                    source = "PurpleAir · cached"
+                    error = f"{exc} Showing cached readings."
+                else:
+                    sensors = demo_sensors(request.center[0], request.center[1])
+                    area_ids = {sensor.sensor_id for sensor in sensors}
+                    provenance = {
+                        sensor.sensor_id: ("demo", "network") for sensor in sensors
+                    }
+                    origin = "demo"
+                    delivery = "network"
+                    source = "Demo data"
+                    error = f"{exc} Showing demo readings instead."
+        else:
+            sensors = demo_sensors(request.center[0], request.center[1])
+            area_ids = {sensor.sensor_id for sensor in sensors}
+            provenance = {
+                sensor.sensor_id: ("demo", "network") for sensor in sensors
+            }
+    except Exception as exc:  # noqa: BLE001 — a worker failure must still finalize
+        sensors = []
+        area_ids = set()
+        monitoring_ids = set()
+        provenance = {}
+        error = f"Refresh failed unexpectedly: {exc}"
+
+    return RefreshOutcome(
+        request=request,
+        sensors=sensors,
+        area_ids=area_ids,
+        monitoring_ids=monitoring_ids,
+        source=source,
+        origin=origin,
+        delivery=delivery,
+        error=error,
+        stale=stale,
+        bounds=bounds,
+        capped=request.bounds != bounds,
+        provenance=provenance,
+    )
 
 
 class AirloomApplication(Adw.Application):
@@ -115,15 +378,18 @@ class AirloomApplication(Adw.Application):
         # _compute_build_id.
         self._debug_build_id: str | None = self._compute_build_id() if self.debug_mode else None
         self.store = Store()
-        self.cache = SensorCache()
+        self.controller = ApplicationController(self.store.data)
+        self.cache, self._cache_error = _open_sensor_cache()
         self._auto_refresh_id: int | None = None
         self.window: Adw.ApplicationWindow | None = None
         self.webview: WebKit.WebView | None = None
         self.title: Adw.WindowTitle | None = None
         self.sensors: list[Sensor] = []
+        self._area_ids: set[int] = set()
+        self._monitoring_ids: set[int] = set()
         self.selected_id: int | None = None
         self.refreshing = False
-        self.pending_fetch: tuple | None = None
+        self.pending_fetch: RefreshRequest | None = None
         self.locator: GeoClueLocator | None = None
         self._locator_focus_handler: int | None = None
         self._locator_focus_fallback: int | None = None
@@ -132,6 +398,9 @@ class AirloomApplication(Adw.Application):
         # that resend sensor state without refetching (e.g. favorite toggles)
         # never guess a label that contradicts what was actually fetched.
         self.last_source: str | None = None
+        self.last_origin = "live"
+        self.last_stale = False
+        self.coverage: dict | None = None
         # Where the user is currently looking, stamped as one (bounds, center)
         # pair so the auto-refresh timer can never combine a stale half.
         self.current_view: tuple[Bounds, tuple[float, float]] | None = None
@@ -315,11 +584,7 @@ class AirloomApplication(Adw.Application):
         # who panned elsewhere shouldn't watch their markers get replaced by
         # home-area sensors on every refresh tick. Favorites are still folded in so
         # the alert check keeps covering starred sensors regardless of view.
-        if self.current_view is not None:
-            bounds, center = self.current_view
-            self._start_fetch(bounds, center, include_favorites=True)
-        else:
-            self.refresh()
+        self.refresh()
         return GLib.SOURCE_CONTINUE
 
     def _on_decide_policy(self, _webview, decision, decision_type) -> bool:
@@ -429,6 +694,7 @@ class AirloomApplication(Adw.Application):
             return
         self.store.data.update({"latitude": float(latitude), "longitude": float(longitude)})
         self.store.save()
+        self.controller.set_config(self.store.data)
         self._send(
             "location",
             {
@@ -438,7 +704,7 @@ class AirloomApplication(Adw.Application):
                 "source": "geoclue",
             },
         )
-        self.refresh()
+        self._refresh_home()
         threading.Thread(
             target=self._reverse_label_worker, args=(float(latitude), float(longitude)), name="airloom-revgeo", daemon=True
         ).start()
@@ -476,6 +742,8 @@ class AirloomApplication(Adw.Application):
         action = message.get("action")
         if action == "ready":
             self._send("config", self.store.public_config())
+            if self._cache_error:
+                self._send("error", {"message": self._cache_error})
             self._paint_cached_home()
             self.refresh()
         elif action == "refresh":
@@ -489,6 +757,7 @@ class AirloomApplication(Adw.Application):
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None and any(sensor.sensor_id == sensor_id for sensor in self.sensors):
                 enabled = self.store.toggle_favorite(sensor_id)
+                self.controller.set_config(self.store.data)
                 for sensor in self.sensors:
                     if sensor.sensor_id == sensor_id:
                         sensor.favorite = enabled
@@ -498,19 +767,23 @@ class AirloomApplication(Adw.Application):
             if sensor_id is not None:
                 if self.store.is_hidden(sensor_id):
                     self.store.unhide(sensor_id)
+                    self.controller.set_config(self.store.data)
                     self._send_sensor_state()
                 else:
                     sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
                     if sensor is not None:
                         self.store.hide(sensor_id, sensor.name)
+                        self.controller.set_config(self.store.data)
                         self._send_sensor_state()
         elif action == "unhide":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None:
                 self.store.unhide(sensor_id)
+                self.controller.set_config(self.store.data)
                 self._send_sensor_state()
         elif action == "unhide-all":
             self.store.unhide_all()
+            self.controller.set_config(self.store.data)
             self._send_sensor_state()
         elif action == "save-settings":
             self._save_settings(message)
@@ -533,25 +806,15 @@ class AirloomApplication(Adw.Application):
 
     def _on_view_changed(self, message: dict) -> None:
         try:
-            view = Bounds(
-                float(message["north"]), float(message["west"]),
-                float(message["south"]), float(message["east"]),
-            )
-            center = (float(message["lat"]), float(message["lon"]))
-        except (KeyError, TypeError, ValueError):
-            return
-        if not (
-            -90 <= view.south <= view.north <= 90
-            and -180 <= view.west <= 180
-            and -180 <= view.east <= 180
-            and view.west <= view.east
-        ):
+            view, center = _view_from_message(message)
+        except (KeyError, TypeError, ValueError, OverflowError):
             return
         self.current_view = (view, center)
+        self.controller.set_view(message)
         fresh = (time.monotonic() - self.view_fetched_at) < self._refresh_seconds()
         if self.view_bounds is not None and fresh and bounds_contains(self.view_bounds, view):
             return
-        self._start_fetch(view, center, include_favorites=False)
+        self._start_fetch(self.controller.begin_refresh())
         self._start_view_label(*center)
 
     def _start_view_label(self, latitude: float, longitude: float) -> None:
@@ -606,12 +869,9 @@ class AirloomApplication(Adw.Application):
             return
         self.store.data["location_filter"] = value
         self.store.save()
+        self.controller.set_config(self.store.data)
         self._send("config", self.store.public_config())
-        if self.current_view is not None:
-            bounds, center = self.current_view
-            self._start_fetch(bounds, center, include_favorites=True)
-        else:
-            self.refresh()
+        self.refresh()
 
     def _save_settings(self, message: dict) -> None:
         previous_mode = self.store.data.get("home_mode")
@@ -652,6 +912,7 @@ class AirloomApplication(Adw.Application):
         elif api_key:
             self.store.data["api_key"] = api_key
         self.store.save()
+        self.controller.set_config(self.store.data)
         self._arm_auto_refresh()
         if self.title:
             self.title.set_subtitle(self.store.data["location_name"])
@@ -676,114 +937,115 @@ class AirloomApplication(Adw.Application):
                     "source": "fixed",
                 },
             )
-        if home_pinned or self.current_view is None:
-            self.refresh()
+        if home_pinned:
+            self._refresh_home()
         else:
-            # Any other save keeps the user where they're looking: refetch
-            # the current view (same rule as the location filter) instead of
-            # yanking the sensor list back to the home area.
-            bounds, center = self.current_view
-            self._start_fetch(bounds, center, include_favorites=True)
+            # Preference and filter changes keep the current viewport target.
+            self.refresh()
 
     def _paint_cached_home(self) -> None:
         """First paint from the cache so launch never blocks on the network.
         The refresh that follows replaces it under the normal TTL rules."""
-        if self.sensors or not self.store.data.get("api_key"):
+        if self.sensors or self.cache is None or not self.store.data.get("api_key"):
             return
         config = self.store.data
         bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
-        cached = [s for s in map(sensor_from_values, self.cache.sensors_in(bounds)) if s is not None]
+        cached = _sensors_from_rows(self.cache.sensors_in(bounds))
         if cached:
+            favorites = set(config.get("favorites", []))
+            for sensor in cached:
+                sensor.favorite = sensor.sensor_id in favorites
+                sensor.origin = "live"
+                sensor.delivery = "cache"
             self.sensors = cached
+            self._area_ids = {sensor.sensor_id for sensor in cached}
+            self._monitoring_ids = set()
+            self.last_origin = "live"
+            self.last_stale = False
+            self.coverage = _coverage_payload(bounds, bounds)
             self._send_sensor_state("PurpleAir · cached")
 
     def refresh(self, force: bool = False) -> None:
-        """Home refresh: home bounds plus favorited sensors wherever they are."""
-        config = self.store.data
-        bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
-        self._start_fetch(bounds, (config["latitude"], config["longitude"]),
-                          include_favorites=True, force=force)
+        """Refresh the current view, falling back to home before one exists."""
+        self._start_fetch(self.controller.begin_refresh(force=force))
 
-    def _start_fetch(self, bounds: Bounds, center: tuple[float, float],
-                     include_favorites: bool, force: bool = False) -> None:
+    def _refresh_home(self, force: bool = False) -> None:
+        """Explicit recentering is separate from ordinary Refresh actions."""
+        config = self.store.data
+        center = (float(config["latitude"]), float(config["longitude"]))
+        bounds = bounds_around(*center, float(config["radius_km"]))
+        self.current_view = (bounds, center)
+        self.controller.set_view(
+            {
+                "north": bounds.north,
+                "west": bounds.west,
+                "south": bounds.south,
+                "east": bounds.east,
+                "lat": center[0],
+                "lon": center[1],
+            }
+        )
+        self.refresh(force=force)
+
+    def _start_fetch(self, request: RefreshRequest) -> None:
         if not self.webview:
             return
         if self.refreshing:
-            # Coalesce: the newest request wins and runs when the current lands.
-            self.pending_fetch = (bounds, center, include_favorites, force)
+            # The descriptor is already registered, so its newer identity also
+            # supersedes the active completion while only one worker runs.
+            self.pending_fetch = request
             return
         self.refreshing = True
-        bounds = cap_bounds(bounds, center)
+        bounds = cap_bounds(request.bounds, request.center)
         self._send("loading", {"active": True})
         config = dict(self.store.data)
         ttl = self._refresh_seconds()
 
         def worker() -> None:
-            source = "Demo data"
-            error = None
-            sensors: list[Sensor] = []
-            mode = config.get("location_filter", "outdoor")
-            try:
-                if config.get("api_key"):
-                    client = PurpleAirClient(config["api_key"])
-                    try:
-                        area = fetch_area(client, self.cache, bounds, mode, ttl, force)
-                        rows = list(area.rows)
-                        if include_favorites:
-                            have = {r.get("sensor_index") for r in rows}
-                            rows += fetch_favorites(client, self.cache,
-                                                    config.get("favorites", []), have, ttl, force)
-                        sensors = [s for s in map(sensor_from_values, rows) if s is not None]
-                        source = "PurpleAir live" if area.polled else \
-                            f"PurpleAir · cached {_age_label(area.age)}"
-                        if not sensors:
-                            error = _no_sensors_message(mode)
-                    except PurpleAirError as exc:
-                        stale = [s for s in map(sensor_from_values, self.cache.sensors_in(bounds))
-                                 if s is not None]
-                        if stale:
-                            # Stale real readings beat fake ones; demo only when
-                            # the cache has nothing for this area.
-                            sensors = stale
-                            source = "PurpleAir · cached"
-                            error = f"{exc} Showing cached readings."
-                        else:
-                            sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
-                            source = "Demo data"
-                            error = f"{exc} Showing demo readings instead."
-                else:
-                    sensors = _filter_demo(demo_sensors(center[0], center[1]), mode)
-            except Exception as exc:  # noqa: BLE001 — a crashed worker must never wedge the refresh state
-                sensors = []
-                error = f"Refresh failed unexpectedly: {exc}"
-            GLib.idle_add(self._finish_refresh, sensors, source, error, bounds)
+            outcome = _fetch_readings(config, self.cache, request, bounds, ttl)
+            GLib.idle_add(self._finish_refresh, outcome)
 
         threading.Thread(target=worker, name="airloom-refresh", daemon=True).start()
 
-    def _finish_refresh(self, sensors: list[Sensor], source: str, error: str | None, bounds: Bounds) -> bool:
-        favorites = set(self.store.data.get("favorites", []))
-        for sensor in sensors:
-            sensor.favorite = sensor.sensor_id in favorites
-        self.sensors = sensors
-        if self.selected_id not in {sensor.sensor_id for sensor in sensors}:
-            self.selected_id = sensors[0].sensor_id if sensors else None
-        self.refreshing = False
-        self.last_source = source
-        self._send_sensor_state(source)
-        self._send("loading", {"active": False})
-        if error:
-            self._send("error", {"message": error})
-        self._check_alerts()
-        if error is None:
-            # A transient live-API failure must not be remembered as fresh —
-            # that would suppress retries for the refresh interval.
-            self.view_bounds = bounds
-            self.view_fetched_at = time.monotonic()
-        if self.selected_id is not None:
-            self._ensure_trend(self.selected_id)
-        if self.pending_fetch is not None:
-            pending, self.pending_fetch = self.pending_fetch, None
-            self._start_fetch(*pending)
+    def _finish_refresh(self, outcome: RefreshOutcome) -> bool:
+        try:
+            decision = self.controller.complete_refresh(
+                outcome.request,
+                outcome.sensors,
+                outcome.origin,
+                outcome.delivery,
+            )
+            if decision.publish:
+                for sensor in outcome.sensors:
+                    sensor.origin, sensor.delivery = outcome.provenance.get(
+                        sensor.sensor_id,
+                        (outcome.origin, outcome.delivery),
+                    )
+                self.sensors = outcome.sensors
+                self._area_ids = set(outcome.area_ids)
+                self._monitoring_ids = set(outcome.monitoring_ids)
+                self.last_source = outcome.source
+                self.last_origin = outcome.origin
+                self.last_stale = outcome.stale
+                self.coverage = _coverage_payload(
+                    outcome.request.bounds, outcome.bounds
+                )
+                self._send_sensor_state(outcome.source)
+                if outcome.error:
+                    self._send("error", {"message": outcome.error})
+                self._check_alerts()
+                if outcome.error is None:
+                    # Failed live retrieval must not suppress the next retry.
+                    self.view_bounds = outcome.bounds
+                    self.view_fetched_at = time.monotonic()
+                for sensor_id in decision.trend_ids:
+                    self._ensure_trend(sensor_id)
+        finally:
+            self.refreshing = False
+            self._send("loading", {"active": False})
+            if self.pending_fetch is not None:
+                pending, self.pending_fetch = self.pending_fetch, None
+                self._start_fetch(pending)
         return GLib.SOURCE_REMOVE
 
     def _ensure_trend(self, sensor_id: int) -> None:
@@ -794,7 +1056,11 @@ class AirloomApplication(Adw.Application):
         sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
         if sensor is None:
             return
-        cached = self.cache.get_trend(sensor_id, self._refresh_seconds())
+        cached = (
+            self.cache.get_trend(sensor_id, self._refresh_seconds())
+            if self.cache is not None
+            else None
+        )
         if cached is not None:
             if sensor.trend != cached:
                 sensor.trend = cached
@@ -817,7 +1083,8 @@ class AirloomApplication(Adw.Application):
 
     def _finish_trend(self, sensor_id: int, trend: list | None) -> bool:
         if trend:
-            self.cache.store_trend(sensor_id, trend)
+            if self.cache is not None:
+                self.cache.store_trend(sensor_id, trend)
             sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
             if sensor is not None:
                 sensor.trend = trend
@@ -825,20 +1092,48 @@ class AirloomApplication(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:
-        hidden = self.store.hidden_ids()
-        confidence_on = bool(self.store.data.get("confidence_filter", True))
-        visible = [
-            sensor for sensor in self.sensors
-            if sensor.sensor_id not in hidden and passes_confidence(sensor, confidence_on)
-        ]
-        # Hiding the selected sensor must not leave a dangling selection —
-        # same reconciliation rule _finish_refresh applies after a fetch.
+        visible, area, favorites = _presentation_collections(
+            self.sensors,
+            area_ids=self._area_ids,
+            monitoring_ids=self._monitoring_ids,
+            hidden_ids=self.store.hidden_ids(),
+            confidence_filter=bool(self.store.data.get("confidence_filter", True)),
+            location_filter=self.store.data.get("location_filter", "outdoor"),
+        )
+        # Hiding or filtering the selected sensor must not leave a dangling ID.
         if self.selected_id not in {sensor.sensor_id for sensor in visible}:
             self.selected_id = visible[0].sensor_id if visible else None
+        if self.coverage is None:
+            if self.current_view is not None:
+                bounds = self.current_view[0]
+            else:
+                config = self.store.data
+                bounds = bounds_around(
+                    config["latitude"], config["longitude"], config["radius_km"]
+                )
+            self.coverage = _coverage_payload(bounds, bounds)
         payload = {
-            "items": [sensor.to_dict() for sensor in visible],
+            "items": [
+                _sensor_payload(
+                    sensor,
+                    remote_favorite=sensor.sensor_id not in self._area_ids,
+                )
+                for sensor in visible
+            ],
+            "area": [
+                _sensor_payload(sensor, remote_favorite=False) for sensor in area
+            ],
+            "favorites": [
+                _sensor_payload(
+                    sensor,
+                    remote_favorite=sensor.sensor_id not in self._area_ids,
+                )
+                for sensor in favorites
+            ],
             "selected_id": self.selected_id,
             "source": source or self.last_source or ("PurpleAir live" if self.store.data.get("api_key") else "Demo data"),
+            "stale": bool(self.last_stale),
+            "coverage": dict(self.coverage),
             "config": self.store.public_config(),
         }
         self._send("sensors", payload)
@@ -848,37 +1143,42 @@ class AirloomApplication(Adw.Application):
             threshold = int(self.store.data.get("alert_threshold", 101))
         except (TypeError, ValueError):
             threshold = 101
-        states = self.store.data.setdefault("alert_states", {})
-        changed = False
-        favorite_keys = {str(sensor_id) for sensor_id in self.store.data.get("favorites", [])}
-        for stale_key in [key for key in states if key not in favorite_keys]:
-            del states[stale_key]
-            changed = True
-        hidden = self.store.hidden_ids()
-        confidence_on = bool(self.store.data.get("confidence_filter", True))
-        for sensor in self.sensors:
-            if not sensor.favorite or sensor.aqi is None or sensor.sensor_id in hidden:
-                continue
-            if not passes_confidence(sensor, confidence_on):
-                continue
-            key = str(sensor.sensor_id)
-            was_high = bool(states.get(key, False))
-            is_high = sensor.aqi >= threshold
-            if is_high != was_high:
-                states[key] = is_high
-                changed = True
-                if is_high:
-                    notification = Notify.Notification.new(
-                        f"Air quality alert · {sensor.name[:80]}",
-                        f"AQI is now {sensor.aqi}. Open Airloom for health guidance.",
-                        APP_ID,
-                    )
-                    try:
-                        notification.show()
-                    except GLib.Error:
-                        pass
-        if changed:
-            self.store.save()
+        visible, _area, _favorites = _presentation_collections(
+            self.sensors,
+            area_ids=self._area_ids,
+            monitoring_ids=self._monitoring_ids,
+            hidden_ids=self.store.hidden_ids(),
+            confidence_filter=bool(self.store.data.get("confidence_filter", True)),
+            location_filter=self.store.data.get("location_filter", "outdoor"),
+        )
+        previous = dict(self.store.data.get("alert_states", {}))
+        alerted, states = alert_transitions(
+            visible,
+            favorites={int(sensor_id) for sensor_id in self.store.data.get("favorites", [])},
+            previous=previous,
+            threshold=threshold,
+            now=time.time(),
+            origin=self.last_origin,
+        )
+        for sensor in alerted:
+            notification = Notify.Notification.new(
+                f"Air quality alert · {sensor.name[:80]}",
+                f"AQI is now {sensor.aqi}. Open Airloom for health guidance.",
+                APP_ID,
+            )
+            try:
+                notification.show()
+            except GLib.Error:
+                pass
+        if states != previous:
+            self.store.data["alert_states"] = states
+            try:
+                self.store.save()
+            except Exception as exc:  # noqa: BLE001 — persistence is nonfatal here
+                self._send(
+                    "error",
+                    {"message": f"Could not save alert state: {exc}"},
+                )
 
     def _send(self, event: str, payload) -> None:
         if not self.webview:
