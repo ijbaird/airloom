@@ -397,6 +397,62 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("needs: [flatpak, release-eligibility]", self.release)
         self.assertIn("needs: [flatpak, release-eligibility]", self.publish)
 
+    def test_newer_tag_after_initial_eligibility_is_rejected_at_publication(self):
+        with release_checkout() as root:
+            initial = check_release(root, "refs/tags/v1.2.3")
+            self.assertEqual(initial.returncode, 0, initial.stdout + initial.stderr)
+
+            write_version_files(
+                root,
+                package="1.2.4",
+                changelog="1.2.4",
+                appstream="1.2.4",
+            )
+            run_git(root, "add", ".")
+            run_git(root, "commit", "-qm", "newer release")
+            run_git(root, "tag", "v1.2.4")
+            run_git(root, "reset", "--hard", "HEAD~1")
+
+            publication = check_release(root, "refs/tags/v1.2.3")
+            self.assertNotEqual(
+                publication.returncode, 0, publication.stdout + publication.stderr
+            )
+            self.assertTrue(
+                publication.stderr.startswith("release eligibility denied:"),
+                publication.stdout + publication.stderr,
+            )
+
+        for job, first_publication_step in (
+            (self.release, "Create release and upload bundles"),
+            (self.publish, "Import signing key"),
+        ):
+            with self.subTest(publication_step=first_publication_step):
+                checkout = step_block(job, "Checkout release history")
+                self.assertIn("fetch-depth: 0", checkout)
+                revalidation = step_block(job, "Revalidate release eligibility")
+                for expected in (
+                    "git fetch --force --tags origin",
+                    "scripts/check-release.py",
+                    "ALLOW_OLDER: ${{ inputs.allow_older }}",
+                    "CONFIRM_TAG: ${{ inputs.confirm_tag }}",
+                    '--confirm-tag "${CONFIRM_TAG}"',
+                ):
+                    self.assertIn(expected, revalidation)
+                self.assertLess(
+                    job.index("name: Revalidate release eligibility"),
+                    job.index(f"name: {first_publication_step}"),
+                )
+
+    def test_publication_jobs_share_non_cancelling_cross_tag_serialization(self):
+        for job_name, job in (("release", self.release), ("publish-repo", self.publish)):
+            with self.subTest(job=job_name):
+                self.assertIn(
+                    "    concurrency:\n"
+                    "      group: stable-publication\n"
+                    "      cancel-in-progress: false\n",
+                    job,
+                )
+
     def test_release_provenance_is_recorded_uploaded_and_attached(self):
         record = step_block(self.flatpak, "Record release provenance")
         for argument in (
