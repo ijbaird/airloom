@@ -48,11 +48,11 @@ Wrapped sensor copies, interrupted animations, failed tiles, stale search contex
 
 **Interfaces:** `reconcileKeyed(container, items, key, create, update)` preserves existing nodes and logical focus; returns focus metadata for removed active items.
 
-- [ ] Add failing DOM-stub tests for keyed list/marker updates, focus after select/trend/refresh/hide, popup/detail focus restoration; add contract checks for dialog name, search label/focus, live region, favorite `aria-pressed`, popup clamping, search z-index, and narrow top controls.
-- [ ] Run focused Node tests; confirm failures.
-- [ ] Implement keyed reconciliation and deliberate focus, accessible metadata/live statuses/interface-scale hooks, popup collision placement, overlay stacking, responsive reflow, and persistent demo/stale/coverage indicators.
-- [ ] Run Node tests and syntax checks; expect PASS.
-- [ ] Commit `fix: preserve focus and accessible sensor workflows`.
+- [x] Add failing DOM-stub tests for keyed list/marker updates, focus after select/trend/refresh/hide, popup/detail focus restoration; add contract checks for dialog name, search label/focus, live region, favorite `aria-pressed`, popup clamping, search z-index, and narrow top controls.
+- [x] Run focused Node tests; confirm failures.
+- [x] Implement keyed reconciliation and deliberate focus, accessible metadata/live statuses/interface-scale hooks, popup collision placement, overlay stacking, responsive reflow, and persistent demo/stale/coverage indicators.
+- [x] Run Node tests and syntax checks; expect PASS.
+- [x] Commit `fix: preserve focus and accessible sensor workflows`.
 
 ### Task 4: Search, trends, and preview adapters
 
