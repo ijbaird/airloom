@@ -58,6 +58,7 @@ from .purpleair import (
     sensor_from_values,
     trend_from_values,
 )
+from .requests import RequestRegistry, RequestToken
 from .store import Store
 
 # How long a debug-port `eval` command waits for evaluate_javascript to
@@ -379,6 +380,7 @@ class AirloomApplication(Adw.Application):
         self._debug_build_id: str | None = self._compute_build_id() if self.debug_mode else None
         self.store = Store()
         self.controller = ApplicationController(self.store.data)
+        self.requests = RequestRegistry()
         self.cache, self._cache_error = _open_sensor_cache()
         self._auto_refresh_id: int | None = None
         self.window: Adw.ApplicationWindow | None = None
@@ -388,6 +390,7 @@ class AirloomApplication(Adw.Application):
         self._area_ids: set[int] = set()
         self._monitoring_ids: set[int] = set()
         self.selected_id: int | None = None
+        self._trend_inflight: dict[int, tuple[RequestToken, int | None]] = {}
         self.refreshing = False
         self.pending_fetch: RefreshRequest | None = None
         self.locator: GeoClueLocator | None = None
@@ -405,9 +408,9 @@ class AirloomApplication(Adw.Application):
         # pair so the auto-refresh timer can never combine a stale half.
         self.current_view: tuple[Bounds, tuple[float, float]] | None = None
         self.view_fetched_at = 0.0
-        # Monotonic ticket for view-center reverse lookups: only the newest
-        # request may label the chip, so a slow lookup for a view the user
-        # already left can never overwrite a fresher name.
+        # Reverse labels carry both request identity and their exact target;
+        # generation alone cannot authorize a callback after coordinates change.
+        self._home_name_generation = 0
         self._view_name_generation = 0
         self._pinch_gesture: Gtk.GestureZoom | None = None
         self._debug_port: DebugPort | None = None
@@ -539,6 +542,8 @@ class AirloomApplication(Adw.Application):
         # focused app; a request fired before our window is focused crashes
         # the dialog and comes back as a denial (gnome-shell#7548). Wait for
         # focus so the dialog can attach to our window.
+        if self.store.data.get("home_mode") != "auto":
+            return
         if self.window.is_active():
             self._start_locator()
             return
@@ -553,10 +558,14 @@ class AirloomApplication(Adw.Application):
         if not window.is_active():
             return
         self._clear_locator_focus_wait()
-        self._start_locator()
+        if self.store.data.get("home_mode") == "auto":
+            self._start_locator()
 
     def _on_locator_focus_fallback(self) -> bool:
         self._locator_focus_fallback = None
+        if self.store.data.get("home_mode") != "auto":
+            self._clear_locator_focus_wait()
+            return GLib.SOURCE_REMOVE
         # Fire even without focus — better than never asking — but keep the
         # focus handler connected: if the window gains focus later, the retry
         # replaces this attempt, which GNOME may have refused unfocused.
@@ -705,25 +714,59 @@ class AirloomApplication(Adw.Application):
             },
         )
         self._refresh_home()
+        self._home_name_generation += 1
+        generation = self._home_name_generation
+        token = self.requests.begin("home-label", generation)
         threading.Thread(
-            target=self._reverse_label_worker, args=(float(latitude), float(longitude)), name="airloom-revgeo", daemon=True
+            target=self._reverse_label_worker,
+            args=(float(latitude), float(longitude), generation, token),
+            name="airloom-revgeo",
+            daemon=True,
         ).start()
 
-    def _reverse_label_worker(self, latitude: float, longitude: float) -> None:
+    def _reverse_label_worker(
+        self,
+        latitude: float,
+        longitude: float,
+        generation: int,
+        token: RequestToken,
+    ) -> None:
         try:
             name = reverse_geocode(latitude, longitude)
         except GeocodeError as exc:
             print(f"Airloom: {exc}", file=sys.stderr)
             name = f"{latitude:.2f}, {longitude:.2f}"
-        GLib.idle_add(self._apply_location_name, name)
+        GLib.idle_add(
+            self._apply_location_name,
+            name,
+            latitude,
+            longitude,
+            generation,
+            token,
+        )
 
-    def _apply_location_name(self, name: str) -> bool:
-        if self.store.data.get("home_mode") == "auto":
-            self.store.data["location_name"] = name[:80]
+    def _apply_location_name(
+        self,
+        name: str,
+        latitude: float,
+        longitude: float,
+        generation: int,
+        token: RequestToken,
+    ) -> bool:
+        config = self.store.data
+        current_home = (config.get("latitude"), config.get("longitude"))
+        if (
+            self.requests.is_current(token)
+            and generation == self._home_name_generation
+            and config.get("home_mode") == "auto"
+            and current_home == (latitude, longitude)
+        ):
+            config["location_name"] = name[:80]
             self.store.save()
             if self.title:
                 self.title.set_subtitle(name[:80])
             self._send("config", self.store.public_config())
+        self.requests.finish(token)
         return GLib.SOURCE_REMOVE
 
     def _on_script_message(self, _manager, value) -> None:
@@ -824,33 +867,68 @@ class AirloomApplication(Adw.Application):
     def _start_view_label(self, latitude: float, longitude: float) -> None:
         """Label the summary chip with the area the user is now looking at."""
         self._view_name_generation += 1
+        generation = self._view_name_generation
+        token = self.requests.begin("view-label", generation)
         threading.Thread(
             target=self._view_label_worker,
-            args=(latitude, longitude, self._view_name_generation),
+            args=(latitude, longitude, generation, token),
             name="airloom-viewgeo",
             daemon=True,
         ).start()
 
-    def _view_label_worker(self, latitude: float, longitude: float, generation: int) -> None:
+    def _view_label_worker(
+        self,
+        latitude: float,
+        longitude: float,
+        generation: int,
+        token: RequestToken,
+    ) -> None:
         try:
             name = reverse_geocode(latitude, longitude)
         except GeocodeError as exc:
             print(f"Airloom: {exc}", file=sys.stderr)
             name = f"{latitude:.2f}, {longitude:.2f}"
-        GLib.idle_add(self._apply_view_name, name, generation)
+        GLib.idle_add(
+            self._apply_view_name, name, latitude, longitude, generation, token
+        )
 
-    def _apply_view_name(self, name: str, generation: int) -> bool:
-        if generation == self._view_name_generation:
+    def _apply_view_name(
+        self,
+        name: str,
+        latitude: float,
+        longitude: float,
+        generation: int,
+        token: RequestToken,
+    ) -> bool:
+        center = self.current_view[1] if self.current_view is not None else None
+        if (
+            self.requests.is_current(token)
+            and generation == self._view_name_generation
+            and center == (latitude, longitude)
+        ):
             self._send("view-name", {"name": name})
+        self.requests.finish(token)
         return GLib.SOURCE_REMOVE
 
     def _on_place_search(self, message: dict) -> None:
-        query = str(message.get("query") or "").strip()[:120]
-        if not query:
+        raw_query = str(message.get("query") or "")
+        query = raw_query.strip()[:120]
+        context = message.get("context", "main")
+        if not query or context not in ("main", "home"):
             return
 
+        token = self.requests.begin(f"place-search:{context}")
+        payload = {
+            "request_id": message.get("request_id", token.request_id),
+            "context": context,
+            "query": raw_query,
+            "results": [],
+        }
+
         def worker() -> None:
-            payload = {"query": query, "results": []}
+            # A thread queued behind newer user intent must not reach the network.
+            if not self.requests.is_current(token):
+                return
             try:
                 payload["results"] = [
                     {"name": place.name, "latitude": place.latitude, "longitude": place.longitude}
@@ -858,12 +936,14 @@ class AirloomApplication(Adw.Application):
                 ]
             except GeocodeError:
                 payload["error"] = "Place lookup unavailable."
-            GLib.idle_add(self._send_places, payload)
+            GLib.idle_add(self._send_places, payload, token)
 
         threading.Thread(target=worker, name="airloom-geocode", daemon=True).start()
 
-    def _send_places(self, payload: dict) -> bool:
-        self._send("places", payload)
+    def _send_places(self, payload: dict, token: RequestToken) -> bool:
+        if self.requests.is_current(token):
+            self._send("places", payload)
+        self.requests.finish(token)
         return GLib.SOURCE_REMOVE
 
     def _set_location_filter(self, message: dict) -> None:
@@ -917,6 +997,12 @@ class AirloomApplication(Adw.Application):
             self.store.data["api_key"] = api_key
         self.store.save()
         self.controller.set_config(self.store.data)
+        if home_mode != "auto":
+            self._clear_locator_focus_wait()
+            if self.locator is not None:
+                self.locator.cancel()
+            self._home_name_generation += 1
+            self.requests.invalidate("home-label")
         self._arm_auto_refresh()
         if self.title:
             self.title.set_subtitle(self.store.data["location_name"])
@@ -1052,47 +1138,136 @@ class AirloomApplication(Adw.Application):
                 self._start_fetch(pending)
         return GLib.SOURCE_REMOVE
 
+    def _send_trend_state(
+        self,
+        sensor_id: int,
+        token: RequestToken,
+        status: str,
+        reading_last_seen: int | None,
+        trend: list | None = None,
+    ) -> None:
+        self._send(
+            "trend",
+            {
+                "sensor_id": sensor_id,
+                "request_id": token.request_id,
+                "status": status,
+                "trend": trend or [],
+                "reading_last_seen": reading_last_seen,
+            },
+        )
+
     def _ensure_trend(self, sensor_id: int) -> None:
-        """Attach a trend to the selected sensor: cached if fresh, else one
-        cheap single-row fetch. Demo sensors already carry trends inline."""
-        if not self.store.data.get("api_key"):
-            return
+        """Attach one current trend request to a sensor reading.
+
+        Repeated selection reuses identical in-flight work. A newer reading gets
+        a new token, so neither an old request nor an old observation can publish.
+        """
         sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
-        if sensor is None:
+        reading_last_seen = sensor.last_seen if sensor is not None else None
+        inflight = self._trend_inflight.get(sensor_id)
+        if (
+            sensor is not None
+            and inflight is not None
+            and inflight[1] == reading_last_seen
+            and self.requests.is_current(inflight[0])
+        ):
             return
+
+        token = self.requests.begin(
+            f"trend:{sensor_id}", generation=reading_last_seen or 0
+        )
+        if sensor is None:
+            self._send_trend_state(sensor_id, token, "idle", None)
+            self.requests.finish(token)
+            return
+
+        if not self.store.data.get("api_key"):
+            status = "loaded" if sensor.trend else "unavailable"
+            self._send_trend_state(
+                sensor_id, token, status, reading_last_seen, sensor.trend
+            )
+            self.requests.finish(token)
+            return
+
         cached = (
             self.cache.get_trend(sensor_id, self._refresh_seconds())
             if self.cache is not None
             else None
         )
         if cached is not None:
-            if sensor.trend != cached:
+            status = "loaded" if cached else "unavailable"
+            if cached and sensor.trend != cached:
                 sensor.trend = cached
                 self._send_sensor_state()
+            self._send_trend_state(
+                sensor_id, token, status, reading_last_seen, cached
+            )
+            self.requests.finish(token)
             return
+
+        self._trend_inflight[sensor_id] = (token, reading_last_seen)
+        self._send_trend_state(sensor_id, token, "loading", reading_last_seen)
         api_key = self.store.data["api_key"]
 
         def worker() -> None:
             trend = None
+            failed = False
             try:
                 result = PurpleAirClient(api_key).fetch_rows(
-                    show_only=[sensor_id], fields=TREND_FETCH_FIELDS)
+                    show_only=[sensor_id], fields=TREND_FETCH_FIELDS
+                )
                 if result.rows:
                     trend = trend_from_values(result.rows[0])
             except PurpleAirError:
-                trend = None  # chart keeps its loading/empty state; next select retries
-            GLib.idle_add(self._finish_trend, sensor_id, trend)
+                failed = True
+            except Exception:  # noqa: BLE001 — worker failures must reach a terminal state
+                failed = True
+            GLib.idle_add(
+                self._finish_trend,
+                sensor_id,
+                reading_last_seen,
+                token,
+                trend,
+                failed,
+            )
 
         threading.Thread(target=worker, name="airloom-trend", daemon=True).start()
 
-    def _finish_trend(self, sensor_id: int, trend: list | None) -> bool:
-        if trend:
+    def _finish_trend(
+        self,
+        sensor_id: int,
+        reading_last_seen: int | None,
+        token: RequestToken,
+        trend: list | None,
+        failed: bool,
+    ) -> bool:
+        inflight = self._trend_inflight.get(sensor_id)
+        sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
+        owns_inflight = inflight is not None and inflight[0] == token
+        authorized = (
+            owns_inflight
+            and self.requests.is_current(token)
+            and sensor is not None
+            and sensor.last_seen == reading_last_seen
+        )
+        if owns_inflight:
+            # This callback settles the stored request even when its reading is
+            # no longer publishable; a later selection must never reuse it.
+            del self._trend_inflight[sensor_id]
+            self.requests.finish(token)
+        if not authorized:
+            return GLib.SOURCE_REMOVE
+
+        status = "error" if failed else "loaded" if trend else "unavailable"
+        if status == "loaded":
             if self.cache is not None:
                 self.cache.store_trend(sensor_id, trend)
-            sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
-            if sensor is not None:
-                sensor.trend = trend
-                self._send_sensor_state()
+            sensor.trend = trend
+            self._send_sensor_state()
+        self._send_trend_state(
+            sensor_id, token, status, reading_last_seen, trend
+        )
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:
@@ -1202,13 +1377,19 @@ class AirloomApplication(Adw.Application):
 
     def _dispatch_debug_command(self, message: dict, reply) -> None:
         def run_on_main_loop() -> bool:
-            self._handle_debug_command(message, reply)
+            try:
+                self._handle_debug_command(message, reply)
+            except Exception as exc:  # noqa: BLE001 — async failures still need a reply
+                reply({"ok": False, "error": f"dispatcher error: {exc}"})
             return GLib.SOURCE_REMOVE
 
         GLib.idle_add(run_on_main_loop)
 
     def _handle_debug_command(self, message: dict, reply) -> None:
         cmd = message.get("cmd")
+        if not isinstance(cmd, str):
+            reply({"ok": False, "error": "debug command must be a string"})
+            return
         # `eval` and `pinch` predate the validate_command() table and keep
         # their own inline validation; every other command's parameters are
         # validated there before any handler below sees them, so an

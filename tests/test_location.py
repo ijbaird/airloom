@@ -56,6 +56,51 @@ class CancelTest(unittest.TestCase):
         self.assertFalse(locator._note_fix())
         self.assertFalse(locator._note_fallback())
 
+    def test_cancel_cancels_the_gio_cancellable_passed_to_geoclue(self):
+        import sys as _sys
+        import types as _types
+        from types import SimpleNamespace
+        from unittest import mock
+
+        created = []
+
+        class Cancellable:
+            def __init__(self):
+                self.cancelled = False
+                created.append(self)
+
+            def cancel(self):
+                self.cancelled = True
+
+        class Simple:
+            @staticmethod
+            def new(_app_id, _accuracy, cancellable, _callback):
+                Simple.cancellable = cancellable
+
+        gi = _types.ModuleType("gi")
+        gi.require_version = lambda *_args: None
+        repository = _types.ModuleType("gi.repository")
+        repository.Geoclue = SimpleNamespace(
+            Simple=Simple,
+            AccuracyLevel=SimpleNamespace(NEIGHBORHOOD=1),
+        )
+        repository.Gio = SimpleNamespace(Cancellable=Cancellable)
+        repository.GLib = SimpleNamespace(
+            timeout_add_seconds=lambda *_args: 42,
+            source_remove=lambda _source_id: None,
+            SOURCE_REMOVE=False,
+        )
+        gi.repository = repository
+
+        locator = GeoClueLocator()
+        with mock.patch.dict(_sys.modules, {"gi": gi, "gi.repository": repository}):
+            locator.start(lambda *_args: None)
+            locator.cancel()
+
+        self.assertEqual(len(created), 1)
+        self.assertIs(Simple.cancellable, created[0])
+        self.assertTrue(created[0].cancelled)
+
 
 class GeoClueUnavailableTest(unittest.TestCase):
     def test_missing_gi_reports_fallback_exactly_once(self):
