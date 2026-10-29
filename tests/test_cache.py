@@ -6,17 +6,26 @@ import sqlite3
 import tempfile
 import unittest
 import warnings
+import weakref
 from pathlib import Path
 
 from airloom import cache
-from airloom.purpleair import Bounds, bounds_around, DATA_FIELDS, MAP_FIELDS, FetchResult
+from airloom.purpleair import (
+    Bounds, bounds_around, DATA_FIELDS, MAP_FIELDS, FetchResult, PurpleAirError,
+)
 
 
 def row(sensor_id, lat=45.5, lon=-122.6, **extra):
     values = {"sensor_index": sensor_id, "name": f"S{sensor_id}", "latitude": lat,
-              "longitude": lon, "pm2.5_cf_1": 4.0, "humidity": 40}
+              "longitude": lon, "last_seen": 1000, "pm2.5_cf_1": 4.0, "humidity": 40}
     values.update(extra)
     return values
+
+
+def _close_weak_cache(reference):
+    instance = reference()
+    if instance is not None:
+        instance.close()
 
 
 class FakeClock:
@@ -44,8 +53,8 @@ class OwnershipTest(unittest.TestCase):
 
     def _cache(self):
         c = cache.SensorCache(self.path, clock=FakeClock())
-        # Keep even failing ownership tests from leaking their raw connection.
-        self.addCleanup(c._db.close)
+        # Do not retain either the raw connection or the cache across forced GC.
+        self.addCleanup(_close_weak_cache, weakref.ref(c))
         return c
 
     def test_cache_error_is_a_runtime_error(self):
@@ -100,6 +109,20 @@ class SchemaVersionTest(CacheBase):
         self.assertEqual(reopened._db.execute("PRAGMA user_version").fetchone()[0],
                          cache.SCHEMA_VERSION)
 
+    def test_correction_v1_schema_is_cleared(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        self.cache.store_trend(1, [{"label": "Now", "aqi": 40}])
+        self.cache._db.execute("PRAGMA user_version = 1")
+        self.cache._db.commit()
+        self.cache.close()
+        reopened = cache.SensorCache(Path(self.tmp.name) / "cache.db", clock=self.clock)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.sensors_in(bounds), [])
+        self.assertIsNone(reopened.covering_region(bounds, "outdoor"))
+        self.assertIsNone(reopened.get_trend(1, max_age=3600))
+        self.assertEqual(reopened._db.execute("PRAGMA user_version").fetchone()[0], 2)
+
     def test_current_version_keeps_rows_across_reconnect(self):
         bounds = bounds_around(45.5, -122.6, 20.0)
         self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
@@ -109,7 +132,43 @@ class SchemaVersionTest(CacheBase):
         self.assertEqual(len(reopened.sensors_in(bounds)), 1)
 
 
+class RegionCommitLock:
+    """Fail the commit that would make a rows+region transaction visible."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.region_staged = False
+
+    def execute(self, sql, parameters=()):
+        if sql.lstrip().startswith("INSERT INTO regions"):
+            self.region_staged = True
+        return self.connection.execute(sql, parameters)
+
+    def commit(self):
+        if self.region_staged:
+            raise sqlite3.OperationalError("database is locked")
+        self.connection.commit()
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
 class StoreFetchTest(CacheBase):
+    def test_locked_rows_and_region_commit_rolls_back_everything(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache._db = RegionCommitLock(self.cache._db)
+        with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+            self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        observer = sqlite3.connect(self.cache.path)
+        try:
+            counts = (
+                observer.execute("SELECT COUNT(*) FROM sensors").fetchone()[0],
+                observer.execute("SELECT COUNT(*) FROM regions").fetchone()[0],
+            )
+        finally:
+            observer.close()
+        self.assertEqual(counts, (0, 0))
+
     def test_round_trips_sensors_in_bounds(self):
         bounds = bounds_around(45.5, -122.6, 20.0)
         self.cache.store_fetch(bounds, "outdoor", [row(1), row(2, lat=45.51)], 1754680000)
@@ -292,9 +351,26 @@ class PruneTest(CacheBase):
         self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
         self.cache.store_trend(1, [{"label": "Now", "aqi": 12}])
         self.clock.now += cache.SENSOR_MAX_AGE + 60
-        self.cache.store_fetch(bounds, "outdoor", [row(2)], 1754770000)
+        self.cache.store_fetch(
+            bounds, "outdoor", [row(2, last_seen=self.clock.now)], 1754770000)
         self.assertEqual([r["sensor_index"] for r in self.cache.sensors_in(bounds)], [2])
         self.assertIsNone(self.cache.get_trend(1, max_age=cache.SENSOR_MAX_AGE * 2))
+
+    def test_observation_prune_invalidates_coverage_before_revisit(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        self.clock.now += 24 * 3600 - 10
+        self.cache.upsert_rows([{"sensor_index": 1, "last_seen": 1000, "humidity": 55}])
+        self.clock.now += 20
+        self.cache.upsert_rows([])
+        self.assertEqual(self.cache.sensors_in(bounds), [])
+        self.assertIsNone(self.cache.covering_region(bounds, "outdoor"))
+
+        client = FakeClient([FetchResult([row(2, last_seen=self.clock.now)], 1754770000)])
+        result = cache.fetch_area(client, self.cache, bounds, "outdoor", ttl=120)
+        self.assertEqual([r["sensor_index"] for r in result.rows], [2])
+        self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
+        self.assertNotIn("modified_since", client.calls[0])
 
 
 class FakeClient:
@@ -304,7 +380,17 @@ class FakeClient:
 
     def fetch_rows(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        fields = kwargs.get("fields")
+        if fields is not None:
+            response = FetchResult(
+                [{key: value for key, value in values.items() if key in fields}
+                 for values in response.rows],
+                response.time_stamp,
+            )
+        return response
 
 
 class FetchAreaTest(CacheBase):
@@ -354,6 +440,101 @@ class FetchAreaTest(CacheBase):
         result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
         self.assertEqual(client.calls[1]["show_only"], [2])
         self.assertEqual(sorted(r["sensor_index"] for r in result.rows), [1, 2])
+
+    def test_failed_backfill_leaves_retry_checkpoint_and_rows_unchanged(self):
+        original_stamp = 1754680000
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1, humidity=40)], original_stamp)
+        self.clock.now += 300
+        delta = FetchResult([
+            {"sensor_index": 1, "last_seen": 1300, "humidity": 60},
+            {"sensor_index": 2, "last_seen": 1300, "pm2.5_cf_1": 9.0},
+        ], 1754680300)
+        client = FakeClient([
+            delta,
+            PurpleAirError("backfill failed"),
+            delta,
+            FetchResult([row(2, lat=45.52, last_seen=1300)], 1754680301),
+        ])
+        with self.assertRaisesRegex(PurpleAirError, "backfill failed"):
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        region = self.cache.covering_region(self.bounds, "outdoor")
+        self.assertEqual(region.api_time_stamp, original_stamp)
+        self.assertEqual(self.cache.sensors_in(self.bounds)[0]["humidity"], 40)
+
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual(client.calls[0]["modified_since"], original_stamp)
+        self.assertEqual(client.calls[2]["modified_since"], original_stamp)
+        self.assertEqual(sorted(r["sensor_index"] for r in result.rows), [1, 2])
+        self.assertEqual(self.cache.covering_region(self.bounds, "outdoor").api_time_stamp,
+                         1754680300)
+
+    def test_repeated_empty_deltas_do_not_delay_metadata_snapshot(self):
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1, name="Original")], 1754680000)
+        client = FakeClient([
+            FetchResult([], 1754680001),
+            FetchResult([], 1754680002),
+            FetchResult([], 1754680003),
+            FetchResult([row(1, name="Current", last_seen=1000 + 25 * 3600)], 1754680004),
+        ])
+        for hours in (6, 12, 18):
+            self.clock.now = 1000 + hours * 3600
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.clock.now = 1000 + 25 * 3600
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual([call["fields"] for call in client.calls],
+                         [DATA_FIELDS, DATA_FIELDS, DATA_FIELDS, MAP_FIELDS])
+        self.assertNotIn("modified_since", client.calls[-1])
+        self.assertEqual(result.rows[0]["name"], "Current")
+
+    def test_metadata_snapshot_applies_rename_relocation_and_reclassification(self):
+        self.cache.store_fetch(
+            self.bounds, "outdoor", [row(1, name="Original", location_type=0)], 1754680000)
+        self.clock.now += 25 * 3600
+        client = FakeClient([FetchResult([
+            row(1, name="Renamed", lat=45.52, location_type=1, last_seen=self.clock.now)
+        ], 1754680300)])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual(result.rows, [])
+        stored = self.cache.sensors_in(self.bounds)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["name"], "Renamed")
+        self.assertEqual(stored[0]["latitude"], 45.52)
+        self.assertEqual(stored[0]["location_type"], 1)
+        self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
+        self.assertNotIn("modified_since", client.calls[0])
+
+    def test_overlapping_full_snapshot_preserves_absent_rows_outside_bounds(self):
+        left = Bounds(46.0, -123.0, 45.0, -122.4)
+        right = Bounds(46.0, -122.6, 45.0, -122.0)
+        self.cache.store_fetch(left, "outdoor", [row(1, lon=-122.9)], 1754680000)
+        self.clock.now += 1
+        self.cache.store_fetch(right, "outdoor", [row(2, lon=-122.2)], 1754680001)
+        self.clock.now = 1000 + 12 * 3600
+        self.cache.upsert_rows([{"sensor_index": 2, "last_seen": self.clock.now}])
+        self.clock.now = 1000 + 25 * 3600
+        client = FakeClient([FetchResult([
+            row(1, name="Left refreshed", lon=-122.9, last_seen=self.clock.now)
+        ], 1754680300)])
+        result = cache.fetch_area(client, self.cache, left, "outdoor", ttl=120)
+        self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
+        self.assertEqual(result.rows[0]["name"], "Left refreshed")
+        self.assertEqual([r["sensor_index"] for r in self.cache.sensors_in(right)], [2])
+
+    def test_crossing_bounds_split_queries_and_dedupe_sensor_ids(self):
+        crossing = Bounds(10.0, 170.0, -10.0, -170.0)
+        client = FakeClient([
+            FetchResult([row(1, lat=0.0, lon=175.0)], 2000),
+            FetchResult([
+                row(1, lat=0.0, lon=175.0),
+                row(2, lat=0.0, lon=-175.0),
+            ], 2001),
+        ])
+        result = cache.fetch_area(client, self.cache, crossing, "outdoor", ttl=120)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0]["bounds"], Bounds(10.0, 170.0, -10.0, 180.0))
+        self.assertEqual(client.calls[1]["bounds"], Bounds(10.0, -180.0, -10.0, -170.0))
+        self.assertEqual(sorted(r["sensor_index"] for r in result.rows), [1, 2])
+        self.assertEqual(self.cache.covering_region(crossing, "outdoor").api_time_stamp, 2000)
 
     def test_force_polls_even_when_fresh(self):
         self.cache.store_fetch(self.bounds, "outdoor", [row(1)], 1754680000)

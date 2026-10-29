@@ -17,15 +17,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .purpleair import Bounds, bounds_contains, DATA_FIELDS, MAP_FIELDS, _integer
+from .purpleair import (
+    Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, FetchResult, _integer,
+)
 
 MAX_REGIONS = 50
 SENSOR_MAX_AGE = 24 * 3600.0
+METADATA_MAX_AGE = 24 * 3600
 
 # Bump when cached rows become unusable (e.g. a newly-requested field that
 # delta polls would never backfill for unchanged sensors); a mismatched
 # cache is cleared on connect and simply refetched.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sensors (
@@ -33,14 +36,16 @@ CREATE TABLE IF NOT EXISTS sensors (
     latitude REAL NOT NULL,
     longitude REAL NOT NULL,
     data TEXT NOT NULL,
-    fetched_at REAL NOT NULL
+    fetched_at REAL NOT NULL,
+    observed_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS regions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     north REAL NOT NULL, west REAL NOT NULL, south REAL NOT NULL, east REAL NOT NULL,
     location_filter TEXT NOT NULL,
     fetched_at REAL NOT NULL,
-    api_time_stamp INTEGER
+    api_time_stamp INTEGER,
+    metadata_fetched_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trends (
     sensor_index INTEGER PRIMARY KEY,
@@ -57,6 +62,7 @@ class Region:
     location_filter: str
     fetched_at: float
     api_time_stamp: int | None
+    metadata_fetched_at: float
 
 
 def _default_cache_dir() -> Path:
@@ -115,9 +121,14 @@ class SensorCache:
             db.executescript(_SCHEMA)
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
-                db.execute("DELETE FROM sensors")
-                db.execute("DELETE FROM regions")
-                db.execute("DELETE FROM trends")
+                # The schema itself changes with v2, so recreate rather than
+                # merely deleting rows from tables that lack the new columns.
+                db.executescript(
+                    "DROP TABLE IF EXISTS sensors;"
+                    "DROP TABLE IF EXISTS regions;"
+                    "DROP TABLE IF EXISTS trends;"
+                    + _SCHEMA
+                )
                 # PRAGMA does not take bound parameters; SCHEMA_VERSION is a
                 # module constant int, never user input.
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -129,7 +140,37 @@ class SensorCache:
 
     def upsert_rows(self, rows: list[dict]) -> list[int]:
         with self._lock:
-            return self._upsert_locked(rows)
+            try:
+                unknown = self._upsert_locked(rows)
+                self._prune_locked(self.clock())
+                self._db.commit()
+                return unknown
+            except BaseException:
+                self._db.rollback()
+                raise
+
+    def unknown_rows(self, rows: list[dict]) -> list[int]:
+        """Return delta IDs that need full metadata, without staging writes."""
+        with self._lock:
+            order: list[int] = []
+            merged_by_id: dict[int, dict] = {}
+            for values in rows:
+                sensor_id = values.get("sensor_index")
+                if not isinstance(sensor_id, (int, float)):
+                    continue
+                sensor_id = int(sensor_id)
+                if sensor_id not in merged_by_id:
+                    order.append(sensor_id)
+                    cursor = self._db.execute(
+                        "SELECT data FROM sensors WHERE sensor_index = ?", (sensor_id,))
+                    existing = cursor.fetchone()
+                    merged_by_id[sensor_id] = dict(json.loads(existing[0])) if existing else {}
+                merged_by_id[sensor_id].update(values)
+            return [
+                sensor_id for sensor_id in order
+                if not isinstance(merged_by_id[sensor_id].get("latitude"), (int, float))
+                or not isinstance(merged_by_id[sensor_id].get("longitude"), (int, float))
+            ]
 
     def _upsert_locked(self, rows: list[dict]) -> list[int]:
         now = self.clock()
@@ -140,7 +181,7 @@ class SensorCache:
                 continue
             sensor_id = int(sensor_id)
             cursor = self._db.execute(
-                "SELECT data FROM sensors WHERE sensor_index = ?", (sensor_id,))
+                "SELECT data, observed_at FROM sensors WHERE sensor_index = ?", (sensor_id,))
             existing = cursor.fetchone()
             merged = dict(json.loads(existing[0])) if existing else {}
             merged.update(values)
@@ -148,68 +189,92 @@ class SensorCache:
             if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
                 unknown.append(sensor_id)
                 continue
-            self._db.execute(
-                "INSERT INTO sensors (sensor_index, latitude, longitude, data, fetched_at)"
-                " VALUES (?, ?, ?, ?, ?) ON CONFLICT(sensor_index) DO UPDATE SET"
-                " latitude = excluded.latitude, longitude = excluded.longitude,"
-                " data = excluded.data, fetched_at = excluded.fetched_at",
-                (sensor_id, float(lat), float(lon), json.dumps(merged), now),
+            last_seen = _integer(merged.get("last_seen"))
+            observed_at = (
+                float(last_seen) if last_seen is not None
+                else float(existing[1]) if existing else now
             )
-        self._db.commit()
+            self._db.execute(
+                "INSERT INTO sensors (sensor_index, latitude, longitude, data, fetched_at,"
+                " observed_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(sensor_index) DO UPDATE SET"
+                " latitude = excluded.latitude, longitude = excluded.longitude,"
+                " data = excluded.data, fetched_at = excluded.fetched_at,"
+                " observed_at = excluded.observed_at",
+                (sensor_id, float(lat), float(lon), json.dumps(merged), now, observed_at),
+            )
         return unknown
 
     def store_fetch(self, bounds: Bounds, location_filter: str,
                     rows: list[dict], api_time_stamp: int | None) -> None:
         with self._lock:
-            self._upsert_locked(rows)
-            now = self.clock()
-            self._db.execute(
-                "INSERT INTO regions (north, west, south, east, location_filter,"
-                " fetched_at, api_time_stamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (bounds.north, bounds.west, bounds.south, bounds.east,
-                 location_filter, now, api_time_stamp),
-            )
-            self._prune_locked(now)
-            self._db.commit()
+            try:
+                self._upsert_locked(rows)
+                now = self.clock()
+                cursor = self._db.execute(
+                    "INSERT INTO regions (north, west, south, east, location_filter,"
+                    " fetched_at, api_time_stamp, metadata_fetched_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (bounds.north, bounds.west, bounds.south, bounds.east,
+                     location_filter, now, api_time_stamp, now),
+                )
+                self._prune_locked(now, preserve_region=cursor.lastrowid)
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def apply_delta(self, region_id: int, rows: list[dict],
                     api_time_stamp: int | None) -> list[int]:
         with self._lock:
-            unknown = self._upsert_locked(rows)
-            self._db.execute(
-                "UPDATE regions SET fetched_at = ?, api_time_stamp ="
-                " COALESCE(?, api_time_stamp) WHERE id = ?",
-                (self.clock(), api_time_stamp, region_id),
-            )
-            self._db.commit()
-            return unknown
+            try:
+                unknown = self._upsert_locked(rows)
+                now = self.clock()
+                self._db.execute(
+                    "UPDATE regions SET fetched_at = ?, api_time_stamp ="
+                    " COALESCE(?, api_time_stamp) WHERE id = ?",
+                    (now, api_time_stamp, region_id),
+                )
+                self._prune_locked(now)
+                self._db.commit()
+                return unknown
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def covering_region(self, bounds: Bounds, location_filter: str,
                         max_age: float | None = None) -> Region | None:
         with self._lock:
             cursor = self._db.execute(
                 "SELECT id, north, west, south, east, location_filter, fetched_at,"
-                " api_time_stamp FROM regions WHERE location_filter = ?"
+                " api_time_stamp, metadata_fetched_at FROM regions WHERE location_filter = ?"
                 " ORDER BY fetched_at DESC",
                 (location_filter,),
             )
             now = self.clock()
-            for rid, north, west, south, east, mode, fetched_at, stamp in cursor:
+            for (rid, north, west, south, east, mode, fetched_at, stamp,
+                 metadata_fetched_at) in cursor:
                 if max_age is not None and now - fetched_at >= max_age:
                     break  # ordered newest-first: everything after is older
-                region = Region(rid, Bounds(north, west, south, east), mode, fetched_at, stamp)
+                region = Region(
+                    rid, Bounds(north, west, south, east), mode, fetched_at, stamp,
+                    metadata_fetched_at,
+                )
                 if bounds_contains(region.bounds, bounds):
                     return region
             return None
 
     def sensors_in(self, bounds: Bounds) -> list[dict]:
         with self._lock:
-            cursor = self._db.execute(
-                "SELECT data FROM sensors WHERE latitude BETWEEN ? AND ?"
-                " AND longitude BETWEEN ? AND ?",
-                (bounds.south, bounds.north, bounds.west, bounds.east),
-            )
-            return [json.loads(row[0]) for row in cursor]
+            rows_by_id: dict[int, dict] = {}
+            for part in split_bounds(bounds):
+                cursor = self._db.execute(
+                    "SELECT sensor_index, data FROM sensors WHERE latitude BETWEEN ? AND ?"
+                    " AND longitude BETWEEN ? AND ?",
+                    (part.south, part.north, part.west, part.east),
+                )
+                for sensor_id, data in cursor:
+                    rows_by_id[sensor_id] = json.loads(data)
+            return list(rows_by_id.values())
 
     def fresh_sensors(self, ids, max_age: float) -> dict[int, dict]:
         wanted = [int(i) for i in ids]
@@ -224,15 +289,22 @@ class SensorCache:
             )
             return {row[0]: json.loads(row[1]) for row in cursor}
 
-    def _prune_locked(self, now: float) -> None:
+    def _prune_locked(self, now: float, preserve_region: int | None = None) -> None:
+        cutoff = now - SENSOR_MAX_AGE
+        cursor = self._db.execute("DELETE FROM sensors WHERE observed_at < ?", (cutoff,))
+        if cursor.rowcount:
+            # A delta checkpoint cannot prove that a pruned row was absent from
+            # the next response. Keep only a just-completed full snapshot, if any.
+            if preserve_region is None:
+                self._db.execute("DELETE FROM regions")
+            else:
+                self._db.execute("DELETE FROM regions WHERE id != ?", (preserve_region,))
+        self._db.execute("DELETE FROM trends WHERE fetched_at < ?", (cutoff,))
         self._db.execute(
             "DELETE FROM regions WHERE id NOT IN"
             " (SELECT id FROM regions ORDER BY fetched_at DESC LIMIT ?)",
             (MAX_REGIONS,),
         )
-        cutoff = now - SENSOR_MAX_AGE
-        self._db.execute("DELETE FROM sensors WHERE fetched_at < ?", (cutoff,))
-        self._db.execute("DELETE FROM trends WHERE fetched_at < ?", (cutoff,))
 
     def store_trend(self, sensor_id: int, trend: list) -> None:
         with self._lock:
@@ -277,6 +349,24 @@ def _matches_filter(values: dict, location_filter: str) -> bool:
     return (_integer(values.get("location_type")) or 0) == want
 
 
+def _fetch_rows(client, bounds: Bounds, **kwargs) -> FetchResult:
+    """Fetch canonical query rectangles and merge duplicate sensor IDs."""
+    rows_by_id: dict[int, dict] = {}
+    unkeyed: list[dict] = []
+    stamps: list[int | None] = []
+    for part in split_bounds(bounds):
+        result = client.fetch_rows(bounds=part, **kwargs)
+        stamps.append(result.time_stamp)
+        for values in result.rows:
+            sensor_id = _integer(values.get("sensor_index"))
+            if sensor_id is None:
+                unkeyed.append(values)
+            else:
+                rows_by_id[sensor_id] = values
+    time_stamp = min(stamps) if stamps and all(stamp is not None for stamp in stamps) else None
+    return FetchResult([*rows_by_id.values(), *unkeyed], time_stamp)
+
+
 def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
                ttl: float, force: bool = False) -> AreaResult:
     """Serve an area from cache, delta-poll a stale known region, or full-fetch
@@ -289,20 +379,29 @@ def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
 
     if region is not None and not force and now - region.fetched_at < ttl:
         return AreaResult(rows_in_view(), now - region.fetched_at, False)
-    if region is not None and region.api_time_stamp is not None:
-        result = client.fetch_rows(
-            bounds=region.bounds,
+    if (
+        region is not None
+        and region.api_time_stamp is not None
+        and now - region.metadata_fetched_at < METADATA_MAX_AGE
+    ):
+        result = _fetch_rows(
+            client,
+            region.bounds,
             location_filter=location_filter,
             fields=DATA_FIELDS,
             modified_since=region.api_time_stamp,
         )
-        unknown = cache.apply_delta(region.id, result.rows, result.time_stamp)
+        unknown = cache.unknown_rows(result.rows)
+        followup_rows: list[dict] = []
         if unknown:
             followup = client.fetch_rows(show_only=sorted(unknown))
-            cache.upsert_rows(followup.rows)
+            followup_rows = followup.rows
+        cache.apply_delta(region.id, result.rows + followup_rows, result.time_stamp)
         return AreaResult(rows_in_view(), 0.0, True)
-    result = client.fetch_rows(bounds=bounds, location_filter=location_filter, fields=MAP_FIELDS)
-    cache.store_fetch(bounds, location_filter, result.rows, result.time_stamp)
+    full_bounds = region.bounds if region is not None else bounds
+    result = _fetch_rows(
+        client, full_bounds, location_filter=location_filter, fields=MAP_FIELDS)
+    cache.store_fetch(full_bounds, location_filter, result.rows, result.time_stamp)
     return AreaResult(rows_in_view(), 0.0, True)
 
 

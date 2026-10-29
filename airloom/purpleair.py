@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 
 from . import __version__
 from .aqi import aqi_from_pm25, epa_corrected_pm25
-from .geography import Bounds, bounds_around, bounds_contains
+from .geography import Bounds, bounds_around, bounds_contains, split_bounds
 from .models import Sensor
 
 
