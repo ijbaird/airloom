@@ -106,7 +106,7 @@ assert_version() {
 verify_bundle() (
   export FLATPAK_USER_DIR="${work}/bundle-client"
   mkdir -p "${FLATPAK_USER_DIR}"
-  flatpak install --user --noninteractive --no-deps --arch="${arch}" --bundle "${bundle}"
+  flatpak install --user --noninteractive --no-deps --arch="${arch}" --gpg-file="${public_key}" --bundle "${bundle}"
   local origin url
   origin="$(installed_origin)"
   [[ "${origin}" == "${app_id}-origin" ]] || fail "bundle origin ${origin} does not match ${app_id}-origin"
@@ -146,7 +146,7 @@ verify_previous_upgrade() (
 
 verify_wrong_key_rejection() (
   export FLATPAK_USER_DIR="${work}/wrong-key-client"
-  local wrong_home wrong_key remote output
+  local wrong_home wrong_key remote output stage
   wrong_home="${work}/wrong-key-gpg"
   wrong_key="${work}/wrong-key.gpg"
   remote="airloom-verify-wrong-key"
@@ -155,12 +155,16 @@ verify_wrong_key_rejection() (
   GNUPGHOME="${wrong_home}" gpg --batch --pinentry-mode loopback --passphrase '' \
     --quick-generate-key "Airloom Wrong Key Verification <wrong-key@example.invalid>" ed25519 sign 1d
   GNUPGHOME="${wrong_home}" gpg --batch --export > "${wrong_key}"
-  flatpak remote-add --user --gpg-import="${wrong_key}" "${remote}" "${repo_url}"
-  if output="$(flatpak install --user --noninteractive --no-deps --arch="${arch}" "${remote}" "${app_id}" 2>&1)"; then
-    fail "wrong signing key was accepted for repository installation"
+  if output="$(flatpak remote-add --user --gpg-import="${wrong_key}" "${remote}" "${repo_url}" 2>&1)"; then
+    if output="$(flatpak install --user --noninteractive --no-deps --arch="${arch}" "${remote}" "${app_id}" 2>&1)"; then
+      fail "wrong signing key was accepted for repository installation"
+    fi
+    stage="install"
+  else
+    stage="remote-add"
   fi
-  grep -Eiq 'gpg|signature|keyring|public key' <<< "${output}" || fail "wrong-key installation failed for an unrelated reason: ${output}"
-  evidence "wrong_key_rejected remote=${remote}"
+  grep -Eiq 'gpg|signature|keyring|public key' <<< "${output}" || fail "wrong-key ${stage} failed for an unrelated reason: ${output}"
+  evidence "wrong_key_rejected remote=${remote} stage=${stage}"
 )
 
 verify_bundle

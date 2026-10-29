@@ -554,7 +554,14 @@ def key_matches(path):
 
 if command == "remote-add":
     name, url = args[-2:]
-    remotes[name] = {"url": url, "key_ok": key_matches(option("--gpg-import"))}
+    key_ok = key_matches(option("--gpg-import"))
+    if not key_ok and env.get("FAKE_WRONG_KEY_REMOTE_ADD_SIGNATURE") == "1":
+        print("OSTree GPG signature verification failed: wrong key", file=sys.stderr)
+        sys.exit(1)
+    if not key_ok and env.get("FAKE_WRONG_KEY_REMOTE_ADD_UNRELATED") == "1":
+        print("network unreachable while fetching metadata", file=sys.stderr)
+        sys.exit(1)
+    remotes[name] = {"url": url, "key_ok": key_ok}
     save()
 elif command == "remote-modify":
     name = args[-1]
@@ -566,6 +573,16 @@ elif command == "install":
     bundle = next((arg for arg in args if arg.endswith(".flatpak")), None)
     if bundle is not None:
         previous = bundle == env["FAKE_PREVIOUS_BUNDLE"]
+        if not previous:
+            signature = env.get("FAKE_CURRENT_BUNDLE_SIGNATURE", "selected")
+            selected_key = option("--gpg-file")
+            if selected_key is not None:
+                if signature == "unsigned":
+                    print("GPG signature missing for current bundle", file=sys.stderr)
+                    sys.exit(1)
+                if signature != "selected" or not key_matches(selected_key):
+                    print("GPG signature verification failed: bundle was not signed by the selected key", file=sys.stderr)
+                    sys.exit(1)
         version = previous_version if previous else current_version
         origin = env.get("FAKE_ORIGIN", "ai.stealthvision.Airloom-origin")
         state = {
@@ -581,7 +598,10 @@ elif command == "install":
         remote_name = args[-2]
         remote = remotes[remote_name]
         if not remote["key_ok"] and env.get("FAKE_ACCEPT_WRONG_KEY") != "1":
-            print("GPG signature verification failed: wrong key", file=sys.stderr)
+            if env.get("FAKE_WRONG_KEY_INSTALL_UNRELATED") == "1":
+                print("network unreachable while pulling commit", file=sys.stderr)
+            else:
+                print("GPG signature verification failed: wrong key", file=sys.stderr)
             sys.exit(1)
         state = {
             "version": current_version,
@@ -672,6 +692,15 @@ else:
         result, entries, summary = self.run_client_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = [entry["args"] for entry in entries]
+        current_bundle_install = next(
+            command
+            for command in commands
+            if "install" in command
+            and any(argument.endswith("Current.flatpak") for argument in command)
+        )
+        self.assertTrue(
+            any(argument.startswith("--gpg-file=") for argument in current_bundle_install)
+        )
         self.assertTrue(any("remote-add" in command for command in commands))
         self.assertTrue(any("remote-modify" in command for command in commands))
         self.assertTrue(any("update" in command for command in commands))
@@ -686,10 +715,26 @@ else:
             "url=https://ijbaird.github.io/airloom/repo version=1.2.3",
             "repository_install_verified origin=airloom-verify-current version=1.2.3",
             "upgrade_verified previous_version=1.2.2 version=1.2.3",
-            "wrong_key_rejected remote=airloom-verify-wrong-key",
+            "wrong_key_rejected remote=airloom-verify-wrong-key stage=install",
         ):
             with self.subTest(evidence=evidence):
                 self.assertIn(evidence, summary)
+
+    def test_unsigned_bundle_is_rejected(self):
+        result, _, summary = self.run_client_gate(
+            FAKE_CURRENT_BUNDLE_SIGNATURE="unsigned"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stderr, r"(?i)gpg|signature")
+        self.assertNotIn("bundle_verified", summary)
+
+    def test_independently_signed_bundle_is_rejected(self):
+        result, _, summary = self.run_client_gate(
+            FAKE_CURRENT_BUNDLE_SIGNATURE="independent"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stderr, r"(?i)gpg|signature")
+        self.assertNotIn("bundle_verified", summary)
 
     def test_wrong_bundle_origin_is_rejected(self):
         result, _, _ = self.run_client_gate(FAKE_ORIGIN="untrusted-origin")
@@ -717,6 +762,32 @@ else:
         result, _, _ = self.run_client_gate(FAKE_ACCEPT_WRONG_KEY="1")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("wrong signing key", result.stderr)
+
+    def test_wrong_key_rejection_during_remote_creation_is_classified(self):
+        result, _, summary = self.run_client_gate(
+            FAKE_WRONG_KEY_REMOTE_ADD_SIGNATURE="1"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "wrong_key_rejected remote=airloom-verify-wrong-key stage=remote-add",
+            summary,
+        )
+
+    def test_unrelated_remote_creation_error_is_not_wrong_key_rejection(self):
+        result, _, summary = self.run_client_gate(
+            FAKE_WRONG_KEY_REMOTE_ADD_UNRELATED="1"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("unrelated reason", result.stderr)
+        self.assertNotIn("wrong_key_rejected", summary)
+
+    def test_unrelated_install_error_is_not_wrong_key_rejection(self):
+        result, _, summary = self.run_client_gate(
+            FAKE_WRONG_KEY_INSTALL_UNRELATED="1"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("unrelated reason", result.stderr)
+        self.assertNotIn("wrong_key_rejected", summary)
 
 
 class ReleaseWorkflowContractTest(unittest.TestCase):
