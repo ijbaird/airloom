@@ -6,6 +6,17 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      allow_older:
+        description: Allow replacement of an older stable release (requires exact tag confirmation)
+        required: false
+        type: boolean
+        default: false
+      confirm_tag:
+        description: Exact older tag to replace (for example v1.2.3)
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -52,9 +63,36 @@ jobs:
             xvfb-run -a -s "-screen 0 1280x800x24" "${script}"
           done
 
+  release-eligibility:
+    name: Validate release eligibility
+    runs-on: ubuntu-24.04
+    outputs:
+      eligible: ${{ steps.check.outputs.eligible }}
+    steps:
+      - name: Checkout release history
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check release ref and versions
+        id: check
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          ALLOW_OLDER: ${{ inputs.allow_older }}
+          CONFIRM_TAG: ${{ inputs.confirm_tag }}
+        run: |
+          set -euo pipefail
+          args=(--ref "${GITHUB_REF}" --version-root .)
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${ALLOW_OLDER}" == "true" ]]; then
+            args+=(--allow-older --confirm-tag "${CONFIRM_TAG}")
+          fi
+          python3 scripts/check-release.py "${args[@]}"
+          echo "eligible=true" >> "${GITHUB_OUTPUT}"
+
   flatpak:
     name: Flatpak (${{ matrix.arch }})
-    needs: test
+    needs: [test, release-eligibility]
     strategy:
       fail-fast: false
       matrix:
@@ -65,7 +103,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77 # gnome-50
       options: --privileged
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,7 +117,7 @@ jobs:
           branch: stable
           upload-artifact: false
       - name: Import signing key
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        if: needs.release-eligibility.outputs.eligible == 'true'
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
         run: scripts/import-signing-key.sh
@@ -105,18 +143,44 @@ jobs:
             --repo-url="https://ijbaird.github.io/airloom/repo" \
             --runtime-repo="https://dl.flathub.org/repo/flathub.flatpakrepo" \
             "${gpg_args[@]}"
+      - name: Record release provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          runtime_ref="runtime/org.gnome.Platform/${arch}/50"
+          sdk_ref="runtime/org.gnome.Sdk/${arch}/50"
+          runtime_commit="$(flatpak info --arch="${arch}" --show-commit org.gnome.Platform//50)"
+          sdk_commit="$(flatpak info --arch="${arch}" --show-commit org.gnome.Sdk//50)"
+          scripts/record-provenance.sh \
+            --output "Airloom-${arch}.provenance.json" \
+            --source-sha "${GITHUB_SHA}" \
+            --image-ref "ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77" \
+            --image-digest "sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77" \
+            --runtime-ref "${runtime_ref}" \
+            --runtime-commit "${runtime_commit}" \
+            --sdk-ref "${sdk_ref}" \
+            --sdk-commit "${sdk_commit}" \
+            --tool-version "flatpak=$(flatpak --version)" \
+            --tool-version "flatpak-builder=$(flatpak-builder --version)" \
+            --tool-ref "actions/checkout=3d3c42e5aac5ba805825da76410c181273ba90b1" \
+            --tool-ref "flatpak/flatpak-github-actions/flatpak-builder=79327416609af08178ad73b352877e51450790b3" \
+            --tool-ref "actions/upload-artifact=043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" \
+            --bundle "Airloom-${arch}.flatpak"
       - name: Upload workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: airloom-${{ matrix.arch }}
-          path: Airloom-${{ matrix.arch }}.flatpak
+          path: |
+            Airloom-${{ matrix.arch }}.flatpak
+            Airloom-${{ matrix.arch }}.provenance.json
           if-no-files-found: error
           retention-days: 30
       - name: Archive update-repo artifact
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        if: needs.release-eligibility.outputs.eligible == 'true'
         run: tar -cf "airloom-repo-${{ matrix.arch }}.tar" repo
       - name: Upload update-repo artifact
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        if: needs.release-eligibility.outputs.eligible == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: airloom-repo-${{ matrix.arch }}
@@ -126,8 +190,8 @@ jobs:
 
   release:
     name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: flatpak
+    if: needs.release-eligibility.outputs.eligible == 'true'
+    needs: [flatpak, release-eligibility]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -144,11 +208,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/*.flatpak dist/SHA256SUMS \
+            gh release upload "${GITHUB_REF_NAME}" dist/*.flatpak dist/SHA256SUMS dist/*.provenance.json \
               --repo "${GITHUB_REPOSITORY}" \
               --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" dist/*.flatpak dist/SHA256SUMS \
+            gh release create "${GITHUB_REF_NAME}" dist/*.flatpak dist/SHA256SUMS dist/*.provenance.json \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --generate-notes \
@@ -157,14 +221,14 @@ jobs:
 
   publish-repo:
     name: Publish update repository
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: flatpak
+    if: needs.release-eligibility.outputs.eligible == 'true'
+    needs: [flatpak, release-eligibility]
     runs-on: ubuntu-24.04
     concurrency:
       group: pages
       cancel-in-progress: false
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77 # gnome-50
       options: --privileged
     permissions:
       contents: read
@@ -194,6 +258,7 @@ jobs:
             mv "${dir}.extracted" "${dir}"
           done
       - name: Import signing key
+        if: needs.release-eligibility.outputs.eligible == 'true'
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
         run: scripts/import-signing-key.sh
