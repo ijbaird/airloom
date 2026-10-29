@@ -53,11 +53,11 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 
 **Interfaces:** Bridge `place-search` accepts `{request_id, context, query}` and `places` returns the same; trend events include `sensor_id`, `status`, `trend`; `GeoClueLocator.cancel()` cancels its `Gio.Cancellable`.
 
-- [ ] Write failing tests for duplicate in-flight trends, terminal trend error/unavailable, obsolete search/label responses, home A/B reversal, auto→fixed cancellation, deferred-start mode recheck, and dispatcher exception replies for non-string commands.
-- [ ] Run focused tests; confirm current missing identity/cancellation/failure behavior.
-- [ ] Integrate `RequestRegistry`, single-flight trend state, contextual place search with obsolete queued requests dropped before network I/O, coordinate/home-generation labels, real location cancellation, and safe async debug error replies.
-- [ ] Re-run focused tests; expect PASS.
-- [ ] Commit `fix: coordinate asynchronous application requests`.
+- [x] Write failing tests for duplicate in-flight trends, terminal trend error/unavailable, obsolete search/label responses, home A/B reversal, auto→fixed cancellation, deferred-start mode recheck, and dispatcher exception replies for non-string commands.
+- [x] Run focused tests; confirm current missing identity/cancellation/failure behavior.
+- [x] Integrate `RequestRegistry`, single-flight trend state, contextual place search with obsolete queued requests dropped before network I/O, coordinate/home-generation labels, real location cancellation, and safe async debug error replies.
+- [x] Re-run focused tests; expect PASS.
+- [x] Commit `fix: coordinate asynchronous application requests`.
 
 ### Task 4: Transactional UI actions and lifecycle
 
