@@ -26,7 +26,7 @@ Cross-workstream contract drift, real WebKit gesture/focus behavior, stale/demo 
 
 - [ ] Merge data → controller → frontend → release hardening, writing failing regression tests for every integration conflict before changing shared code.
 - [ ] Run `make check`; investigate and fix failures by root cause with focused tests.
-- [ ] Add/execute headless scenarios for away-from-home refresh, delayed search, interrupted fly/zoom/pinch, keyboard focus, cached filters, trend retry, demo/stale alerts/labels, reduced motion, preview actions, popup/search/narrow layouts, stripped debug module, and sentinel process/config/cache safety.
+- [ ] Add/execute headless scenarios for away-from-home refresh, delayed search, interrupted fly/zoom/pinch, keyboard focus, cached filters, trend retry, demo/stale alerts/labels, reduced motion, preview actions, popup/search/narrow layouts, stripped debug module, and sentinel process/config/cache safety. Include the final frontend review's blocking scaled-search regressions: 320px at 1.25× must not produce 365.5px clipped content, and 375px at 1.5× must not produce 438px clipped content; fix search/container min-width behavior and verify actual browser layout.
 - [ ] Run complete local matrix and record exact results; require zero ResourceWarnings.
 - [ ] Commit `test: complete cross-layer regression coverage`.
 
