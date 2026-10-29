@@ -412,6 +412,77 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         self.assertEqual(request.bounds.west, 179.0)
         self.assertEqual(request.bounds.east, -179.0)
 
+    def test_returning_to_fresh_a_invalidates_active_b_without_fetching(self):
+        app = self.make_app()
+        original = make_sensor(99, aqi=20)
+        app.sensors = [original]
+        app._area_ids = {99}
+        app.controller.set_view(VIEW)
+        app.current_view = (
+            Bounds(20.0, -30.0, 10.0, -10.0),
+            (15.0, -20.0),
+        )
+        app.view_bounds = Bounds(20.0, -30.0, 10.0, -10.0)
+        app.view_fetched_at = 1_000.0
+        view_b = {
+            "north": 40.0,
+            "west": 10.0,
+            "south": 30.0,
+            "east": 30.0,
+            "lat": 35.0,
+            "lon": 20.0,
+        }
+        alerts = []
+        app._check_alerts = lambda: alerts.append(True)
+
+        with mock.patch.object(app_module.time, "monotonic", return_value=1_000.0):
+            app._on_view_changed(view_b)
+            request_b = app.launched[-1][0]
+            app.refreshing = True
+            app._on_view_changed(VIEW)
+            outcome_b = self.make_outcome(
+                app,
+                [make_sensor(2)],
+                request=request_b,
+            )
+            app._finish_refresh(outcome_b)
+
+        self.assertEqual(len(app.launched), 1)
+        self.assertEqual(app.sensors, [original])
+        self.assertEqual(self.sensor_payloads(app), [])
+        self.assertEqual(alerts, [])
+        self.assertEqual(app.trends, [])
+
+    def test_returning_to_cached_coverage_discards_pending_fetch(self):
+        app = self.make_app()
+        app.controller.set_view(VIEW)
+        app.current_view = (
+            Bounds(20.0, -30.0, 10.0, -10.0),
+            (15.0, -20.0),
+        )
+        app.view_bounds = Bounds(20.0, -30.0, 10.0, -10.0)
+        app.view_fetched_at = 1_000.0
+        app.pending_fetch = app.controller.begin_refresh()
+
+        with mock.patch.object(app_module.time, "monotonic", return_value=1_000.0):
+            app._on_view_changed(VIEW)
+
+        self.assertIsNone(app.pending_fetch)
+        self.assertEqual(app.launched, [])
+
+    def test_refresh_ensures_preserved_non_first_selection_trend(self):
+        app = self.make_app()
+        app.selected_id = 2
+        outcome = self.make_outcome(
+            app,
+            [make_sensor(1, aqi=20), make_sensor(2, aqi=30)],
+        )
+
+        app._finish_refresh(outcome)
+
+        self.assertEqual(app.selected_id, 2)
+        self.assertEqual(app.trends, [2])
+
     def test_superseded_completion_never_publishes_alerts_or_starts_trends(self):
         app = self.make_app()
         previous = make_sensor(99, aqi=20)

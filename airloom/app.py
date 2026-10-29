@@ -811,10 +811,14 @@ class AirloomApplication(Adw.Application):
             return
         self.current_view = (view, center)
         self.controller.set_view(message)
+        # Register new view intent even when cached coverage needs no worker:
+        # the token supersedes active/pending requests for the previous view.
+        request = self.controller.begin_refresh()
+        self.pending_fetch = None
         fresh = (time.monotonic() - self.view_fetched_at) < self._refresh_seconds()
         if self.view_bounds is not None and fresh and bounds_contains(self.view_bounds, view):
             return
-        self._start_fetch(self.controller.begin_refresh())
+        self._start_fetch(request)
         self._start_view_label(*center)
 
     def _start_view_label(self, latitude: float, longitude: float) -> None:
@@ -1038,8 +1042,8 @@ class AirloomApplication(Adw.Application):
                     # Failed live retrieval must not suppress the next retry.
                     self.view_bounds = outcome.bounds
                     self.view_fetched_at = time.monotonic()
-                for sensor_id in decision.trend_ids:
-                    self._ensure_trend(sensor_id)
+                if self.selected_id is not None:
+                    self._ensure_trend(self.selected_id)
         finally:
             self.refreshing = False
             self._send("loading", {"active": False})
