@@ -41,11 +41,11 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 
 **Interfaces:** Consumes `visible_sensors`, `alert_transitions`, controller refresh methods, and data `fetch_area`/`fetch_favorites`; JS payload includes origin, delivery, coverage, and area/favorite collections.
 
-- [ ] Add failing tests for cached startup/stale fallback/opposite favorite filters, antimeridian view acceptance/split fetching, CacheError nonpersistent degradation, remote favorite summary exclusion inputs, demo/stale alert suppression, fresh real alert once, alert-save failure finalization, and capped coverage metadata.
-- [ ] Run focused tests; reproduce current mixed-state behavior.
-- [ ] Port `_on_view_changed`, `_start_fetch`, `_finish_refresh`, `_paint_cached_home`, `_send_sensor_state`, and `_check_alerts` to geography/controller/presentation decisions. Keep favorite monitoring separate; route both Refresh controls through current-view `begin_refresh`; surface cache-open failure and continue without persistence; drain pending work in `finally`.
-- [ ] Run focused tests and `python3 -m unittest discover -s tests -v`; expect PASS.
-- [ ] Commit `fix: authorize sensor publication and alert eligibility`.
+- [x] Add failing tests for cached startup/stale fallback/opposite favorite filters, antimeridian view acceptance/split fetching, CacheError nonpersistent degradation, remote favorite summary exclusion inputs, demo/stale alert suppression, fresh real alert once, alert-save failure finalization, and capped coverage metadata.
+- [x] Run focused tests; reproduce current mixed-state behavior.
+- [x] Port `_on_view_changed`, `_start_fetch`, `_finish_refresh`, `_paint_cached_home`, `_send_sensor_state`, and `_check_alerts` to geography/controller/presentation decisions. Keep favorite monitoring separate; route both Refresh controls through current-view `begin_refresh`; surface cache-open failure and continue without persistence; drain pending work in `finally`.
+- [x] Run focused tests and `python3 -m unittest discover -s tests -v`; expect PASS.
+- [x] Commit `fix: authorize sensor publication and alert eligibility`.
 
 ### Task 3: Coordinated trends, search, and labels
 
