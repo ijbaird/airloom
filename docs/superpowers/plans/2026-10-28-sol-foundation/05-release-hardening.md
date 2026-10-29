@@ -56,11 +56,11 @@ Regular-file socket paths, live sockets, unrelated running apps, custom DESTDIR/
 
 **Interfaces:** `check-release.py --ref REF --version-root PATH [--allow-older --confirm-tag TAG]`; validates semver, three version files, branch/tag context, and latest-tag rules.
 
-- [ ] Write failing tests for branch dispatch, malformed/mismatched versions, latest/current rerun, unconfirmed/wrongly confirmed older tag, confirmed older tag, and provenance required fields.
-- [ ] Run `python3 -m unittest tests.test_release -v`; expect missing script/current unsafe workflow failures.
-- [ ] Implement deny-by-default checks and workflow inputs; only valid tags sign/publish, older stable replacement needs exact typed confirmation. Record source SHA, image digest, runtime/tool refs/commits, and checksums.
-- [ ] Run focused/workflow tests; expect PASS.
-- [ ] Commit `ci: gate stable publication on release eligibility`.
+- [x] Write failing tests for branch dispatch, malformed/mismatched versions, latest/current rerun, unconfirmed/wrongly confirmed older tag, confirmed older tag, and provenance required fields.
+- [x] Run `python3 -m unittest tests.test_release -v`; expect missing script/current unsafe workflow failures.
+- [x] Implement deny-by-default checks and workflow inputs; only valid tags sign/publish, older stable replacement needs exact typed confirmation. Record source SHA, image digest, runtime/tool refs/commits, and checksums.
+- [x] Run focused/workflow tests; expect PASS.
+- [x] Commit `ci: gate stable publication on release eligibility`.
 
 ### Task 5: Signed client installation and upgrade gates
 
