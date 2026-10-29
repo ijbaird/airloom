@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,6 +17,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHECK_RELEASE = PROJECT_ROOT / "scripts" / "check-release.py"
 RECORD_PROVENANCE = PROJECT_ROOT / "scripts" / "record-provenance.sh"
+IMPORT_SIGNING_KEY = PROJECT_ROOT / "scripts" / "import-signing-key.sh"
+VERIFY_CLIENT = PROJECT_ROOT / "scripts" / "verify-flatpak-release.sh"
 WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "flatpak.yml"
 SOURCE_SHA = "a" * 40
 RUNTIME_COMMIT = "b" * 64
@@ -351,12 +356,376 @@ class ProvenanceTest(unittest.TestCase):
             self.assertFalse(output.exists())
 
 
+class SigningKeyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="airloom-signing-test-")
+        cls.root = Path(cls.temporary.name)
+        cls.fixtures = {}
+        for name in ("matching", "wrong"):
+            home = cls.root / name
+            home.mkdir(mode=0o700)
+            env = dict(os.environ, GNUPGHOME=str(home))
+            subprocess.run(
+                [
+                    "gpg",
+                    "--batch",
+                    "--pinentry-mode",
+                    "loopback",
+                    "--passphrase",
+                    "",
+                    "--quick-generate-key",
+                    f"Airloom Test {name} <{name}@example.invalid>",
+                    "ed25519",
+                    "sign",
+                    "1d",
+                ],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            listing = subprocess.run(
+                ["gpg", "--batch", "--with-colons", "--list-secret-keys"],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            fingerprint = next(
+                line.split(":")[9]
+                for line in listing.splitlines()
+                if line.startswith("fpr:")
+            )
+            public = cls.root / f"{name}.gpg"
+            private = cls.root / f"{name}.asc"
+            with public.open("wb") as stream:
+                subprocess.run(
+                    ["gpg", "--batch", "--export", fingerprint],
+                    env=env,
+                    check=True,
+                    stdout=stream,
+                )
+            with private.open("wb") as stream:
+                subprocess.run(
+                    [
+                        "gpg",
+                        "--batch",
+                        "--pinentry-mode",
+                        "loopback",
+                        "--passphrase",
+                        "",
+                        "--armor",
+                        "--export-secret-keys",
+                        fingerprint,
+                    ],
+                    env=env,
+                    check=True,
+                    stdout=stream,
+                )
+            cls.fixtures[name] = {
+                "fingerprint": fingerprint,
+                "public": public,
+                "private": private,
+            }
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def import_key(self, **overrides):
+        work = Path(tempfile.mkdtemp(prefix="airloom-import-test-"))
+        self.addCleanup(shutil.rmtree, work)
+        github_env = work / "github-env"
+        github_env.touch()
+        env = dict(
+            os.environ,
+            GITHUB_ENV=str(github_env),
+            TMPDIR=str(work),
+            AIRLOOM_REQUIRE_PRODUCTION_KEY="1",
+            AIRLOOM_PUBLIC_KEY_FILE=str(self.fixtures["matching"]["public"]),
+            FLATPAK_GPG_PRIVATE_KEY=self.fixtures["matching"]["private"].read_text(
+                encoding="utf-8"
+            ),
+        )
+        env.pop("AIRLOOM_EPHEMERAL_SIGNING_KEY", None)
+        env.update(overrides)
+        result = subprocess.run(
+            [str(IMPORT_SIGNING_KEY)],
+            cwd=PROJECT_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return result, github_env.read_text(encoding="utf-8"), work
+
+    def test_production_import_must_match_the_committed_public_key(self):
+        result, github_env, work = self.import_key()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        fingerprint = self.fixtures["matching"]["fingerprint"]
+        self.assertIn(f"GPG_KEY_ID={fingerprint}", github_env)
+        public_line = next(
+            line for line in github_env.splitlines() if line.startswith("FLATPAK_GPG_PUBLIC_KEY=")
+        )
+        exported = Path(public_line.split("=", 1)[1])
+        self.assertTrue(exported.is_file())
+        self.assertTrue(exported.is_relative_to(work))
+
+        result, github_env, _ = self.import_key(
+            AIRLOOM_PUBLIC_KEY_FILE=str(self.fixtures["wrong"]["public"])
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("does not match", result.stderr)
+        self.assertNotIn("GPG_KEY_ID=", github_env)
+
+    def test_ordinary_ci_generates_a_disposable_ephemeral_key(self):
+        result, github_env, work = self.import_key(
+            AIRLOOM_EPHEMERAL_SIGNING_KEY="1",
+            AIRLOOM_REQUIRE_PRODUCTION_KEY="0",
+            FLATPAK_GPG_PRIVATE_KEY="",
+            AIRLOOM_PUBLIC_KEY_FILE=str(self.root / "does-not-exist.gpg"),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = dict(
+            line.split("=", 1) for line in github_env.splitlines() if "=" in line
+        )
+        self.assertIn("GNUPGHOME", values)
+        self.assertIn("GPG_KEY_ID", values)
+        self.assertIn("FLATPAK_GPG_PUBLIC_KEY", values)
+        self.assertNotEqual(
+            values["GPG_KEY_ID"], self.fixtures["matching"]["fingerprint"]
+        )
+        self.assertTrue(Path(values["GNUPGHOME"]).is_relative_to(work))
+        self.assertTrue(Path(values["FLATPAK_GPG_PUBLIC_KEY"]).is_file())
+
+
+class ClientVerificationTest(unittest.TestCase):
+    def run_client_gate(self, **fake_overrides):
+        with tempfile.TemporaryDirectory(prefix="airloom-client-test-") as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            log = root / "flatpak.jsonl"
+            current = root / "Current.flatpak"
+            previous = root / "Previous.flatpak"
+            current.write_bytes(b"current fixture bundle")
+            previous.write_bytes(b"previous fixture bundle")
+            repo = root / "repo"
+            repo.mkdir()
+            correct_key = root / "correct.gpg"
+            correct_key.write_bytes(b"correct-test-key")
+            summary = root / "summary.md"
+            summary.touch()
+            (root / "correct-home").mkdir(mode=0o700)
+
+            flatpak = bin_dir / "flatpak"
+            flatpak.write_text(
+                textwrap.dedent(
+                    r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+env = os.environ
+client = Path(env["FLATPAK_USER_DIR"])
+client.mkdir(parents=True, exist_ok=True)
+state_path = client / "state.json"
+remotes_path = client / "remotes.json"
+state = json.loads(state_path.read_text()) if state_path.exists() else {}
+remotes = json.loads(remotes_path.read_text()) if remotes_path.exists() else {}
+with open(env["FAKE_FLATPAK_LOG"], "a") as stream:
+    stream.write(json.dumps({"args": args, "client": str(client)}) + "\n")
+command = next((arg for arg in args if not arg.startswith("-")), "")
+current_version = env["FAKE_CURRENT_VERSION"]
+previous_version = env["FAKE_PREVIOUS_VERSION"]
+correct_key = Path(env["FAKE_CORRECT_KEY"]).read_bytes()
+
+def save():
+    state_path.write_text(json.dumps(state))
+    remotes_path.write_text(json.dumps(remotes))
+
+def option(name):
+    return next((arg.split("=", 1)[1] for arg in args if arg.startswith(name + "=")), None)
+
+def key_matches(path):
+    return path is not None and Path(path).read_bytes() == correct_key
+
+if command == "remote-add":
+    name, url = args[-2:]
+    remotes[name] = {"url": url, "key_ok": key_matches(option("--gpg-import"))}
+    save()
+elif command == "remote-modify":
+    name = args[-1]
+    remote = remotes[name]
+    remote["url"] = option("--url") or remote["url"]
+    remote["key_ok"] = remote["key_ok"] or key_matches(option("--gpg-import"))
+    save()
+elif command == "install":
+    bundle = next((arg for arg in args if arg.endswith(".flatpak")), None)
+    if bundle is not None:
+        previous = bundle == env["FAKE_PREVIOUS_BUNDLE"]
+        version = previous_version if previous else current_version
+        origin = env.get("FAKE_ORIGIN", "ai.stealthvision.Airloom-origin")
+        state = {
+            "version": version,
+            "commit": "previous-commit" if previous else "current-commit",
+            "origin": origin,
+        }
+        remotes[origin] = {
+            "url": env.get("FAKE_BUNDLE_URL", "https://ijbaird.github.io/airloom/repo"),
+            "key_ok": True,
+        }
+    else:
+        remote_name = args[-2]
+        remote = remotes[remote_name]
+        if not remote["key_ok"] and env.get("FAKE_ACCEPT_WRONG_KEY") != "1":
+            print("GPG signature verification failed: wrong key", file=sys.stderr)
+            sys.exit(1)
+        state = {
+            "version": current_version,
+            "commit": "current-commit",
+            "origin": remote_name,
+        }
+    save()
+elif command == "update":
+    remote = remotes[state["origin"]]
+    if not remote["key_ok"] and env.get("FAKE_ACCEPT_WRONG_KEY") != "1":
+        print("GPG signature verification failed: wrong key", file=sys.stderr)
+        sys.exit(1)
+    if env.get("FAKE_STALE_UPGRADE") != "1":
+        state["version"] = current_version
+        state["commit"] = "current-commit"
+    save()
+elif command == "info":
+    if "--show-origin" in args:
+        print(state["origin"])
+    elif "--show-commit" in args:
+        print(state["commit"])
+    else:
+        print(f"Version: {env.get('FAKE_INFO_VERSION', state['version'])}")
+elif command == "remotes":
+    for name, remote in remotes.items():
+        print(f"{name} {remote['url']}")
+else:
+    print(f"unsupported fake flatpak command: {args}", file=sys.stderr)
+    sys.exit(2)
+'''
+                ),
+                encoding="utf-8",
+            )
+            flatpak.chmod(0o755)
+            gpg = bin_dir / "gpg"
+            gpg.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "if '--export' in sys.argv:\n"
+                "    sys.stdout.buffer.write(b'wrong-test-key')\n",
+                encoding="utf-8",
+            )
+            gpg.chmod(0o755)
+
+            env = dict(
+                os.environ,
+                PATH=f"{bin_dir}:{os.environ['PATH']}",
+                TMPDIR=str(root),
+                GITHUB_STEP_SUMMARY=str(summary),
+                FLATPAK_GPG_PUBLIC_KEY=str(correct_key),
+                GNUPGHOME=str(root / "correct-home"),
+                FAKE_FLATPAK_LOG=str(log),
+                FAKE_CORRECT_KEY=str(correct_key),
+                FAKE_PREVIOUS_BUNDLE=str(previous),
+                FAKE_CURRENT_VERSION="1.2.3",
+                FAKE_PREVIOUS_VERSION="1.2.2",
+            )
+            env.update(fake_overrides)
+            result = subprocess.run(
+                [
+                    str(VERIFY_CLIENT),
+                    "--bundle",
+                    str(current),
+                    "--previous-bundle",
+                    str(previous),
+                    "--repo",
+                    str(repo),
+                    "--arch",
+                    "x86_64",
+                    "--version",
+                    "1.2.3",
+                    "--previous-version",
+                    "1.2.2",
+                ],
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            entries = (
+                [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+                if log.exists()
+                else []
+            )
+            return result, entries, summary.read_text(encoding="utf-8")
+
+    def test_installs_signed_bundle_and_repository_and_upgrades_previous_release(self):
+        result, entries, summary = self.run_client_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = [entry["args"] for entry in entries]
+        self.assertTrue(any("remote-add" in command for command in commands))
+        self.assertTrue(any("remote-modify" in command for command in commands))
+        self.assertTrue(any("update" in command for command in commands))
+        self.assertFalse(
+            any("--no-gpg-verify" in argument for command in commands for argument in command)
+        )
+        clients = {entry["client"] for entry in entries}
+        self.assertEqual(len(clients), 4)
+        self.assertTrue(all("airloom-client-verify." in client for client in clients))
+        for evidence in (
+            "bundle_verified origin=ai.stealthvision.Airloom-origin "
+            "url=https://ijbaird.github.io/airloom/repo version=1.2.3",
+            "repository_install_verified origin=airloom-verify-current version=1.2.3",
+            "upgrade_verified previous_version=1.2.2 version=1.2.3",
+            "wrong_key_rejected remote=airloom-verify-wrong-key",
+        ):
+            with self.subTest(evidence=evidence):
+                self.assertIn(evidence, summary)
+
+    def test_wrong_bundle_origin_is_rejected(self):
+        result, _, _ = self.run_client_gate(FAKE_ORIGIN="untrusted-origin")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("origin", result.stderr)
+
+    def test_wrong_bundle_origin_url_is_rejected(self):
+        result, _, _ = self.run_client_gate(
+            FAKE_BUNDLE_URL="https://ijbaird.github.io/airloom/repo/repo"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("origin URL", result.stderr)
+
+    def test_wrong_installed_version_is_rejected(self):
+        result, _, _ = self.run_client_gate(FAKE_INFO_VERSION="9.9.9")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("version", result.stderr.lower())
+
+    def test_previous_installation_must_reach_the_current_commit(self):
+        result, _, _ = self.run_client_gate(FAKE_STALE_UPGRADE="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("upgrade", result.stderr.lower())
+
+    def test_accepting_a_wrong_signing_key_fails_the_gate(self):
+        result, _, _ = self.run_client_gate(FAKE_ACCEPT_WRONG_KEY="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("wrong signing key", result.stderr)
+
+
 class ReleaseWorkflowContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = WORKFLOW.read_text(encoding="utf-8")
         cls.eligibility = job_block(cls.source, "release-eligibility")
         cls.flatpak = job_block(cls.source, "flatpak")
+        cls.verify = job_block(cls.source, "verify-client")
         cls.release = job_block(cls.source, "release")
         cls.publish = job_block(cls.source, "publish-repo")
 
@@ -381,21 +750,62 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("--version-root", self.eligibility)
         self.assertIn("needs: [test, release-eligibility]", self.flatpak)
 
-    def test_only_eligible_releases_can_sign_or_archive_stable_repository(self):
+    def test_production_and_ephemeral_signing_keys_are_explicitly_separated(self):
         eligible = "needs.release-eligibility.outputs.eligible == 'true'"
-        for job in (self.flatpak, self.publish):
-            with self.subTest(step="Import signing key"):
-                self.assertIn(eligible, step_block(job, "Import signing key"))
-        for step_name in ("Archive update-repo artifact", "Upload update-repo artifact"):
-            with self.subTest(step=step_name):
-                self.assertIn(eligible, step_block(self.flatpak, step_name))
+        for job_name, job in (
+            ("flatpak", self.flatpak),
+            ("verify-client", self.verify),
+            ("publish-repo", self.publish),
+        ):
+            with self.subTest(job=job_name):
+                production = step_block(job, "Import production signing key")
+                self.assertIn(eligible, production)
+                self.assertIn("AIRLOOM_REQUIRE_PRODUCTION_KEY", production)
+                self.assertIn("secrets.FLATPAK_GPG_PRIVATE_KEY", production)
+                self.assertIn("scripts/import-signing-key.sh", production)
+        ephemeral = step_block(self.verify, "Generate ephemeral signing key")
+        self.assertIn("needs.release-eligibility.outputs.eligible != 'true'", ephemeral)
+        self.assertIn("AIRLOOM_EPHEMERAL_SIGNING_KEY", ephemeral)
+        self.assertIn("scripts/import-signing-key.sh", ephemeral)
+        self.assertNotIn("secrets.", ephemeral)
 
-    def test_only_eligible_releases_can_publish(self):
+    def test_only_eligible_releases_can_publish_after_client_verification(self):
         eligible = "if: needs.release-eligibility.outputs.eligible == 'true'"
         self.assertIn(eligible, self.release)
         self.assertIn(eligible, self.publish)
-        self.assertIn("needs: [flatpak, release-eligibility]", self.release)
-        self.assertIn("needs: [flatpak, release-eligibility]", self.publish)
+        self.assertTrue(self.verify, "verify-client job is missing")
+        self.assertIn("needs: [flatpak, release-eligibility]", self.verify)
+        for job in (self.release, self.publish):
+            self.assertIn(
+                "needs: [flatpak, verify-client, release-eligibility]", job
+            )
+
+    def test_client_gate_assembles_signed_test_repo_and_verifies_every_architecture(self):
+        for architecture in ("x86_64", "aarch64"):
+            self.assertIn(f"arch: {architecture}", self.verify)
+        self.assertIn("fetch-depth: 0", self.verify)
+        assemble = step_block(self.verify, "Assemble verification repository")
+        self.assertIn("scripts/publish-flatpak-repo.sh _site", assemble)
+        verify = step_block(self.verify, "Verify signed client installation and upgrade")
+        self.assertIn("scripts/verify-flatpak-release.sh", verify)
+        for argument in (
+            "--bundle",
+            "--previous-bundle",
+            "--previous-version",
+            "--repo",
+            "--arch",
+            "--version",
+        ):
+            self.assertIn(argument, verify)
+        self.assertLess(self.verify.index("name: Assemble verification repository"), self.verify.index("name: Verify signed client installation and upgrade"))
+        development = step_block(self.verify, "Sign disposable development fixtures")
+        self.assertIn("needs.release-eligibility.outputs.eligible != 'true'", development)
+        self.assertIn("flatpak build-sign", development)
+        self.assertIn("flatpak build-bundle", development)
+        self.assertIn("FLATPAK_GPG_PUBLIC_KEY", development)
+        for step_name in ("Archive update-repo artifact", "Upload update-repo artifact"):
+            self.assertNotIn("needs.release-eligibility.outputs.eligible", step_block(self.flatpak, step_name))
+        self.assertNotIn("--no-gpg-verify", self.source)
 
     def test_newer_tag_after_initial_eligibility_is_rejected_at_publication(self):
         with release_checkout() as root:
@@ -424,7 +834,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
 
         for job, first_publication_step in (
             (self.release, "Create release and upload bundles"),
-            (self.publish, "Import signing key"),
+            (self.publish, "Import production signing key"),
         ):
             with self.subTest(publication_step=first_publication_step):
                 checkout = step_block(job, "Checkout release history")

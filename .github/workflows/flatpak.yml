@@ -116,10 +116,11 @@ jobs:
           arch: ${{ matrix.arch }}
           branch: stable
           upload-artifact: false
-      - name: Import signing key
+      - name: Import production signing key
         if: needs.release-eligibility.outputs.eligible == 'true'
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          AIRLOOM_REQUIRE_PRODUCTION_KEY: "1"
         run: scripts/import-signing-key.sh
       - name: Rebuild bundle with update-repo origin
         shell: bash
@@ -135,7 +136,7 @@ jobs:
               --arch="${{ matrix.arch }}" \
               --gpg-sign="${GPG_KEY_ID}" \
               --gpg-homedir="${GNUPGHOME}"
-            gpg_args=(--gpg-keys="packaging/airloom-flatpak.gpg")
+            gpg_args=(--gpg-keys="${FLATPAK_GPG_PUBLIC_KEY}")
           fi
           flatpak build-bundle repo "Airloom-${{ matrix.arch }}.flatpak" \
             ai.stealthvision.Airloom stable \
@@ -177,10 +178,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Archive update-repo artifact
-        if: needs.release-eligibility.outputs.eligible == 'true'
         run: tar -cf "airloom-repo-${{ matrix.arch }}.tar" repo
       - name: Upload update-repo artifact
-        if: needs.release-eligibility.outputs.eligible == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: airloom-repo-${{ matrix.arch }}
@@ -188,10 +187,155 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  verify-client:
+    name: Verify signed client (${{ matrix.arch }})
+    needs: [flatpak, release-eligibility]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77 # gnome-50
+      options: --privileged
+    steps:
+      - name: Checkout release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Download current bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: airloom-${{ matrix.arch }}
+          path: dist
+      - name: Download update-repo artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: airloom-repo-*
+          path: repos
+      - name: Extract update-repo artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in repos/airloom-repo-*/; do
+            dir="${dir%/}"
+            arch="${dir#repos/airloom-repo-}"
+            tar -xf "${dir}/airloom-repo-${arch}.tar" -C "${dir}"
+            rm -f "${dir}/airloom-repo-${arch}.tar"
+            rm -rf "${dir}.extracted"
+            mv "${dir}/repo" "${dir}.extracted"
+            rm -rf "${dir}"
+            mv "${dir}.extracted" "${dir}"
+          done
+      - name: Import production signing key
+        if: needs.release-eligibility.outputs.eligible == 'true'
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          AIRLOOM_REQUIRE_PRODUCTION_KEY: "1"
+        run: scripts/import-signing-key.sh
+      - name: Generate ephemeral signing key
+        if: needs.release-eligibility.outputs.eligible != 'true'
+        env:
+          AIRLOOM_EPHEMERAL_SIGNING_KEY: "1"
+          AIRLOOM_REQUIRE_PRODUCTION_KEY: "0"
+        run: scripts/import-signing-key.sh
+      - name: Select previous supported release
+        shell: bash
+        env:
+          RELEASE_ELIGIBLE: ${{ needs.release-eligibility.outputs.eligible }}
+        run: |
+          set -euo pipefail
+          current_version="$(python3 -c 'from airloom import __version__; print(__version__)')"
+          export CURRENT_VERSION="${current_version}"
+          previous_tag="$(python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          pattern = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+          current = tuple(int(part) for part in os.environ["CURRENT_VERSION"].split("."))
+          candidates = []
+          for tag in subprocess.check_output(["git", "tag", "--list", "v*"], text=True).splitlines():
+              match = pattern.fullmatch(tag)
+              if not match:
+                  continue
+              candidate = tuple(int(part) for part in match.groups())
+              if candidate < current or (
+                  candidate == current and os.environ["RELEASE_ELIGIBLE"] != "true"
+              ):
+                  candidates.append((candidate, tag))
+          if not candidates:
+              raise SystemExit("no previous supported release tag found")
+          print(max(candidates)[1])
+          PY
+          )"
+          {
+            echo "EXPECTED_VERSION=${current_version}"
+            echo "PREVIOUS_TAG=${previous_tag}"
+            echo "PREVIOUS_VERSION=${previous_tag#v}"
+          } >> "${GITHUB_ENV}"
+      - name: Download previous release bundle
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import urllib.request
+
+          tag = os.environ["PREVIOUS_TAG"]
+          arch = os.environ["ARCH"]
+          url = f"https://github.com/ijbaird/airloom/releases/download/{tag}/Airloom-{arch}.flatpak"
+          output = Path("previous") / f"Airloom-{arch}.flatpak"
+          output.parent.mkdir(parents=True, exist_ok=True)
+          with urllib.request.urlopen(url, timeout=120) as response, output.open("wb") as stream:
+              shutil.copyfileobj(response, stream)
+          print(f"Downloaded previous supported release {tag} for {arch}")
+          PY
+      - name: Sign disposable development fixtures
+        if: needs.release-eligibility.outputs.eligible != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          source_repo="repos/airloom-repo-${arch}"
+          flatpak build-sign "${source_repo}" ai.stealthvision.Airloom stable \
+            --arch="${arch}" \
+            --gpg-sign="${GPG_KEY_ID}" \
+            --gpg-homedir="${GNUPGHOME}"
+          flatpak build-bundle "${source_repo}" "dist/Airloom-${arch}.flatpak" \
+            ai.stealthvision.Airloom stable \
+            --arch="${arch}" \
+            --repo-url="https://ijbaird.github.io/airloom/repo" \
+            --runtime-repo="https://dl.flathub.org/repo/flathub.flatpakrepo" \
+            --gpg-keys="${FLATPAK_GPG_PUBLIC_KEY}"
+          echo "Development verification uses an ephemeral key and disposable signed fixtures; uploaded development artifacts remain unsigned." >> "${GITHUB_STEP_SUMMARY}"
+      - name: Assemble verification repository
+        run: PUBKEY_FILE="${FLATPAK_GPG_PUBLIC_KEY}" scripts/publish-flatpak-repo.sh _site repos/airloom-repo-x86_64 repos/airloom-repo-aarch64
+      - name: Verify signed client installation and upgrade
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          scripts/verify-flatpak-release.sh \
+            --bundle "dist/Airloom-${arch}.flatpak" \
+            --previous-bundle "previous/Airloom-${arch}.flatpak" \
+            --repo _site/repo \
+            --arch "${arch}" \
+            --version "${EXPECTED_VERSION}" \
+            --previous-version "${PREVIOUS_VERSION}"
+
   release:
     name: Publish GitHub release
     if: needs.release-eligibility.outputs.eligible == 'true'
-    needs: [flatpak, release-eligibility]
+    needs: [flatpak, verify-client, release-eligibility]
     runs-on: ubuntu-24.04
     concurrency:
       group: stable-publication
@@ -242,7 +386,7 @@ jobs:
   publish-repo:
     name: Publish update repository
     if: needs.release-eligibility.outputs.eligible == 'true'
-    needs: [flatpak, release-eligibility]
+    needs: [flatpak, verify-client, release-eligibility]
     runs-on: ubuntu-24.04
     concurrency:
       group: stable-publication
@@ -293,13 +437,14 @@ jobs:
             rm -rf "${dir}"
             mv "${dir}.extracted" "${dir}"
           done
-      - name: Import signing key
+      - name: Import production signing key
         if: needs.release-eligibility.outputs.eligible == 'true'
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          AIRLOOM_REQUIRE_PRODUCTION_KEY: "1"
         run: scripts/import-signing-key.sh
       - name: Assemble site
-        run: scripts/publish-flatpak-repo.sh _site repos/airloom-repo-x86_64 repos/airloom-repo-aarch64
+        run: PUBKEY_FILE="${FLATPAK_GPG_PUBLIC_KEY}" scripts/publish-flatpak-repo.sh _site repos/airloom-repo-x86_64 repos/airloom-repo-aarch64
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
