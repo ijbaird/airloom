@@ -1127,6 +1127,10 @@ class AirloomApplication(Adw.Application):
             self._on_view_changed(message)
         elif action == "place-search":
             self._on_place_search(message)
+        elif action == "cancel-place-search":
+            context = message.get("context")
+            if context in ("main", "home"):
+                self.requests.invalidate(f"place-search:{context}")
         elif action == "set-location-filter":
             self._set_location_filter(message)
         else:

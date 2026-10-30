@@ -531,6 +531,31 @@ class PlaceSearchRequestTest(ApplicationRequestTestCase):
         self.assertEqual(idles.callbacks, [])
         self.assertEqual(self.place_events(app), [])
 
+    def test_cancel_place_search_invalidates_queued_home_work_before_admission(self):
+        app = self.make_app()
+        threads = ThreadQueue()
+        idles = IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "place_search") as search,
+        ):
+            app._on_place_search(
+                {"request_id": "home-old", "context": "home", "query": "old"}
+            )
+            app._on_script_message(
+                None,
+                ScriptMessage(
+                    {"action": "cancel-place-search", "context": "home"}
+                ),
+            )
+            threads.threads[0].run()
+
+        search.assert_not_called()
+        self.assertEqual(idles.callbacks, [])
+        self.assertEqual(self.place_events(app), [])
+
     def test_superseded_search_waiting_in_geocoder_queue_never_reaches_network(self):
         app = self.make_app()
         idles = IdleQueue()
