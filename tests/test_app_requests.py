@@ -1047,6 +1047,10 @@ class TransactionalActionTest(ApplicationRequestTestCase):
         self.assertEqual(
             [payload for event, payload in app.sent if event == "config"], []
         )
+        # The inline Preferences error is the only report; no toast as well.
+        self.assertEqual(
+            [payload for event, payload in app.sent if event == "error"], []
+        )
 
     def test_unhide_permission_and_space_failures_are_actionable_and_unchanged(self):
         failures = (

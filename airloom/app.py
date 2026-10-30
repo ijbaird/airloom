@@ -1203,8 +1203,7 @@ class AirloomApplication(Adw.Application):
             return
         request_id = message.get("request_id")
         if result.status != "success":
-            if result.status == "invalid":
-                self._send("error", {"message": result.error})
+            # Preferences shows this inline; a toast would report it twice.
             self._send(
                 "settings-save-result",
                 {"request_id": request_id, "status": "error", "error": result.error},
