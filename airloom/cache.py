@@ -79,7 +79,8 @@ class CacheError(RuntimeError):
 
 
 class CacheWriteError(CacheError):
-    """Fetched rows could not be persisted; the rows remain valid live data."""
+    """The cache failed after a full fetch (persisting or rereading its rows);
+    the fetched rows remain valid live data."""
 
     def __init__(self, message: str, rows: list[dict]):
         super().__init__(message)
@@ -446,8 +447,11 @@ def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
                ttl: float, force: bool = False) -> AreaResult:
     """Serve an area from cache, delta-poll a stale known region, or full-fetch
     a new one. May raise PurpleAirError — the caller owns fallback policy.
-    SQLite failures propagate, except that a failed write after a full fetch
-    raises CacheWriteError carrying the fetched rows within `bounds`."""
+    SQLite failures propagate, except that any failure after a full fetch
+    (storing or rereading) raises CacheWriteError carrying the fetched rows
+    within `bounds`, so obtained live data never needs a second paid request.
+    A delta response alone is not a complete view, so delta-path failures
+    propagate and the caller refetches without the cache."""
     cache.prune()
     region = cache.covering_region(bounds, location_filter)
     now = cache.clock()
@@ -489,12 +493,13 @@ def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
         client, full_bounds, location_filter=location_filter, fields=MAP_FIELDS)
     try:
         cache.store_fetch(full_bounds, location_filter, result.rows, result.time_stamp)
+        rows = rows_in_view()
     except sqlite3.Error as exc:
         raise CacheWriteError(
             f"Could not cache readings: {exc}",
             _rows_within(result.rows, bounds, location_filter),
         ) from exc
-    return AreaResult(rows_in_view(), 0.0, True)
+    return AreaResult(rows, 0.0, True)
 
 
 def fetch_favorites(client, cache: SensorCache, favorite_ids, have_ids,

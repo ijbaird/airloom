@@ -550,6 +550,44 @@ class RuntimeCacheFailureTest(ApplicationAdapterTestCase):
         self.assertIn("database is locked", outcome.cache_warning)
         self.assertEqual(outcome.provenance[7], ("live", "network"))
 
+    def test_read_failure_after_successful_store_keeps_fetched_live_rows(self):
+        app = self.make_app(cache=self.cache)
+        calls = []
+
+        def fetch_rows(**kwargs):
+            calls.append(kwargs)
+            if len(calls) > 1:
+                raise PurpleAirError("PurpleAir is down.")
+            return FetchResult([make_row(7)], 123)
+
+        client = SimpleNamespace(fetch_rows=fetch_rows)
+        store_fetch = self.cache.store_fetch
+
+        def store_then_lock(*args, **kwargs):
+            store_fetch(*args, **kwargs)
+            self.lock()
+
+        self.cache.store_fetch = store_then_lock
+        request = app.controller.begin_refresh()
+
+        with mock.patch.object(app_module, "PurpleAirClient", return_value=client):
+            outcome = app_module._fetch_readings(
+                app.store.data, self.cache, request, request.bounds, 120
+            )
+            app._finish_refresh(outcome)
+
+        self.assertEqual(len(calls), 1, "live rows in hand need no second paid request")
+        self.assertEqual(outcome.origin, "live")
+        self.assertEqual([sensor.sensor_id for sensor in outcome.sensors], [7])
+        self.assertEqual(outcome.provenance, {7: ("live", "network")})
+        self.assertIsNone(outcome.error)
+        self.assertIn("database is locked", outcome.cache_warning)
+        payload = self.sensor_payloads(app)[-1]
+        self.assertEqual([item["id"] for item in payload["items"]], [7])
+        errors = [item["message"] for event, item in app.sent if event == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("without persistent caching", errors[0])
+
     def test_ready_with_locked_cache_still_starts_refresh(self):
         app = self.make_app(cache=self.cache)
         self.lock()
