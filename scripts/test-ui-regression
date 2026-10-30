@@ -18,9 +18,11 @@ the caller's own Airloom state:
 Requires GTK 4, WebKitGTK 6.0 and a display (for CI, run it under a private
 headless compositor or, as the webkit-ui CI job does, `dbus-run-session --
 xvfb-run -a -s "-screen 0 1280x800x24" env GDK_DEBUG=no-portals python3
-scripts/test-ui-regression`). Not part of `make test`; tests/test_integration.py
-covers this script's isolation contract without a display. Exits 0 when
-every selected scenario passes.
+scripts/test-ui-regression` as a regular user; the save scenario fails as
+root, which ignores the directory permissions it uses to force a failed
+save). Not part of `make test`; tests/test_integration.py covers this
+script's isolation contract without a display. Exits 0 when every selected
+scenario passes.
 """
 
 from __future__ import annotations
@@ -410,15 +412,16 @@ def scenario_away_refresh(app: DebugApp):
 
 def scenario_save(app: DebugApp):
     print("— Save closes only on its own acknowledgment —")
+    # Root ignores directory permissions, so the failure checks below could
+    # never run; fail instead of reporting a pass without them.
+    if os.geteuid() == 0:
+        raise AssertionError("the save scenario must run as a regular user (root ignores directory permissions)")
     sock = app.sock_path
     eval_js(sock, SUBMIT_SETTINGS_JS)
     state = wait_for(lambda: (lambda s: s if not s["open"] else None)(eval_js(sock, SETTINGS_STATE_JS)),
                      15, "successful save to close Preferences")
     check(not state["saveDisabled"], "Save is re-enabled after success")
 
-    if os.geteuid() == 0:
-        print("  skip: save failure (root ignores directory permissions)")
-        return
     app.config_dir.chmod(0o500)
     try:
         eval_js(sock, SUBMIT_SETTINGS_JS)

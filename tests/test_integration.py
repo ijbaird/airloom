@@ -296,6 +296,16 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         self.assertIs(launched.get("private_bus"), True)
         self.assertIs(launched.get("debug_socket"), False)
 
+    def test_save_scenario_fails_rather_than_skips_as_root(self):
+        app = mock.Mock(sock_path="sock")
+        with mock.patch.object(self.script.os, "geteuid", return_value=0), \
+                mock.patch.object(self.script, "eval_js") as eval_js, \
+                redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(AssertionError, "regular user"):
+                self.script.scenario_save(app)
+        eval_js.assert_not_called()
+        self.assertNotIn("skip", output.getvalue())
+
     def test_viewport_width_excludes_the_window_frame_before_scaling(self):
         # Under a compositor (mutter) the webview spans the whole window; under
         # Xvfb GTK draws a solid CSD frame inside the requested size.

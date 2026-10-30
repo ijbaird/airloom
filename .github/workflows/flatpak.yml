@@ -62,7 +62,7 @@ jobs:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
       - name: Install headless WebKit dependencies
-        run: dnf install -y python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon
+        run: dnf install -y python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon util-linux shadow-utils
       - name: Run isolated WebKit UI regressions
         shell: bash
         env:
@@ -81,12 +81,17 @@ jobs:
           NO_AT_BRIDGE: "1"
         run: |
           set -euo pipefail
-          XDG_RUNTIME_DIR="$(mktemp -d)"
-          export XDG_RUNTIME_DIR
-          chmod 700 "${XDG_RUNTIME_DIR}"
+          # Root ignores directory permissions, so the save-failure checks need
+          # a regular user with its own copy of the checkout and runtime dir.
+          useradd --create-home --user-group airloom-ci
+          workdir="$(mktemp -d)"
+          cp -a . "${workdir}/src"
+          mkdir -m 700 "${workdir}/runtime"
+          chown -R airloom-ci:airloom-ci "${workdir}"
+          cd "${workdir}/src"
           # The stripped-debug scenario requires dbus-run-session; the outer
           # private bus also keeps every child off any other session bus.
-          dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" env GDK_DEBUG=no-portals python3 scripts/test-ui-regression
+          runuser -u airloom-ci -- env XDG_RUNTIME_DIR="${workdir}/runtime" dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" env GDK_DEBUG=no-portals python3 scripts/test-ui-regression
 
   release-eligibility:
     name: Validate release eligibility

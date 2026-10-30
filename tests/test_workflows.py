@@ -141,10 +141,33 @@ class WorkflowContractTest(unittest.TestCase):
         # A private session bus outside Xvfb, with the script itself under Xvfb.
         self.assertRegex(
             commands[0],
-            r"^dbus-run-session -- xvfb-run -a (?:-s \"[^\"]*\" )?"
+            r"^(?:runuser -u \S+ -- env (?:[A-Z_]+=\S+ )+)?dbus-run-session -- xvfb-run -a (?:-s \"[^\"]*\" )?"
             r"(?:env (?:[A-Z_]+=\S+ )+)?python3 scripts/test-ui-regression$",
         )
         self.assertIn("webkit-ui", job_needs(source, "publication"))
+
+    def test_cross_layer_regression_runs_unprivileged_with_its_own_writable_dirs(self):
+        # Root ignores directory permissions, so save-failure checks need a
+        # regular user; it gets a writable copy of the checkout and runtime dir.
+        ui_job = job_block(workflow("flatpak.yml"), "webkit-ui")
+        install = re.search(r"(?m)^\s*run: dnf install -y (.*)$", ui_job)
+        packages = install.group(1).split() if install else []
+        for package in ("util-linux", "shadow-utils"):  # runuser, useradd
+            with self.subTest(package=package):
+                self.assertIn(package, packages)
+
+        command = re.search(
+            r"(?m)^\s*runuser -u (?P<user>[a-z_][a-z0-9_-]*) -- env (?P<env>(?:[A-Z_]+=\S+ )+)"
+            r"dbus-run-session -- xvfb-run -a (?:-s \"[^\"]*\" )?"
+            r"(?:env (?:[A-Z_]+=\S+ )+)?python3 scripts/test-ui-regression$",
+            ui_job,
+        )
+        self.assertTrue(command, "test-ui-regression must run via runuser on a private bus under Xvfb")
+        user = command.group("user")
+        self.assertNotEqual(user, "root")
+        self.assertRegex(command.group("env"), r"\bXDG_RUNTIME_DIR=\S+ ")
+        self.assertRegex(ui_job, rf"(?m)^\s*useradd\b[^\n]*\s{re.escape(user)}$")
+        self.assertRegex(ui_job, rf"(?m)^\s*chown -R {re.escape(user)}:{re.escape(user)} \S+$")
 
     def test_publication_queue_retries_transient_github_api_errors(self):
         publish = workflow("publish.yml")
