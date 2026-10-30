@@ -16,24 +16,13 @@ from unittest import mock
 try:
     from airloom import app as app_module
 except (ImportError, ValueError):
-    # The adapter tests never instantiate GTK widgets. Provide just enough
-    # namespace for app.py's class definitions on headless build hosts.
-    gi = types.ModuleType("gi")
-    gi.require_version = lambda *_args: None
-    repository = types.ModuleType("gi.repository")
-    repository.Adw = SimpleNamespace(Application=object)
-    repository.Gio = SimpleNamespace()
-    repository.GLib = SimpleNamespace(
-        Error=Exception,
-        SOURCE_REMOVE=False,
-        SOURCE_CONTINUE=True,
-    )
-    repository.Gtk = SimpleNamespace()
-    repository.Notify = SimpleNamespace(Notification=object)
-    repository.WebKit = SimpleNamespace()
-    gi.repository = repository
-    sys.modules["gi"] = gi
-    sys.modules["gi.repository"] = repository
+    # Headless hosts without PyGObject: the adapter tests never create
+    # widgets, so a shared minimal namespace stands in for gi.
+    try:
+        from tests import gi_stub
+    except ImportError:
+        import gi_stub
+    gi_stub.install()
     from airloom import app as app_module
 
 from airloom import controller as controller_module
