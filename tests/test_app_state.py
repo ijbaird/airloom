@@ -567,6 +567,50 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         self.assertEqual(replacement.generation, outdoor_request.generation + 1)
         self.assertEqual(app._start_worker.call_count, 1)
 
+    def test_favorite_change_reissues_active_refresh_under_committed_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.save()
+            app = self.make_app(store=store)
+            app.sensors = [make_sensor(1)]
+            app._area_ids = {1}
+            active = app.controller.begin_refresh()
+            app.refreshing = True
+
+            app._on_script_message(
+                None, ScriptMessage({"action": "favorite", "id": 1})
+            )
+            replacement = app.pending_fetch
+            app._finish_refresh(
+                self.make_outcome(app, [make_sensor(2)], request=active)
+            )
+
+            self.assertIsNotNone(replacement)
+            self.assertEqual(replacement.generation, active.generation + 1)
+            self.assertEqual(app.launched, [(replacement,)])
+
+    def test_hide_change_replaces_pending_refresh_under_committed_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.save()
+            app = self.make_app(store=store)
+            app.sensors = [make_sensor(1)]
+            app._area_ids = {1}
+            active = app.controller.begin_refresh()
+            pending = app.controller.begin_refresh()
+            app.refreshing = True
+            app.pending_fetch = pending
+
+            app._on_script_message(None, ScriptMessage({"action": "hide", "id": 1}))
+            replacement = app.pending_fetch
+            app._finish_refresh(
+                self.make_outcome(app, [make_sensor(2)], request=active)
+            )
+
+            self.assertIsNot(replacement, pending)
+            self.assertEqual(replacement.generation, pending.generation + 1)
+            self.assertEqual(app.launched, [(replacement,)])
+
     def test_refresh_ensures_preserved_non_first_selection_trend(self):
         app = self.make_app()
         app.selected_id = 2

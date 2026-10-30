@@ -1017,7 +1017,7 @@ class AirloomApplication(Adw.Application):
                         },
                     )
                     return
-                self.controller.set_config(self.store.data)
+                self._set_publication_config()
                 for sensor in self.sensors:
                     if sensor.sensor_id == sensor_id:
                         sensor.favorite = enabled
@@ -1039,7 +1039,7 @@ class AirloomApplication(Adw.Application):
                             },
                         )
                         return
-                    self.controller.set_config(self.store.data)
+                    self._set_publication_config()
                     self._send_sensor_state()
                 else:
                     sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
@@ -1057,7 +1057,7 @@ class AirloomApplication(Adw.Application):
                                 },
                             )
                             return
-                        self.controller.set_config(self.store.data)
+                        self._set_publication_config()
                         self._send_sensor_state()
         elif action == "unhide":
             sensor_id = self._message_sensor_id(message)
@@ -1075,7 +1075,7 @@ class AirloomApplication(Adw.Application):
                         },
                     )
                     return
-                self.controller.set_config(self.store.data)
+                self._set_publication_config()
                 self._send_sensor_state()
         elif action == "unhide-all":
             try:
@@ -1091,7 +1091,7 @@ class AirloomApplication(Adw.Application):
                     },
                 )
                 return
-            self.controller.set_config(self.store.data)
+            self._set_publication_config()
             self._send_sensor_state()
         elif action == "save-settings":
             self._save_settings(message)
@@ -1391,6 +1391,12 @@ class AirloomApplication(Adw.Application):
             self.last_stale = False
             self.coverage = _coverage_payload(bounds, bounds)
             self._send_sensor_state("PurpleAir · cached")
+
+    def _set_publication_config(self) -> None:
+        """Keep active or queued refresh work authorized after display changes."""
+        self.controller.set_config(self.store.data)
+        if self.refreshing or self.pending_fetch is not None:
+            self.pending_fetch = self.controller.begin_refresh()
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the current view, falling back to home before one exists."""
