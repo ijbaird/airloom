@@ -40,6 +40,26 @@ class FakeTiming:
         self.now += seconds
 
 
+class EntrySignalingLock:
+    """Wrap the search lock and signal once a second search is waiting on it."""
+
+    def __init__(self, lock):
+        self._lock = lock
+        self._entries = 0
+        self._guard = threading.Lock()
+        self.second_waiting = threading.Event()
+
+    def __enter__(self):
+        with self._guard:
+            self._entries += 1
+            if self._entries == 2:
+                self.second_waiting.set()
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc):
+        return self._lock.__exit__(*exc)
+
+
 def make_geocoder(**kwargs):
     timing = FakeTiming()
     client = geocode.Geocoder(clock=timing.clock, sleep=timing.sleep, **kwargs)
@@ -209,6 +229,7 @@ class GeocoderTest(unittest.TestCase):
         payload = [{"lat": "1", "lon": "2", "display_name": "Shared place"}]
         expected = [Place("Shared place", 1.0, 2.0)]
         client, _ = make_geocoder()
+        client._search_lock = EntrySignalingLock(client._search_lock)
         first_started = threading.Event()
         release_first = threading.Event()
         second_done = threading.Event()
@@ -244,12 +265,16 @@ class GeocoderTest(unittest.TestCase):
             first_thread.start()
             entered_request = first_started.wait(2)
             second_thread.start()
-            second_finished_early = second_done.wait(0.1)
+            # Release the leader only once the second search is provably
+            # inside search() and blocked behind the in-flight miss.
+            second_waiting = client._search_lock.second_waiting.wait(5)
+            second_finished_early = second_done.is_set()
             release_first.set()
             first_thread.join(5)
             second_thread.join(5)
 
         self.assertTrue(entered_request, "first search did not reach the request")
+        self.assertTrue(second_waiting, "second search never reached the search lock")
         self.assertFalse(second_finished_early, "second search bypassed the in-flight miss")
         self.assertFalse(first_thread.is_alive())
         self.assertFalse(second_thread.is_alive())
@@ -261,6 +286,7 @@ class GeocoderTest(unittest.TestCase):
         payload = [{"lat": "1", "lon": "2", "display_name": "Recovered place"}]
         expected = [Place("Recovered place", 1.0, 2.0)]
         client, _ = make_geocoder()
+        client._search_lock = EntrySignalingLock(client._search_lock)
         first_started = threading.Event()
         release_first = threading.Event()
         call_lock = threading.Lock()
@@ -300,12 +326,14 @@ class GeocoderTest(unittest.TestCase):
             first_thread.start()
             entered_request = first_started.wait(2)
             second_thread.start()
+            second_waiting = client._search_lock.second_waiting.wait(5)
             release_first.set()
             first_thread.join(5)
             second_thread.join(5)
             cached = client.search("retry concurrently")
 
         self.assertTrue(entered_request, "failed search did not reach the request")
+        self.assertTrue(second_waiting, "second search never reached the search lock")
         self.assertFalse(first_thread.is_alive())
         self.assertFalse(second_thread.is_alive())
         self.assertEqual(len(first_errors), 1)
