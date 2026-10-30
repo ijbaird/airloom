@@ -342,14 +342,116 @@ class DebugScriptIsolationTest(unittest.TestCase):
         with mock.patch.object(Path, "read_text", read_text), \
                 mock.patch.object(Path, "read_bytes", read_bytes), \
                 mock.patch.object(module.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
-                mock.patch.object(module.subprocess, "run",
-                                  lambda command, **_kwargs: calls.append(command[-1])):
+                mock.patch.object(module, "run_bounded",
+                                  lambda command, *_args: calls.append(command[-1])):
             module.detach_mounts(root)
 
         self.assertEqual(sorted(calls), sorted([
             "/tmp/café/airloom-screenshots-x/runtime/doc",
             "/tmp/café/airloom-screenshots-x/runtime/a b\tc\nd\\e",
         ]))
+
+    def test_screenshot_stuck_unmount_is_bounded_reaped_and_fails_the_run(self):
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        # The session "succeeds" at once: mutter's stand-in writes the runner's
+        # success marker instead of running it.
+        write_executable(fake_bin / "dbus-run-session", '#!/bin/sh\n[ "$1" = "--" ] && shift\nexec "$@"\n')
+        write_executable(
+            fake_bin / "mutter",
+            '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--inside-compositor" ]; do shift; done\n'
+            'echo ok > "$2/done"\n',
+        )
+        unmounts = self.root / "unmounts.jsonl"
+        # A stuck unmount: records itself, ignores SIGTERM, and never returns.
+        stuck = (
+            f"#!{sys.executable}\n"
+            "import json, os, signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"with open({str(unmounts)!r}, 'a') as record:\n"
+            "    record.write(json.dumps({'pid': os.getpid(), 'args': sys.argv[1:]}) + '\\n')\n"
+            "time.sleep(300)\n"
+        )
+        for name in ("fusermount3", "fusermount"):
+            write_executable(fake_bin / name, stuck)
+        tmpdir = self.root / "tmp"
+        tmpdir.mkdir()
+        # Runs the real owner in-process with /proc/self/mountinfo listing two
+        # FUSE mounts inside its private directory, and a 1 s unmount bound
+        # (ignored by a script without one).
+        driver = self.root / "driver.py"
+        driver.write_text(
+            "import glob, json, os, sys, time\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "from importlib.util import module_from_spec, spec_from_loader\n"
+            "from pathlib import Path\n"
+            "script, tmpdir, output, unmounts = sys.argv[1:5]\n"
+            "loader = SourceFileLoader('make_screenshots', script)\n"
+            "module = module_from_spec(spec_from_loader(loader.name, loader))\n"
+            "loader.exec_module(module)\n"
+            "module.UNMOUNT_TIMEOUT_S = 1\n"
+            "original = Path.read_bytes\n"
+            "def read_bytes(path):\n"
+            "    if str(path) != '/proc/self/mountinfo':\n"
+            "        return original(path)\n"
+            "    lines = [f'90 1 0:90 / {root}/{name} rw - fuse.fake fake rw'\n"
+            "             for root in glob.glob(os.path.join(tmpdir, 'airloom-screenshots-*'))\n"
+            "             for name in ('runtime', 'state')]\n"
+            "    return ''.join(line + '\\n' for line in lines).encode()\n"
+            "Path.read_bytes = read_bytes\n"
+            "start = time.monotonic()\n"
+            "try:\n"
+            "    module.main(['--output', output])\n"
+            "    outcome = {'result': 'success', 'message': ''}\n"
+            "except BaseException as exc:\n"
+            "    outcome = {'result': type(exc).__name__, 'message': str(exc)}\n"
+            "outcome['elapsed'] = time.monotonic() - start\n"
+            "pids = [json.loads(line)['pid'] for line in open(unmounts)] if os.path.exists(unmounts) else []\n"
+            "outcome['unreaped'] = [pid for pid in pids if os.path.exists(f'/proc/{pid}')]\n"
+            "print('OUTCOME ' + json.dumps(outcome))\n",
+            encoding="utf-8",
+        )
+        env = {
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "TMPDIR": str(tmpdir),
+        }
+        process = self._launch_owned_process(
+            [sys.executable, str(driver), str(PROJECT / "scripts" / "make-screenshots"),
+             str(tmpdir), str(self.root / "shots"), str(unmounts)],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self._kill_recorded_unmounts, unmounts)
+        guard_s = 25
+        try:
+            stdout, stderr = process.communicate(timeout=guard_s)
+        except subprocess.TimeoutExpired:
+            self._stop_owned_process(process)
+            self.fail(f"cleanup did not finish within the {guard_s}s guard (stuck unmount is unbounded)")
+
+        outcome = json.loads(next(line for line in stdout.splitlines()
+                                  if line.startswith("OUTCOME "))[len("OUTCOME "):])
+        # A leftover mount must not pass as success even though capture succeeded.
+        self.assertEqual(outcome["result"], "AssertionError", stdout + stderr)
+        self.assertIn("unmount", outcome["message"])
+        self.assertIn("warning", stderr.lower())
+        # Each of the two unmounts is bounded (1 s plus the kill), so the
+        # whole cleanup finishes far inside the guard.
+        self.assertLess(outcome["elapsed"], 10, outcome)
+        calls = [json.loads(line) for line in unmounts.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(calls), 2, "a stuck unmount skipped the next mount")
+        for call in calls:
+            self.assertEqual(call["args"][:2], ["-u", "-z"])
+        self.assertEqual(outcome["unreaped"], [], "a timed-out unmount was left unreaped")
+        # Removal was still attempted: everything but the still-mounted
+        # directories is gone.
+        (root,) = list(tmpdir.iterdir())
+        self.assertEqual(sorted(path.name for path in root.iterdir()), ["runtime", "state"])
+
+    def _kill_recorded_unmounts(self, record: Path) -> None:
+        if record.exists():
+            for line in record.read_text(encoding="utf-8").splitlines():
+                self._kill_owned_pid(json.loads(line)["pid"])
 
     def _exercise_screenshot_abort(self, timeout_s: int, cancel_signal, signal_during_cleanup=None) -> None:
         # A copy of the real script in a fake project whose debug-run never
