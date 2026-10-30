@@ -1250,6 +1250,50 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(app.webview.zoom_level, scale)
 
 
+class FilterSaveFailureTest(ApplicationAdapterTestCase):
+    def test_failed_filter_save_keeps_publication_and_alerts_on_saved_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.data.update({"favorites": [1, 2], "alert_states": {}})
+            store.save()
+            app = self.make_app(store=store)
+            app.refresh = mock.Mock()
+            app.sensors = [
+                make_sensor(1, favorite=True),
+                make_sensor(2, indoor=True, favorite=True),
+            ]
+            app._area_ids = {1, 2}
+
+            with mock.patch.object(
+                store, "_write", side_effect=PermissionError(13, "Permission denied")
+            ):
+                app._set_location_filter({"value": "indoor"})
+            app._send_sensor_state()
+            decision = app.controller.complete_refresh(
+                app.controller.begin_refresh(),
+                [make_sensor(1), make_sensor(2, indoor=True)],
+                "live",
+                "network",
+            )
+            with (
+                mock.patch.object(app_module.time, "time", return_value=NOW),
+                mock.patch.object(app_module.Notify, "Notification") as notification_type,
+            ):
+                app._check_alerts()
+
+        app.refresh.assert_not_called()
+        self.assertEqual(store.data["location_filter"], "outdoor")
+        payload = self.sensor_payloads(app)[-1]
+        self.assertEqual([item["id"] for item in payload["items"]], [1])
+        self.assertEqual([sensor.sensor_id for sensor in decision.sensors], [1])
+        alerted = [call.args[0] for call in notification_type.new.call_args_list]
+        self.assertEqual(len(alerted), 1)
+        self.assertIn("Sensor 1", alerted[0])
+        self.assertEqual(
+            [event for event, _payload in app.sent if event == "config"], []
+        )
+
+
 class DemoPublicationTest(ApplicationAdapterTestCase):
     CENTERS = ((0.0, 179.99), (0.0, -179.99), (89.99, 0.0), (-89.99, 0.0), (90.0, 180.0))
 

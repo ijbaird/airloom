@@ -28,6 +28,9 @@
     // other config or error publications never complete a pending Save.
     settingsSaveRequestId: null,
     nextSettingsRequestId: 0,
+    // Filter chosen on the chip but not yet acknowledged by a config event;
+    // the chip keeps showing the filter Python actually applies.
+    requestedLocationFilter: null,
     positioned: false,
     // Name of the area currently in view (reverse-geocoded by Python);
     // overrides the configured home name on the summary chip until replaced.
@@ -197,6 +200,7 @@
 
   function applyConfig(config) {
     state.config = { ...state.config, ...config };
+    state.requestedLocationFilter = null;
     const lat = Number(state.config.latitude);
     const lon = Number(state.config.longitude);
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
@@ -1174,6 +1178,7 @@
   }
 
   function handleError(payload) {
+    state.requestedLocationFilter = null;
     toast(payload.message);
   }
 
@@ -1411,10 +1416,17 @@
     $("#legend-chip").setAttribute("aria-expanded", String(!legend.hidden));
   });
   $("#filter-chip").addEventListener("click", () => {
-    state.config.location_filter = FILTER_NEXT[state.config.location_filter] || "indoor";
+    const next = FILTER_NEXT[state.requestedLocationFilter || state.config.location_filter] || "indoor";
+    // Desktop commits only when Python acknowledges with its saved config,
+    // so a failed save never leaves the chip naming a filter not applied.
+    if (window.webkit?.messageHandlers?.airloom) {
+      state.requestedLocationFilter = next;
+      bridge({ action: "set-location-filter", value: next });
+      return;
+    }
+    state.config.location_filter = next;
     stampFilterChip();
-    if (window.webkit?.messageHandlers?.airloom) bridge({ action: "set-location-filter", value: state.config.location_filter });
-    else { renderAll(); reconcilePopup(); } // preview: filter locally, no bridge round-trip
+    renderAll(); reconcilePopup(); // preview: filter locally, no bridge round-trip
   });
   $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button, a, .map-popup")) return; beginDirectManipulation(); hideTransientOverlays(); state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });

@@ -1773,3 +1773,67 @@ test("a newer empty publication preserves an exhausted retry budget", () => {
   retry.click();
   assert.equal(app.messages.filter((message) => message.action === "select" && message.id === 1).length, 3);
 });
+
+function runPythonAdapter(messages, { failWrites = false } = {}) {
+  const output = require("node:child_process").execFileSync(
+    "python3",
+    [path.resolve(__dirname, "fixtures/bridge_adapter.py")],
+    {
+      cwd: path.resolve(__dirname, "../.."),
+      env: { ...process.env, PYTHONPATH: path.resolve(__dirname, "../..") },
+      input: JSON.stringify({ messages, fail_writes: failWrites }),
+      encoding: "utf8",
+    },
+  );
+  return JSON.parse(output);
+}
+
+test("a failed filter save leaves the chip on the filter Python still applies", () => {
+  const app = loadApp();
+  configureMap(app, { location_filter: "outdoor" });
+  const chip = app.elements.get("filter-chip");
+  assert.equal(chip.textContent, "Outdoor");
+
+  chip.click();
+  const bridged = app.messages.filter((message) => message.action === "set-location-filter");
+  assert.deepEqual(bridged, [{ action: "set-location-filter", value: "indoor" }]);
+  const result = runPythonAdapter(bridged, { failWrites: true });
+  assert.equal(result.location_filter, "outdoor");
+  for (const [event, payload] of result.events) app.context.Airloom.receive(event, payload);
+
+  assert.equal(chip.textContent, "Outdoor");
+  assert.equal(app.context.Airloom.debugState().location_filter, "outdoor");
+  const toasts = app.elements.get("toast-stack").childNodes.map((node) => node.textContent);
+  assert.ok(toasts.some((text) => text.includes("Could not save location filter")), toasts.join("|"));
+});
+
+test("a successful filter save updates the chip from Python's acknowledgment", () => {
+  const app = loadApp();
+  configureMap(app, { location_filter: "outdoor" });
+  const chip = app.elements.get("filter-chip");
+
+  chip.click();
+  const bridged = app.messages.filter((message) => message.action === "set-location-filter");
+  const result = runPythonAdapter(bridged);
+  assert.equal(result.location_filter, "indoor");
+  for (const [event, payload] of result.events) app.context.Airloom.receive(event, payload);
+
+  assert.equal(chip.textContent, "Indoor");
+  assert.equal(app.context.Airloom.debugState().location_filter, "indoor");
+});
+
+test("rapid filter clicks before acknowledgment advance from the requested filter", () => {
+  const app = loadApp();
+  configureMap(app, { location_filter: "indoor" });
+  const chip = app.elements.get("filter-chip");
+
+  chip.click();
+  chip.click();
+
+  const values = app.messages.filter((message) => message.action === "set-location-filter").map((message) => message.value);
+  assert.deepEqual(values, ["both", "outdoor"]);
+  assert.equal(chip.textContent, "Indoor", "the chip waits for Python's acknowledgment");
+  app.context.Airloom.receive("error", { message: "Could not save location filter: denied" });
+  chip.click();
+  assert.equal(app.messages.at(-1).value, "both", "a failure releases the unacknowledged request");
+});
