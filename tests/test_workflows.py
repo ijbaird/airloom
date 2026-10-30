@@ -18,11 +18,13 @@ FLATPAK_IMAGE = "ghcr.io/flathub-infra/flatpak-github-actions@sha256:"
 
 SANDBOX_VARIABLE = "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"
 UI_SCRIPT_STEPS = ("Run isolated WebKit UI regressions", "Run cross-layer UI regression")
-SANDBOX_EXEMPT_DIRS = {".git", "tests", "docs", "__pycache__"}
+# Only these repository-root directories are exempt; nested directories with
+# the same names ship with the app. Bytecode caches mirror scanned sources.
+SANDBOX_EXEMPT_ROOTS = {".git", "tests", "docs"}
 
 
 def repository_files(root):
-    """Every file the repository would ship, tracked or new, minus tests/docs.
+    """Every file the repository would ship, tracked or new, minus root tests/ and docs/.
 
     With git, ignored local-only files (build output, agent notes) are
     skipped; a pristine export has no git and no ignored files to skip.
@@ -37,7 +39,9 @@ def repository_files(root):
         paths = [Path(top) / name for top, _dirs, names in os.walk(root) for name in names]
     for path in paths:
         relative = path.relative_to(root)
-        if path.is_file() and not SANDBOX_EXEMPT_DIRS.intersection(relative.parts):
+        if relative.parts[0] in SANDBOX_EXEMPT_ROOTS or "__pycache__" in relative.parts:
+            continue
+        if path.is_file():
             yield path
 
 
@@ -382,6 +386,12 @@ class WorkflowContractTest(unittest.TestCase):
             "app module": ("airloom/sandbox.py", f'import os\nos.environ["{SANDBOX_VARIABLE}"] = "1"\n'),
             "packaging": ("packaging/extra.yml", f"finish-args:\n  - --env={SANDBOX_VARIABLE}=1\n"),
             "Makefile": ("Makefile", f"export {SANDBOX_VARIABLE} = 1\n"),
+            # Only the repository-root tests/ and docs/ are exempt; nested
+            # directories with those names ship (Makefile, Flatpak manifest).
+            "nested app docs/": ("airloom/docs/sandbox.py", f'import os\nos.environ["{SANDBOX_VARIABLE}"] = "1"\n'),
+            "nested action tests/": (".github/actions/tests/action.yaml",
+                                     f"runs:\n  using: composite\n  steps:\n    - run: export {SANDBOX_VARIABLE}=1\n      shell: bash\n"),
+            "nested scripts tests/": ("scripts/tests/x", f"export {SANDBOX_VARIABLE}=1\n"),
         }
         cases = [(name, edit, None) for name, edit in injections.items()]
         cases += [(name, None, added) for name, added in added_files.items()]
@@ -407,6 +417,15 @@ class WorkflowContractTest(unittest.TestCase):
                         stream.write(added[1])
                 _permitted, elsewhere = sandbox_variable_occurrences(root)
                 self.assertEqual(len(elsewhere), 1, elsewhere)
+
+    def test_sandbox_guard_exempts_only_the_root_tests_and_docs_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in ("tests/test_sandbox.py", "tests/nested/case.py", "docs/ci.md"):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"{SANDBOX_VARIABLE}=1\n", encoding="utf-8")
+            self.assertEqual(sandbox_variable_occurrences(root), ([], []))
 
     def test_publication_queue_retries_transient_github_api_errors(self):
         publish = workflow("publish.yml")
