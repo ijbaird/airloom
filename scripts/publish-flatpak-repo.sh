@@ -49,9 +49,35 @@ if ! merged_refs="$(ostree refs --repo="${repo}")"; then
   exit 1
 fi
 
+# Build jobs (and dev fixtures) already sign each arch's commit with this
+# key. ostree refuses to sign again only when it recognizes our own
+# signature, with exactly this message; every other failure is fatal.
+already_signed="error: Commit is already signed with GPG key ${GPG_KEY_ID}"
 while IFS= read -r ref; do
   commit="$(ostree rev-parse --repo="${repo}" "${ref}")"
-  ostree gpg-sign --repo="${repo}" --gpg-homedir="${GNUPGHOME}" "${commit}" "${GPG_KEY_ID}"
+  if ! sign_error="$(ostree gpg-sign --repo="${repo}" --gpg-homedir="${GNUPGHOME}" "${commit}" "${GPG_KEY_ID}" 2>&1 >/dev/null)"; then
+    if [[ "${sign_error}" != "${already_signed}" ]]; then
+      printf '%s\n' "${sign_error}" >&2
+      exit 1
+    fi
+    echo "${ref}: already signed by ${GPG_KEY_ID}"
+  fi
+done <<< "${merged_refs}"
+
+# Prove every merged commit carries a good signature by GPG_KEY_ID: a
+# gpg-verified metadata pull against a keyring holding only that key.
+verify_dir="$(mktemp -d)"
+trap 'rm -rf "${verify_dir}"' EXIT
+GNUPGHOME="${GNUPGHOME}" gpg --batch --export "${GPG_KEY_ID}" > "${verify_dir}/signing-key.gpg"
+[[ -s "${verify_dir}/signing-key.gpg" ]] || { echo "could not export public key ${GPG_KEY_ID}" >&2; exit 1; }
+ostree init --repo="${verify_dir}/repo" --mode=archive
+ostree remote add --repo="${verify_dir}/repo" --gpg-import="${verify_dir}/signing-key.gpg" \
+  airloom-signing-check "file://$(cd "${repo}" && pwd)"
+while IFS= read -r ref; do
+  if ! ostree pull-local --repo="${verify_dir}/repo" --remote=airloom-signing-check --gpg-verify --commit-metadata-only "${repo}" "${ref}"; then
+    echo "${ref} is not signed by ${GPG_KEY_ID}" >&2
+    exit 1
+  fi
 done <<< "${merged_refs}"
 
 flatpak build-update-repo \

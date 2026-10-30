@@ -20,6 +20,7 @@ CHECK_PROVENANCE = PROJECT_ROOT / "scripts" / "check-release-provenance.py"
 RECORD_PROVENANCE = PROJECT_ROOT / "scripts" / "record-provenance.sh"
 IMPORT_SIGNING_KEY = PROJECT_ROOT / "scripts" / "import-signing-key.sh"
 VERIFY_CLIENT = PROJECT_ROOT / "scripts" / "verify-flatpak-release.sh"
+PUBLISH_REPO = PROJECT_ROOT / "scripts" / "publish-flatpak-repo.sh"
 WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "flatpak.yml"
 PUBLISH_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "publish.yml"
 SOURCE_SHA = "a" * 40
@@ -652,6 +653,161 @@ class RepositoryTarProvenanceValidationTest(unittest.TestCase):
         result = self.check(source_sha="e" * 40)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("source_sha", result.stderr)
+
+
+# Stand-ins for ostree/gpg/flatpak that model just enough of commit
+# signatures for publish-flatpak-repo.sh: per-commit signer records, ostree's
+# "already signed" refusal, and gpg-verified metadata pulls against a keyring.
+FAKE_OSTREE = r"""#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+env = os.environ
+state = Path(env["FAKE_STATE"])
+with open(state / "log", "a") as stream:
+    stream.write(" ".join(sys.argv[1:]) + "\n")
+args = sys.argv[1:]
+options = {a.split("=", 1)[0]: (a.split("=", 1)[1] if "=" in a else "") for a in args if a.startswith("--")}
+positional = [a for a in args[1:] if not a.startswith("--")]
+command = args[0]
+
+
+def signers(commit):
+    path = state / "signatures" / commit
+    return path.read_text().split() if path.exists() else []
+
+
+if command == "init":
+    Path(options["--repo"]).mkdir(parents=True, exist_ok=True)
+elif command == "refs":
+    refs = Path(options["--repo"]) / "refs.list"
+    print(refs.read_text(), end="") if refs.exists() else None
+elif command == "rev-parse":
+    print("commit-" + positional[0].split("/")[2])
+elif command == "pull-local":
+    source, ref = positional
+    if "--remote" in options:
+        keyring = (state / "remotes" / options["--remote"]).read_text().strip()
+        commit = "commit-" + ref.split("/")[2]
+        assert "--gpg-verify" in options and "--commit-metadata-only" in options, args
+        if not signers(commit):
+            sys.exit(f"error: Commit {commit}: GPG verification enabled, but no signatures found")
+        if keyring.removeprefix("PUBKEY:") not in signers(commit):
+            sys.exit(f"error: Commit {commit}: Can't check signature: public key not found")
+    else:
+        with open(Path(options["--repo"]) / "refs.list", "a") as stream:
+            stream.write(ref + "\n")
+elif command == "remote":
+    assert positional[0] == "add", args
+    (state / "remotes").mkdir(exist_ok=True)
+    (state / "remotes" / positional[1]).write_text(Path(options["--gpg-import"]).read_text())
+elif command == "gpg-sign":
+    commit, key = positional
+    existing = signers(commit)
+    if existing:
+        sys.exit(f"error: Commit is already signed with GPG key {existing[0]}")
+    if env.get("FAKE_SIGN_ERROR"):
+        sys.exit(env["FAKE_SIGN_ERROR"])
+    if env.get("FAKE_SIGN_DROPS_SIGNATURE") != "1":
+        (state / "signatures").mkdir(exist_ok=True)
+        (state / "signatures" / commit).write_text(key + "\n")
+else:
+    sys.exit(f"unsupported fake ostree command: {args}")
+"""
+
+FAKE_GPG = """#!/bin/sh
+# Only `gpg --batch --export KEY` is used.
+[ "$2" = "--export" ] || { echo "unsupported fake gpg: $*" >&2; exit 1; }
+echo "PUBKEY:$3"
+"""
+
+FAKE_FLATPAK = """#!/bin/sh
+echo "flatpak $*" >> "$FAKE_STATE/log"
+"""
+
+
+class PublishRepoSigningTest(unittest.TestCase):
+    KEY = "A69439FA8798E7F3D470CB0AB0CB70F4240BF9B6"
+    OTHER_KEY = "0123456789ABCDEF0123456789ABCDEF01234567"
+
+    def run_publish(self, presigned=None, **env_overrides):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for name, body in (("ostree", FAKE_OSTREE), ("gpg", FAKE_GPG), ("flatpak", FAKE_FLATPAK)):
+                (bin_dir / name).write_text(body, encoding="utf-8")
+                (bin_dir / name).chmod(0o755)
+            state = root / "state"
+            (state / "signatures").mkdir(parents=True)
+            for commit, key in (presigned or {}).items():
+                (state / "signatures" / commit).write_text(key + "\n")
+            sources = []
+            for arch in ("x86_64", "aarch64"):
+                source = root / f"airloom-repo-{arch}"
+                source.mkdir()
+                (source / "refs.list").write_text(f"app/ai.stealthvision.Airloom/{arch}/stable\n")
+                sources.append(str(source))
+            pubkey = root / "airloom-flatpak.gpg"
+            pubkey.write_text("public key\n")
+            env = {
+                **os.environ,
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                "FAKE_STATE": str(state),
+                "GPG_KEY_ID": self.KEY,
+                "GNUPGHOME": str(root / "gnupg"),
+                "PUBKEY_FILE": str(pubkey),
+                **env_overrides,
+            }
+            result = subprocess.run(
+                ["bash", str(PUBLISH_REPO), str(root / "_site"), *sources],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            log = (state / "log").read_text() if (state / "log").exists() else ""
+            signatures = {
+                path.name: path.read_text().split() for path in (state / "signatures").iterdir()
+            }
+            return result, log, signatures
+
+    def test_unsigned_merged_commits_are_signed_and_verified(self):
+        result, log, signatures = self.run_publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(signatures, {"commit-x86_64": [self.KEY], "commit-aarch64": [self.KEY]})
+        for arch in ("x86_64", "aarch64"):
+            self.assertRegex(
+                log,
+                rf"(?m)^pull-local --repo=\S+ --remote=\S+ --gpg-verify --commit-metadata-only "
+                rf"\S+/_site/repo app/ai\.stealthvision\.Airloom/{arch}/stable$",
+            )
+        self.assertIn("flatpak build-update-repo", log)
+
+    def test_commits_already_signed_by_the_same_key_are_accepted(self):
+        # Production build jobs and dev fixtures sign every arch's commit
+        # before assembly; ostree refuses to sign them again.
+        result, _log, signatures = self.run_publish(
+            presigned={"commit-x86_64": self.KEY, "commit-aarch64": self.KEY}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(signatures, {"commit-x86_64": [self.KEY], "commit-aarch64": [self.KEY]})
+
+    def test_already_signed_by_a_different_key_is_fatal(self):
+        result, log, _signatures = self.run_publish(presigned={"commit-x86_64": self.OTHER_KEY})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"already signed with GPG key {self.OTHER_KEY}", result.stderr)
+        self.assertNotIn("build-update-repo", log)
+
+    def test_other_signing_errors_are_fatal(self):
+        result, log, _signatures = self.run_publish(FAKE_SIGN_ERROR="error: gpg: signing failed: No secret key")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No secret key", result.stderr)
+        self.assertNotIn("build-update-repo", log)
+
+    def test_a_commit_left_without_our_signature_is_fatal(self):
+        result, log, _signatures = self.run_publish(FAKE_SIGN_DROPS_SIGNATURE="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"is not signed by {self.KEY}", result.stderr)
+        self.assertNotIn("build-update-repo", log)
 
 
 class SigningKeyTest(unittest.TestCase):
