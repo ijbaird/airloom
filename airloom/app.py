@@ -1570,11 +1570,20 @@ class AirloomApplication(Adw.Application):
             self.requests.finish(token)
             return
 
-        cached = (
-            self.cache.get_trend(sensor_id, self._refresh_seconds())
-            if self.cache is not None
-            else None
-        )
+        cached = None
+        if self.cache is not None:
+            try:
+                cached = self.cache.get_trend(sensor_id, self._refresh_seconds())
+            except Exception as exc:  # noqa: BLE001 — caching is optional
+                self._send(
+                    "error",
+                    {
+                        "message": (
+                            f"Could not read cached trend: {exc}. "
+                            "Fetching a live trend instead."
+                        )
+                    },
+                )
         if cached is not None:
             status = "loaded" if cached else "unavailable"
             if cached and sensor.trend != cached:
@@ -1643,7 +1652,18 @@ class AirloomApplication(Adw.Application):
         status = "error" if failed else "loaded" if trend else "unavailable"
         if status == "loaded":
             if self.cache is not None:
-                self.cache.store_trend(sensor_id, trend)
+                try:
+                    self.cache.store_trend(sensor_id, trend)
+                except Exception as exc:  # noqa: BLE001 — live data remains valid
+                    self._send(
+                        "error",
+                        {
+                            "message": (
+                                f"Could not cache trend: {exc}. "
+                                "Showing the live result without trend caching."
+                            )
+                        },
+                    )
             sensor.trend = trend
             self._send_sensor_state()
         self._send_trend_state(

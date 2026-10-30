@@ -38,6 +38,7 @@ except (ImportError, ValueError):
 
 from airloom import geocode as geocode_module
 from airloom.app import AirloomApplication
+from airloom.cache import CacheError
 from airloom.controller import ApplicationController
 from airloom.geocode import Place
 from airloom.models import Sensor
@@ -327,6 +328,66 @@ class TrendRequestTest(ApplicationRequestTestCase):
                 "reading_last_seen": 1234,
             },
         )
+
+    def test_trend_cache_read_failure_still_emits_loaded(self):
+        sensor = make_sensor(last_seen=1234)
+        app = self.make_app(sensors=[sensor])
+        app.cache.get_trend = mock.Mock(side_effect=CacheError("cache read failed"))
+        threads = ThreadQueue()
+        idles = IdleQueue()
+        trend = [{"label": "Now", "aqi": 50}]
+        client = mock.Mock()
+        client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "PurpleAirClient", return_value=client),
+            mock.patch.object(app_module, "trend_from_values", return_value=trend),
+        ):
+            try:
+                app._ensure_trend(1)
+            except Exception as exc:
+                self.fail(f"trend cache read escaped: {exc}")
+            threads.threads[0].run()
+            idles.run(0)
+
+        self.assertEqual(self.trend_events(app)[-1]["status"], "loaded")
+        self.assertEqual(self.trend_events(app)[-1]["trend"], trend)
+        self.assertEqual(sensor.trend, trend)
+
+    def test_trend_cache_write_failure_reports_degradation_and_emits_loaded(self):
+        sensor = make_sensor(last_seen=1234)
+        app = self.make_app(sensors=[sensor])
+        app.cache.store_trend = mock.Mock(side_effect=CacheError("cache write failed"))
+        threads = ThreadQueue()
+        idles = IdleQueue()
+        trend = [{"label": "Now", "aqi": 50}]
+        client = mock.Mock()
+        client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "PurpleAirClient", return_value=client),
+            mock.patch.object(app_module, "trend_from_values", return_value=trend),
+        ):
+            app._ensure_trend(1)
+            threads.threads[0].run()
+            try:
+                idles.run(0)
+            except Exception as exc:
+                self.fail(f"trend cache write escaped: {exc}")
+
+        self.assertEqual(self.trend_events(app)[-1]["status"], "loaded")
+        self.assertEqual(self.trend_events(app)[-1]["trend"], trend)
+        self.assertEqual(sensor.trend, trend)
+        errors = [
+            payload["message"] for event, payload in app.sent if event == "error"
+        ]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("cache", errors[0].lower())
+        self.assertIn("cache write failed", errors[0])
 
     def test_missing_sensor_emits_idle_state(self):
         app = self.make_app()
