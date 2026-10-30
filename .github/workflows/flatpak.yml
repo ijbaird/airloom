@@ -74,6 +74,10 @@ jobs:
         shell: bash
         env:
           NO_AT_BRIDGE: "1"
+          # Docker's default seccomp profile blocks bubblewrap here, so WebKit's
+          # web-process sandbox cannot start. CI only; released Flatpaks run
+          # WebKit inside the Flatpak sandbox.
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
         run: |
           set -euo pipefail
           XDG_RUNTIME_DIR="$(mktemp -d)"
@@ -86,6 +90,10 @@ jobs:
         shell: bash
         env:
           NO_AT_BRIDGE: "1"
+          # Docker's default seccomp profile blocks bubblewrap here, so WebKit's
+          # web-process sandbox cannot start. CI only; released Flatpaks run
+          # WebKit inside the Flatpak sandbox.
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
         run: |
           set -euo pipefail
           # Root ignores directory permissions, so the save-failure checks need

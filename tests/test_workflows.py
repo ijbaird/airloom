@@ -246,6 +246,43 @@ class WorkflowContractTest(unittest.TestCase):
                 if before:
                     self.assertLess(fetched.start(), block.index(before), "refresh tags before selecting by tag")
 
+    def test_only_the_ci_ui_script_steps_disable_the_webkit_sandbox(self):
+        # Docker's default seccomp blocks bubblewrap, so WebKit's web-process
+        # sandbox cannot start in the webkit-ui container. Nothing else (app,
+        # packaging, release jobs) may turn the sandbox off.
+        variable = "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"
+        ui_steps = {"Run isolated WebKit UI regressions", "Run cross-layer UI regression"}
+        for path in WORKFLOWS.glob("*.yml"):
+            source = path.read_text(encoding="utf-8")
+            for job_name in re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", source):
+                for step in re.split(r"(?m)^      - ", job_block(source, job_name))[1:]:
+                    name = re.match(r"name: (.*)", step)
+                    name = name.group(1).strip() if name else ""
+                    code = "\n".join(line for line in step.splitlines() if not line.strip().startswith("#"))
+                    with self.subTest(workflow=path.name, job=job_name, step=name):
+                        if path.name == "flatpak.yml" and job_name == "webkit-ui" and name in ui_steps:
+                            self.assertRegex(code, rf'(?m)^        env:\n(?:          [^\n]*\n)*?          {variable}: "1"$')
+                            self.assertEqual(code.count(variable), 1)
+                            ui_steps.discard(name)
+                        else:
+                            self.assertNotIn(variable, code)
+        self.assertEqual(ui_steps, set(), "both UI script steps must exist")
+
+        ui_job = job_block(workflow("flatpak.yml"), "webkit-ui")
+        runuser = re.search(r"(?m)^\s*runuser .*scripts/test-ui-regression$", ui_job)
+        self.assertTrue(runuser)
+        # The unprivileged step must hand the inherited environment on.
+        self.assertNotRegex(runuser.group(0), r"runuser (?:-l|--login|-)\s|\benv -i\b|--ignore-environment")
+
+        for relative in ("airloom", "packaging", "scripts", "run", "Makefile"):
+            target = PROJECT / relative
+            files = [target] if target.is_file() else [
+                path for path in target.rglob("*") if path.is_file() and "__pycache__" not in path.parts
+            ]
+            for path in files:
+                with self.subTest(file=str(path.relative_to(PROJECT))):
+                    self.assertNotIn(variable.encode(), path.read_bytes())
+
     def test_publication_queue_retries_transient_github_api_errors(self):
         publish = workflow("publish.yml")
         step = re.search(

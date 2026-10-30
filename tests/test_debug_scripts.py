@@ -26,6 +26,7 @@ record.write_text(json.dumps({
     "pid": os.getpid(),
     "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME"),
     "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME"),
+    "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": os.environ.get("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"),
 }), encoding="utf-8")
 for variable in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
     app_dir = Path(os.environ[variable]) / "airloom"
@@ -198,6 +199,8 @@ class DebugScriptIsolationTest(unittest.TestCase):
             "XDG_CACHE_HOME": str(sentinel_cache),
             "AIRLOOM_TEST_ENV_RECORD": str(record),
             "AIRLOOM_TEST_SENTINEL_PID": str(unrelated.pid),
+            # CI disables WebKit's sandbox for these scripts; it must reach the app.
+            "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": "1",
         }
         launched = self._launch_owned_process(
             [sys.executable, str(scripts / script_name)],
@@ -232,6 +235,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
                 private.is_relative_to(tmpdir),
                 f"{variable} was not private to the GUI test: {private}",
             )
+        self.assertEqual(child["WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"], "1", "the CI sandbox setting did not reach the app")
         self.assertEqual(tree_snapshot(sentinel_config), before[0])
         self.assertEqual(tree_snapshot(sentinel_cache), before[1])
 

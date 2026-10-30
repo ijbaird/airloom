@@ -76,7 +76,8 @@ from pathlib import Path
 Path(os.environ["AIRLOOM_TEST_ENV_RECORD"]).write_text(json.dumps({
     "pid": os.getpid(),
     "env": {key: os.environ.get(key) for key in (
-        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "AIRLOOM_DEBUG_SOCKET", "AIRLOOM_NOMINATIM_URL")},
+        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "AIRLOOM_DEBUG_SOCKET", "AIRLOOM_NOMINATIM_URL",
+        "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS")},
     "config": json.loads((Path(os.environ["XDG_CONFIG_HOME"]) / "airloom" / "config.json").read_text()),
 }), encoding="utf-8")
 # A grandchild in the same session, like WebKit's helper processes.
@@ -159,10 +160,12 @@ class UiRegressionScriptContractTest(unittest.TestCase):
 
         apps_root = self.root / "apps"
         apps_root.mkdir()
-        app = self.script.DebugApp(
-            apps_root, "main", "http://127.0.0.1:1",
-            extra_env={"AIRLOOM_TEST_ENV_RECORD": str(record)}, project=project,
-        )
+        # CI disables WebKit's sandbox for these scripts; it must reach the app.
+        with mock.patch.dict(os.environ, {"WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": "1"}):
+            app = self.script.DebugApp(
+                apps_root, "main", "http://127.0.0.1:1",
+                extra_env={"AIRLOOM_TEST_ENV_RECORD": str(record)}, project=project,
+            )
         app.start()
         try:
             app.wait_ready()
@@ -173,6 +176,7 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         for key in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "AIRLOOM_DEBUG_SOCKET"):
             self.assertTrue(Path(child["env"][key]).is_relative_to(apps_root / "main"), key)
         self.assertEqual(child["env"]["AIRLOOM_NOMINATIM_URL"], "http://127.0.0.1:1")
+        self.assertEqual(child["env"]["WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"], "1", "the CI sandbox setting did not reach the app")
         self.assertNotIn("api_key", child["config"], "scenarios must run on demo data")
         self.assertEqual(child["config"]["home_mode"], "fixed")
         self.assertTrue(process_gone(child["pid"]), "the debug child survived cleanup")
@@ -305,6 +309,20 @@ class UiRegressionScriptContractTest(unittest.TestCase):
                 self.script.scenario_save(app)
         eval_js.assert_not_called()
         self.assertNotIn("skip", output.getvalue())
+
+    def test_layout_probe_children_inherit_the_ci_sandbox_setting(self):
+        launched = {}
+
+        def record_popen(args, **kwargs):
+            launched.update(kwargs)
+            raise RuntimeError("recorded")
+
+        with mock.patch.dict(os.environ, {"WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": "1"}), \
+                mock.patch.object(self.script.subprocess, "Popen", record_popen), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "recorded"):
+                self.script.scenario_layouts(self.root)
+        self.assertEqual(launched["env"].get("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"), "1")
 
     def test_viewport_width_excludes_the_window_frame_before_scaling(self):
         # Under a compositor (mutter) the webview spans the whole window; under
