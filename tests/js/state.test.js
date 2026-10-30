@@ -1774,14 +1774,14 @@ test("a newer empty publication preserves an exhausted retry budget", () => {
   assert.equal(app.messages.filter((message) => message.action === "select" && message.id === 1).length, 3);
 });
 
-function runPythonAdapter(messages, { failWrites = false } = {}) {
+function runPythonAdapter(messages, { failWrites = false, sensors = [] } = {}) {
   const output = require("node:child_process").execFileSync(
     "python3",
     [path.resolve(__dirname, "fixtures/bridge_adapter.py")],
     {
       cwd: path.resolve(__dirname, "../.."),
       env: { ...process.env, PYTHONPATH: path.resolve(__dirname, "../..") },
-      input: JSON.stringify({ messages, fail_writes: failWrites }),
+      input: JSON.stringify({ messages, fail_writes: failWrites, sensors }),
       encoding: "utf8",
     },
   );
@@ -1836,4 +1836,26 @@ test("rapid filter clicks before acknowledgment advance from the requested filte
   app.context.Airloom.receive("error", { message: "Could not save location filter: denied" });
   chip.click();
   assert.equal(app.messages.at(-1).value, "both", "a failure releases the unacknowledged request");
+});
+
+test("the largest safe sensor id round-trips Python to JS to Python exactly", () => {
+  const SAFE_MAX = 9007199254740991;
+  const seeded = [{ id: SAFE_MAX, origin: "demo" }, { id: 1, origin: "demo" }];
+  const { published } = runPythonAdapter([], { sensors: seeded });
+  assert.deepEqual(published.map((item) => item.id), [SAFE_MAX, 1]);
+  const app = loadApp();
+  configureMap(app);
+  app.context.Airloom.receive("sensors", { items: published, selected_id: 1, source: "Demo data" });
+
+  const row = app.elements.get("sensor-list").querySelectorAll(".sensor-row")
+    .find((node) => node.dataset.id === String(SAFE_MAX));
+  assert.ok(row, "the safe-maximum sensor has a list row");
+  row.click();
+  const bridged = app.messages.filter((message) => message.action === "select");
+  assert.deepEqual(bridged.map((message) => message.id), [SAFE_MAX]);
+
+  const result = runPythonAdapter(bridged, { sensors: seeded });
+  assert.equal(result.selected_id, SAFE_MAX);
+  const trend = result.events.find(([event]) => event === "trend")[1];
+  assert.equal(trend.sensor_id, SAFE_MAX);
 });

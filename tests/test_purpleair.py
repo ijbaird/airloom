@@ -246,20 +246,24 @@ class SensorFromValuesTest(unittest.TestCase):
                 self.assertIsNone(purpleair.sensor_from_values({**base, "sensor_index": sensor_id}))
 
     def test_large_integer_sensor_id_is_preserved_exactly(self):
-        sensor_id = 9007199254740993
+        sensor_id = 9007199254740991
         sensor = purpleair.sensor_from_values(
             {"sensor_index": sensor_id, "latitude": 45.5, "longitude": -122.6}
         )
         self.assertEqual(sensor.sensor_id, sensor_id)
+        # One past JavaScript's safe range would alias in the web UI.
+        self.assertIsNone(purpleair.sensor_from_values(
+            {"sensor_index": sensor_id + 2, "latitude": 45.5, "longitude": -122.6}
+        ))
 
-    def test_sensor_ids_enforce_signed_64_bit_limit_without_losing_boundaries(self):
-        maximum = 2**63 - 1
+    def test_sensor_ids_enforce_javascript_safe_limit_without_losing_boundaries(self):
+        maximum = 2**53 - 1
         base = {"latitude": 45.5, "longitude": -122.6}
-        for value in (maximum, str(maximum), "9.223372036854775807e18"):
+        for value in (maximum, str(maximum), "9.007199254740991e15"):
             with self.subTest(valid=value):
                 sensor = purpleair.sensor_from_values({**base, "sensor_index": value})
                 self.assertEqual(sensor.sensor_id, maximum)
-        for value in ("1e5000", "-1e5000", "9.223372036854775808e18", 2**63, 10**400):
+        for value in ("1e5000", "-1e5000", "9.007199254740992e15", 2**53, 2**63 - 1, 10**400):
             with self.subTest(invalid=value):
                 self.assertIsNone(purpleair.sensor_from_values({**base, "sensor_index": value}))
 

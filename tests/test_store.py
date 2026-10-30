@@ -515,14 +515,14 @@ class StoreTest(unittest.TestCase):
 
 
 class SensorIdTest(unittest.TestCase):
-    def test_accepts_positive_integral_ids_through_signed_64_bit_maximum(self):
-        maximum = 2**63 - 1
+    def test_accepts_positive_integral_ids_through_javascript_safe_maximum(self):
+        maximum = 2**53 - 1
         for value, expected in ((1, 1), (1.0, 1), ("007", 7), ("1e3", 1000), (maximum, maximum)):
             with self.subTest(value=value):
                 self.assertEqual(store.sensor_id(value), expected)
 
     def test_rejects_nonintegral_nonfinite_nonpositive_and_out_of_range_ids(self):
-        maximum = 2**63 - 1
+        maximum = 2**53 - 1
         for bad in (
             None,
             True,
@@ -536,6 +536,7 @@ class SensorIdTest(unittest.TestCase):
             "²",
             maximum + 1,
             str(maximum + 1),
+            2**63 - 1,
             "1e999999999",
         ):
             with self.subTest(bad=bad):

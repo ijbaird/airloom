@@ -71,6 +71,7 @@ from .purpleair import (
 )
 from .requests import RequestRegistry, RequestToken
 from .store import Store
+from .validation import bridge_sensor_id
 
 # How long a debug-port `eval` command waits for evaluate_javascript to
 # call back before giving up and returning a timeout error to the client.
@@ -1229,11 +1230,10 @@ class AirloomApplication(Adw.Application):
 
     @staticmethod
     def _message_sensor_id(message: dict) -> int | None:
-        try:
-            return int(message["id"])
-        except (KeyError, TypeError, ValueError):
+        sensor_id = bridge_sensor_id(message.get("id"))
+        if sensor_id is None:
             print("Airloom: ignored web message with invalid sensor id", file=sys.stderr)
-            return None
+        return sensor_id
 
     def _on_view_changed(self, message: dict) -> None:
         if self._shutting_down:

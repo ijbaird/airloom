@@ -1116,6 +1116,62 @@ class TransactionalActionTest(ApplicationRequestTestCase):
                 self.assertIn("try again", errors[0].lower())
 
 
+class BridgeSensorIdTest(ApplicationRequestTestCase):
+    SAFE_MAX = 2**53 - 1
+    INVALID = (
+        True,
+        False,
+        1.9,
+        1.0,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "7",
+        "abc",
+        None,
+        0,
+        -1,
+        2**53,
+        2**63 - 1,
+        [7],
+    )
+
+    def test_every_sensor_id_action_rejects_hostile_ids_without_side_effects(self):
+        for action in ("select", "favorite", "hide", "unhide"):
+            for value in self.INVALID:
+                with self.subTest(action=action, value=value):
+                    with tempfile.TemporaryDirectory() as directory:
+                        sensor = make_sensor(1)
+                        app = self.make_app(sensors=[sensor])
+                        app.store = Store(Path(directory) / "config.json")
+                        app.store.data["hidden"] = {"1": "Sensor 1"}
+                        app.store.save()
+                        previous = deepcopy(app.store.data)
+                        # JSON carries NaN/Infinity literals exactly as JSC would.
+                        raw = json.dumps({"action": action, "id": value})
+                        app._on_script_message(
+                            None, SimpleNamespace(to_json=lambda _o, raw=raw: raw)
+                        )
+
+                        self.assertIsNone(app.selected_id)
+                        self.assertEqual(app.store.data, previous)
+                        self.assertEqual(Store(app.store.path).data, previous)
+                        self.assertEqual(app.sent, [])
+                        self.assertEqual(app.sensor_state_sends, 0)
+
+    def test_safe_maximum_id_is_ingested_exactly(self):
+        sensor = make_sensor(self.SAFE_MAX)
+        sensor.origin = "demo"
+        app = self.make_app(sensors=[sensor])
+
+        app._on_script_message(
+            None, ScriptMessage({"action": "select", "id": self.SAFE_MAX})
+        )
+
+        self.assertEqual(app.selected_id, self.SAFE_MAX)
+        self.assertEqual(self.trend_events(app)[-1]["sensor_id"], self.SAFE_MAX)
+
+
 class ShutdownLifecycleTest(ApplicationRequestTestCase):
     def test_shutdown_cleans_every_owned_resource_exactly_once(self):
         app = self.make_app()
