@@ -3,8 +3,10 @@ from __future__ import annotations
 import errno
 import io
 import json
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import types
 import unittest
@@ -1026,6 +1028,145 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
         self.assertEqual(app.cache.close_calls, 1)
         app._on_shutdown()
         self.assertEqual(app.cache.close_calls, 1)
+
+    def test_process_exit_drains_every_worker_class_and_closes_cache_once(self):
+        script = textwrap.dedent(
+            r"""
+            import sys
+            import threading
+            import time
+            from pathlib import Path
+            from types import SimpleNamespace
+
+            from tests import test_app_requests as h
+            from airloom.cache import SensorCache
+
+            cache_path = Path(sys.argv[1])
+            marker_path = Path(sys.argv[2])
+            app_module = h.app_module
+            app_module.GLib.idle_add = lambda *_args: None
+
+            class RecordingCache(SensorCache):
+                def close(self):
+                    with marker_path.open("a", encoding="utf-8") as marker:
+                        marker.write("close\n")
+                    super().close()
+
+            lock = threading.Lock()
+            started = []
+            all_started = threading.Event()
+            release = threading.Event()
+
+            def block(name):
+                with lock:
+                    started.append(name)
+                    if len(started) == 5:
+                        all_started.set()
+                if not release.wait(5):
+                    raise RuntimeError(f"{name} was not released")
+                # Main must return while every admitted worker is still active.
+                time.sleep(0.25)
+                with marker_path.open("a", encoding="utf-8") as marker:
+                    marker.write(name + "\n")
+
+            def fetch_readings(_config, _cache, _request, _bounds, _ttl):
+                block("refresh")
+                return SimpleNamespace()
+
+            def reverse_geocode(latitude, longitude):
+                name = "home-label" if (latitude, longitude) == (30.0, 40.0) else "view-label"
+                block(name)
+                return name
+
+            def place_search(_query):
+                block("place-search")
+                return []
+
+            class Client:
+                def __init__(self, _api_key):
+                    pass
+
+                def fetch_rows(self, **_kwargs):
+                    block("trend")
+                    return h.FetchResult([], 1)
+
+            app_module._fetch_readings = fetch_readings
+            app_module.reverse_geocode = reverse_geocode
+            app_module.place_search = place_search
+            app_module._install_place_search_admission = lambda: None
+            app_module.PurpleAirClient = Client
+
+            app = h.AirloomApplication.__new__(h.AirloomApplication)
+            app.store = h.FakeStore()
+            app.cache = RecordingCache(cache_path)
+            app.controller = h.ApplicationController(app.store.data)
+            app.requests = h.RequestRegistry()
+            app._worker_lock = threading.Lock()
+            app._active_workers = 0
+            app._cache_closed = False
+            app._shutting_down = False
+            app._debug_port = None
+            app._auto_refresh_id = None
+            app.refreshing = False
+            app.pending_fetch = None
+            app.sensors = [h.make_sensor(1)]
+            app._trend_inflight = {}
+            app._home_name_generation = 0
+            app._view_name_generation = 0
+            app.current_view = None
+            app.window = None
+            app.title = None
+            app.locator = None
+            app._locator_focus_handler = None
+            app._locator_focus_fallback = None
+            app.webview = object()
+            app._send = lambda *_args: None
+            app._refresh_home = lambda *_args, **_kwargs: None
+
+            app._on_location_fix(30.0, 40.0, 50.0)
+            app._start_view_label(10.0, 20.0)
+            app._on_place_search({"context": "main", "query": "Portland"})
+            app._ensure_trend(1)
+            app.refresh()
+            if not all_started.wait(5):
+                raise RuntimeError(f"workers did not all start: {started!r}")
+            app._on_shutdown()
+            release.set()
+            # Returning from this script is the process-lifetime regression:
+            # daemon workers are terminated before their finally blocks run.
+            """
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "lifecycle.txt"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-W",
+                    "error::ResourceWarning",
+                    "-c",
+                    script,
+                    str(Path(directory) / "cache.db"),
+                    str(marker),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            lines = marker.read_text(encoding="utf-8").splitlines() if marker.exists() else []
+
+        diagnostic = f"stdout={result.stdout!r}\nstderr={result.stderr!r}\nmarkers={lines!r}"
+        self.assertEqual(len(lines), 6, diagnostic)
+        self.assertEqual(lines.count("close"), 1, diagnostic)
+        self.assertEqual(lines[-1], "close", diagnostic)
+        self.assertEqual(
+            set(lines[:-1]),
+            {"refresh", "trend", "place-search", "home-label", "view-label"},
+            diagnostic,
+        )
+        self.assertEqual(result.returncode, 0, diagnostic)
+        self.assertEqual(result.stderr, "", diagnostic)
 
 
 class DebugDispatcherRequestTest(ApplicationRequestTestCase):

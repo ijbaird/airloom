@@ -481,7 +481,11 @@ class AirloomApplication(Adw.Application):
                 self._worker_finished()
 
         try:
-            threading.Thread(target=run, name=name, daemon=True).start()
+            # Python waits for non-daemon workers at interpreter shutdown, so
+            # every admitted worker runs its finalizer and the last one closes
+            # the cache. The GTK thread never joins a worker or waits for a
+            # queued GUI callback, avoiding shutdown deadlocks.
+            threading.Thread(target=run, name=name, daemon=False).start()
         except BaseException:
             self._worker_finished()
             raise
