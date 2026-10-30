@@ -83,6 +83,27 @@ class RequestRegistryTest(unittest.TestCase):
         self.assertFalse(self.registry.is_current(refresh))
         self.assertFalse(self.registry.is_current(search))
 
+    def test_replacement_after_invalidation_is_newer_and_isolated_from_old_token(self):
+        for invalidate in (
+            lambda registry: registry.invalidate("trend:7"),
+            lambda registry: registry.invalidate(),
+        ):
+            with self.subTest(invalidate=invalidate):
+                registry = RequestRegistry()
+                old = registry.begin("trend:7", generation=3)
+                invalidate(registry)
+
+                replacement = registry.begin("trend:7", generation=3)
+
+                self.assertGreater(replacement.request_id, old.request_id)
+                self.assertNotEqual(replacement, old)
+                self.assertFalse(registry.is_current(old))
+                self.assertTrue(registry.is_current(replacement))
+                # A late completion of the invalidated request settles nothing.
+                registry.finish(old)
+                self.assertFalse(registry.is_current(old))
+                self.assertTrue(registry.is_current(replacement))
+
     def test_concurrent_begins_have_unique_ids_and_one_current_token_per_context(self):
         with ThreadPoolExecutor(max_workers=8) as pool:
             tokens = list(pool.map(
