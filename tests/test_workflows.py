@@ -120,22 +120,40 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertTrue(job_block(publish, "publish-repo"), "Pages channel is missing")
         self.assertEqual(job_needs(publish, "publish-repo"), ["release"])
 
-    def test_integration_plan_06_owns_remaining_ui_scenarios_before_tagging(self):
-        ui_job = job_block(workflow("flatpak.yml"), "webkit-ui")
-        for expected in (
-            "06-integration-release.md",
-            "scripts/test-ui-regression",
-            "stripped-debug",
-            "search",
-            "focus",
-            "alert",
-            "before tagging",
-        ):
-            with self.subTest(expected=expected):
-                self.assertIn(expected, ui_job)
-        release_guide = (PROJECT / "RELEASE.md").read_text(encoding="utf-8")
-        self.assertIn("scripts/test-ui-regression", release_guide)
-        self.assertRegex(release_guide, r"(?i)before tagging|do not tag")
+    def test_webkit_ui_gates_publication_on_the_cross_layer_regression(self):
+        source = workflow("flatpak.yml")
+        ui_job = job_block(source, "webkit-ui")
+        self.assertTrue(ui_job, "webkit-ui job is missing")
+        install = re.search(r"(?m)^\s*run: dnf install -y (.*)$", ui_job)
+        self.assertTrue(install, "webkit-ui must install its Fedora packages")
+        packages = install.group(1).split()
+        # dbus-daemon provides dbus-run-session on Fedora.
+        for package in ("dbus-daemon", "xorg-x11-server-Xvfb", "xorg-x11-xauth", "webkitgtk6.0"):
+            with self.subTest(package=package):
+                self.assertIn(package, packages)
+
+        commands = [
+            line.strip()
+            for line in ui_job.splitlines()
+            if "scripts/test-ui-regression" in line and not line.strip().startswith("#")
+        ]
+        self.assertEqual(len(commands), 1, commands)
+        # A private session bus outside Xvfb, with the script itself under Xvfb.
+        self.assertRegex(
+            commands[0],
+            r"^dbus-run-session -- xvfb-run -a (?:-s \"[^\"]*\" )?"
+            r"(?:env (?:[A-Z_]+=\S+ )+)?python3 scripts/test-ui-regression$",
+        )
+        self.assertIn("webkit-ui", job_needs(source, "publication"))
+
+    def test_publication_queue_retries_transient_github_api_errors(self):
+        publish = workflow("publish.yml")
+        step = re.search(
+            r"(?ms)uses: softprops/turnstyle@[0-9a-f]{40}[^\n]*\n\s*with:\n((?:\s{10}[^\n]*\n)+)",
+            publish,
+        )
+        self.assertTrue(step, "Turnstyle step needs a with: block")
+        self.assertRegex(step.group(1), r"(?m)^\s*retries: 3$")
 
     def test_claude_review_runs_only_for_same_repository_human_prs(self):
         review_job = job_block(workflow("claude-code-review.yml"), "claude-review")

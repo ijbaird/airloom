@@ -62,22 +62,31 @@ jobs:
           EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA}"
       - name: Install headless WebKit dependencies
-        run: dnf install -y python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth
-      # Integration plan 06 (06-integration-release.md) owns
-      # scripts/test-ui-regression. Add its stripped-debug, search, focus, and
-      # alert scenarios to this required release ancestor before tagging; they
-      # do not exist in this branch, which runs only the two scripts below.
+        run: dnf install -y python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon
       - name: Run isolated WebKit UI regressions
         shell: bash
         env:
           NO_AT_BRIDGE: "1"
         run: |
           set -euo pipefail
-          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
           chmod 700 "${XDG_RUNTIME_DIR}"
           for script in scripts/test-heatmap scripts/test-save-refresh; do
             xvfb-run -a -s "-screen 0 1280x800x24" "${script}"
           done
+      - name: Run cross-layer UI regression
+        shell: bash
+        env:
+          NO_AT_BRIDGE: "1"
+        run: |
+          set -euo pipefail
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
+          chmod 700 "${XDG_RUNTIME_DIR}"
+          # The stripped-debug scenario requires dbus-run-session; the outer
+          # private bus also keeps every child off any other session bus.
+          dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" env GDK_DEBUG=no-portals python3 scripts/test-ui-regression
 
   release-eligibility:
     name: Validate release eligibility
