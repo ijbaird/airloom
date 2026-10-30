@@ -267,6 +267,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
             "delivery": "network",
             "error": None,
             "monitoring_error": None,
+            "cache_warning": None,
             "stale": False,
             "bounds": request.bounds,
             "capped": False,
@@ -487,6 +488,83 @@ class FetchAdapterTest(ApplicationAdapterTestCase):
             [(call["bounds"].west, call["bounds"].east) for call in area_calls],
             [(179.0, 180.0), (-180.0, -179.0)],
         )
+
+
+class RuntimeCacheFailureTest(ApplicationAdapterTestCase):
+    """A real SQLite lock taken by another connection after the cache opened."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "cache.db"
+        self.cache = SensorCache(self.path, busy_timeout=0.05)
+        self.addCleanup(self.cache.close)
+        self.locker = None
+
+    def lock(self):
+        import sqlite3
+
+        self.locker = sqlite3.connect(self.path, isolation_level=None)
+        self.addCleanup(self.locker.close)
+        self.locker.execute("BEGIN EXCLUSIVE")
+
+    def test_runtime_lock_falls_back_to_nonpersistent_live_fetch(self):
+        app = self.make_app(cache=self.cache)
+        app.sensors = [make_sensor(99, aqi=20)]
+        app._area_ids = {99}
+        client = FakeClient([make_row(7)])
+        self.lock()
+        request = app.controller.begin_refresh()
+
+        with mock.patch.object(app_module, "PurpleAirClient", return_value=client):
+            outcome = app_module._fetch_readings(
+                app.store.data, self.cache, request, request.bounds, 120
+            )
+            app._finish_refresh(outcome)
+
+        self.assertGreater(len(client.calls), 0)
+        self.assertEqual([sensor.sensor_id for sensor in app.sensors], [7])
+        self.assertEqual(outcome.provenance, {7: ("live", "network")})
+        self.assertIsNone(outcome.error)
+        payload = self.sensor_payloads(app)[-1]
+        self.assertEqual([item["id"] for item in payload["items"]], [7])
+        errors = [item["message"] for event, item in app.sent if event == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("database is locked", errors[0])
+        self.assertIn("without persistent caching", errors[0])
+
+    def test_write_failure_after_fetch_preserves_fetched_live_rows(self):
+        app = self.make_app(store=FakeStore(favorites=[8]), cache=self.cache)
+        client = FakeClient([make_row(7)])
+        original = client.fetch_rows
+
+        def fetch_then_lock(**kwargs):
+            result = original(**kwargs)
+            if self.locker is None:
+                self.lock()
+            return result
+
+        client.fetch_rows = fetch_then_lock
+        request = app.controller.begin_refresh()
+
+        with mock.patch.object(app_module, "PurpleAirClient", return_value=client):
+            outcome = app_module._fetch_readings(
+                app.store.data, self.cache, request, request.bounds, 120
+            )
+            app._finish_refresh(outcome)
+
+        area_calls = [call for call in client.calls if "bounds" in call]
+        self.assertEqual(len(area_calls), 1)
+        self.assertEqual([sensor.sensor_id for sensor in app.sensors][:1], [7])
+        self.assertIsNone(outcome.error)
+        self.assertIn("database is locked", outcome.cache_warning)
+        self.assertEqual(outcome.provenance[7], ("live", "network"))
+
+    def test_ready_with_locked_cache_still_starts_refresh(self):
+        app = self.make_app(cache=self.cache)
+        self.lock()
+        app._on_script_message(None, ScriptMessage({"action": "ready"}))
+        self.assertEqual(len(app.launched), 1)
 
 
 class RefreshAdapterTest(ApplicationAdapterTestCase):

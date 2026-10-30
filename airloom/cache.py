@@ -78,6 +78,14 @@ class CacheError(RuntimeError):
     """The cache could not be opened without destroying valid data."""
 
 
+class CacheWriteError(CacheError):
+    """Fetched rows could not be persisted; the rows remain valid live data."""
+
+    def __init__(self, message: str, rows: list[dict]):
+        super().__init__(message)
+        self.rows = rows
+
+
 def _coordinates(values: dict) -> tuple[float, float] | None:
     latitude = _number(values.get("latitude"))
     longitude = _number(values.get("longitude"))
@@ -92,9 +100,11 @@ def _coordinates(values: dict) -> tuple[float, float] | None:
 
 
 class SensorCache:
-    def __init__(self, path: Path | None = None, clock=time.time):
+    def __init__(self, path: Path | None = None, clock=time.time,
+                 busy_timeout: float = 5.0):
         self.path = path or _default_cache_dir() / "cache.db"
         self.clock = clock
+        self.busy_timeout = busy_timeout
         self._lock = threading.Lock()
         self._db = None
         self._connect()
@@ -130,7 +140,8 @@ class SensorCache:
             raise CacheError(f"Could not open cache at {self.path}") from exc
 
     def _open_and_migrate(self) -> None:
-        db = sqlite3.connect(self.path, check_same_thread=False)
+        db = sqlite3.connect(
+            self.path, timeout=self.busy_timeout, check_same_thread=False)
         self._db = db
         try:
             db.executescript(_SCHEMA)
@@ -417,10 +428,26 @@ def _fetch_rows(client, bounds: Bounds, **kwargs) -> FetchResult:
     return FetchResult([*rows_by_id.values(), *unkeyed], time_stamp)
 
 
+def _rows_within(rows: list[dict], bounds: Bounds, location_filter: str) -> list[dict]:
+    parts = split_bounds(bounds)
+    return [
+        values for values in rows
+        if (coordinates := _coordinates(values)) is not None
+        and _matches_filter(values, location_filter)
+        and any(
+            part.south <= coordinates[0] <= part.north
+            and part.west <= coordinates[1] <= part.east
+            for part in parts
+        )
+    ]
+
+
 def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
                ttl: float, force: bool = False) -> AreaResult:
     """Serve an area from cache, delta-poll a stale known region, or full-fetch
-    a new one. May raise PurpleAirError — the caller owns fallback policy."""
+    a new one. May raise PurpleAirError — the caller owns fallback policy.
+    SQLite failures propagate, except that a failed write after a full fetch
+    raises CacheWriteError carrying the fetched rows within `bounds`."""
     cache.prune()
     region = cache.covering_region(bounds, location_filter)
     now = cache.clock()
@@ -460,7 +487,13 @@ def fetch_area(client, cache: SensorCache, bounds: Bounds, location_filter: str,
     full_bounds = region.bounds if region is not None else bounds
     result = _fetch_rows(
         client, full_bounds, location_filter=location_filter, fields=MAP_FIELDS)
-    cache.store_fetch(full_bounds, location_filter, result.rows, result.time_stamp)
+    try:
+        cache.store_fetch(full_bounds, location_filter, result.rows, result.time_stamp)
+    except sqlite3.Error as exc:
+        raise CacheWriteError(
+            f"Could not cache readings: {exc}",
+            _rows_within(result.rows, bounds, location_filter),
+        ) from exc
     return AreaResult(rows_in_view(), 0.0, True)
 
 
@@ -483,6 +516,9 @@ def fetch_favorites(client, cache: SensorCache, favorite_ids, have_ids,
     need = sorted(set(missing) - set(cached))
     if need:
         result = client.fetch_rows(show_only=need)
-        cache.upsert_rows(result.rows)
         rows += result.rows
+        try:
+            cache.upsert_rows(result.rows)
+        except sqlite3.Error as exc:
+            raise CacheWriteError(f"Could not cache readings: {exc}", rows) from exc
     return rows

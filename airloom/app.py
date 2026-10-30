@@ -16,6 +16,7 @@ import base64
 import json
 import math
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -37,7 +38,7 @@ from gi.repository import Adw, Gio, GLib, Gtk, Notify, WebKit  # noqa: E402
 from . import __version__
 from . import geocode as geocode_module
 from .bridge import decode_message
-from .cache import CacheError, SensorCache, fetch_area, fetch_favorites
+from .cache import CacheError, CacheWriteError, SensorCache, fetch_area, fetch_favorites
 from .controller import ApplicationController, RefreshRequest
 # Release bundles strip airloom/debugport.py (see packaging/*.yml), so debug
 # support degrades to "absent" rather than erroring when the module is gone.
@@ -148,6 +149,16 @@ class RefreshOutcome:
     bounds: Bounds
     capped: bool
     provenance: dict[int, tuple[str, str]]
+    cache_warning: str | None = None
+
+
+# Runtime persistence failures (locks, I/O, full disks) degrade one refresh to
+# the nonpersistent path; they are never transport failures.
+_CACHE_FAILURES = (CacheError, sqlite3.Error)
+
+
+def _cache_warning(exc: Exception) -> str:
+    return f"Cache unavailable ({exc}). Continuing without persistent caching."
 
 
 def _open_sensor_cache() -> tuple[SensorCache | None, str | None]:
@@ -269,17 +280,39 @@ def _fetch_readings(
     error = None
     monitoring_error = None
     stale = False
+    cache_warning = None
     sensors: list[Sensor] = []
     area_ids: set[int] = set()
     monitoring_ids: set[int] = set()
     provenance: dict[int, tuple[str, str]] = {}
+
+    def degrade(exc: Exception) -> None:
+        nonlocal cache, cache_warning
+        cache = None
+        if cache_warning is None:
+            cache_warning = _cache_warning(exc)
 
     try:
         if config.get("api_key"):
             client = _new_purpleair_client(config["api_key"])
             try:
                 cached_favorite_ids: set[int] = set()
-                if cache is None:
+                area_rows = None
+                if cache is not None:
+                    try:
+                        area = fetch_area(client, cache, bounds, mode, ttl, request.force)
+                        area_rows = list(area.rows)
+                        area_polled = area.polled
+                        area_age = area.age
+                    except CacheWriteError as exc:
+                        # Persisting failed after a full fetch; the rows are live.
+                        degrade(exc)
+                        area_rows = list(exc.rows)
+                        area_polled = True
+                        area_age = 0.0
+                    except _CACHE_FAILURES as exc:
+                        degrade(exc)
+                if area_rows is None:
                     area_rows = []
                     for part in split_bounds(bounds):
                         result = client.fetch_rows(
@@ -290,11 +323,6 @@ def _fetch_readings(
                         area_rows.extend(result.rows)
                     area_polled = True
                     area_age = 0.0
-                else:
-                    area = fetch_area(client, cache, bounds, mode, ttl, request.force)
-                    area_rows = list(area.rows)
-                    area_polled = area.polled
-                    area_age = area.age
 
                 area_sensors = _sensors_from_rows(area_rows)
                 area_ids = {sensor.sensor_id for sensor in area_sensors}
@@ -306,23 +334,30 @@ def _fetch_readings(
                 favorite_rows = []
                 if missing_favorites:
                     try:
-                        if cache is None:
+                        if cache is not None:
+                            try:
+                                if not request.force:
+                                    cached_favorite_ids = set(
+                                        cache.fresh_sensors(missing_favorites, ttl)
+                                    )
+                                favorite_rows = fetch_favorites(
+                                    client,
+                                    cache,
+                                    request.favorite_ids,
+                                    area_ids,
+                                    ttl,
+                                    request.force,
+                                )
+                            except CacheWriteError as exc:
+                                degrade(exc)
+                                favorite_rows = exc.rows
+                            except _CACHE_FAILURES as exc:
+                                degrade(exc)
+                                cached_favorite_ids = set()
+                        if cache is None and not favorite_rows:
                             favorite_rows = client.fetch_rows(
                                 show_only=sorted(missing_favorites)
                             ).rows
-                        else:
-                            if not request.force:
-                                cached_favorite_ids = set(
-                                    cache.fresh_sensors(missing_favorites, ttl)
-                                )
-                            favorite_rows = fetch_favorites(
-                                client,
-                                cache,
-                                request.favorite_ids,
-                                area_ids,
-                                ttl,
-                                request.force,
-                            )
                     except Exception as exc:  # noqa: BLE001 — preserve the live area
                         monitoring_error = (
                             f"Favorite monitoring unavailable: {exc}. "
@@ -369,7 +404,12 @@ def _fetch_readings(
                 if not sensors:
                     error = _no_sensors_message(mode)
             except PurpleAirError as exc:
-                stale_rows = [] if cache is None else cache.sensors_in(bounds)
+                stale_rows = []
+                if cache is not None:
+                    try:
+                        stale_rows = cache.sensors_in(bounds)
+                    except _CACHE_FAILURES as cache_exc:
+                        degrade(cache_exc)
                 stale_sensors = _sensors_from_rows(stale_rows)
                 if stale_sensors:
                     # Retrieval is degraded, but each observation keeps its own
@@ -423,6 +463,7 @@ def _fetch_readings(
         bounds=bounds,
         capped=request.bounds != bounds,
         provenance=provenance,
+        cache_warning=cache_warning,
     )
 
 
@@ -1463,7 +1504,11 @@ class AirloomApplication(Adw.Application):
             return
         config = self.store.data
         bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
-        cached = _sensors_from_rows(self.cache.sensors_in(bounds))
+        try:
+            cached = _sensors_from_rows(self.cache.sensors_in(bounds))
+        except _CACHE_FAILURES:
+            # First paint is optional; the refresh that follows reports it.
+            return
         if cached:
             favorites = set(config.get("favorites", []))
             for sensor in cached:
@@ -1567,6 +1612,8 @@ class AirloomApplication(Adw.Application):
                     self._send("error", {"message": outcome.error})
                 if outcome.monitoring_error:
                     self._send("error", {"message": outcome.monitoring_error})
+                if outcome.cache_warning:
+                    self._send("error", {"message": outcome.cache_warning})
                 self._check_alerts()
                 if outcome.error is None:
                     # Failed live retrieval must not suppress the next retry.
