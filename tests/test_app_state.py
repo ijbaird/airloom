@@ -263,6 +263,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
             "origin": "live",
             "delivery": "network",
             "error": None,
+            "monitoring_error": None,
             "stale": False,
             "bounds": request.bounds,
             "capped": False,
@@ -387,6 +388,47 @@ class FetchAdapterTest(ApplicationAdapterTestCase):
             outcome.provenance,
             {7: ("live", "cache"), 8: ("live", "network")},
         )
+
+    def test_favorite_failure_preserves_live_area_and_reports_monitoring_separately(self):
+        app = self.make_app(store=FakeStore(favorites=[8]))
+        request = app.controller.begin_refresh()
+        cache = FakeCache()
+        cache.fresh_sensors = lambda _ids, _ttl: {}
+        area = AreaResult([make_row(7)], age=0.0, polled=True)
+
+        with (
+            mock.patch.object(app_module, "PurpleAirClient", return_value=FakeClient()),
+            mock.patch.object(app_module, "fetch_area", return_value=area),
+            mock.patch.object(
+                app_module,
+                "fetch_favorites",
+                side_effect=PurpleAirError("favorites offline"),
+            ),
+        ):
+            outcome = app_module._fetch_readings(
+                app.store.data, cache, request, request.bounds, 120
+            )
+            app._finish_refresh(outcome)
+
+        self.assertEqual([sensor.sensor_id for sensor in outcome.sensors], [7])
+        self.assertEqual(outcome.area_ids, {7})
+        self.assertEqual(outcome.monitoring_ids, set())
+        self.assertEqual(outcome.origin, "live")
+        self.assertEqual(outcome.delivery, "network")
+        self.assertEqual(outcome.provenance, {7: ("live", "network")})
+        self.assertIsNone(outcome.error)
+        self.assertIn("favorites offline", outcome.monitoring_error)
+        self.assertEqual(app.view_bounds, outcome.bounds)
+        payload = self.sensor_payloads(app)[-1]
+        self.assertEqual([item["id"] for item in payload["area"]], [7])
+        self.assertEqual(payload["area"][0]["origin"], "live")
+        self.assertEqual(payload["area"][0]["delivery"], "network")
+        errors = [
+            item["message"] for event, item in app.sent if event == "error"
+        ]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("favorite monitoring", errors[0].lower())
+        self.assertIn("favorites offline", errors[0])
 
     def test_cache_open_failure_degrades_to_split_network_fetch_without_persistence(self):
         with mock.patch.object(
@@ -630,9 +672,7 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         app.sensors = [previous]
         outcome = self.make_outcome(
             app,
-            [make_sensor(1)],
-            delivery="cache",
-            provenance={1: ("live", "cache")},
+            [make_sensor(1, favorite=True, origin="demo", delivery="cache")],
         )
         pending = app.controller.begin_refresh()
         app.pending_fetch = pending
@@ -643,8 +683,9 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         app._finish_refresh(outcome)
 
         self.assertEqual(app.sensors, [previous])
-        self.assertEqual(outcome.sensors[0].origin, "live")
-        self.assertEqual(outcome.sensors[0].delivery, "network")
+        self.assertTrue(outcome.sensors[0].favorite)
+        self.assertEqual(outcome.sensors[0].origin, "demo")
+        self.assertEqual(outcome.sensors[0].delivery, "cache")
         self.assertEqual(self.sensor_payloads(app), [])
         self.assertEqual(alerts, [])
         self.assertEqual(app.trends, [])

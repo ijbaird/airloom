@@ -136,6 +136,7 @@ class RefreshOutcome:
     origin: str
     delivery: str
     error: str | None
+    monitoring_error: str | None
     stale: bool
     bounds: Bounds
     capped: bool
@@ -248,6 +249,7 @@ def _fetch_readings(
     delivery = "network"
     source = "PurpleAir live" if origin == "live" else "Demo data"
     error = None
+    monitoring_error = None
     stale = False
     sensors: list[Sensor] = []
     area_ids: set[int] = set()
@@ -285,22 +287,28 @@ def _fetch_readings(
                 ]
                 favorite_rows = []
                 if missing_favorites:
-                    if cache is None:
-                        favorite_rows = client.fetch_rows(
-                            show_only=sorted(missing_favorites)
-                        ).rows
-                    else:
-                        if not request.force:
-                            cached_favorite_ids = set(
-                                cache.fresh_sensors(missing_favorites, ttl)
+                    try:
+                        if cache is None:
+                            favorite_rows = client.fetch_rows(
+                                show_only=sorted(missing_favorites)
+                            ).rows
+                        else:
+                            if not request.force:
+                                cached_favorite_ids = set(
+                                    cache.fresh_sensors(missing_favorites, ttl)
+                                )
+                            favorite_rows = fetch_favorites(
+                                client,
+                                cache,
+                                request.favorite_ids,
+                                area_ids,
+                                ttl,
+                                request.force,
                             )
-                        favorite_rows = fetch_favorites(
-                            client,
-                            cache,
-                            request.favorite_ids,
-                            area_ids,
-                            ttl,
-                            request.force,
+                    except Exception as exc:  # noqa: BLE001 — preserve the live area
+                        monitoring_error = (
+                            f"Favorite monitoring unavailable: {exc}. "
+                            "Live area readings are still shown."
                         )
 
                 favorite_sensors = _sensors_from_rows(favorite_rows)
@@ -392,6 +400,7 @@ def _fetch_readings(
         origin=origin,
         delivery=delivery,
         error=error,
+        monitoring_error=monitoring_error,
         stale=stale,
         bounds=bounds,
         capped=request.bounds != bounds,
@@ -1504,6 +1513,8 @@ class AirloomApplication(Adw.Application):
                 self._send_sensor_state(outcome.source)
                 if outcome.error:
                     self._send("error", {"message": outcome.error})
+                if outcome.monitoring_error:
+                    self._send("error", {"message": outcome.monitoring_error})
                 self._check_alerts()
                 if outcome.error is None:
                     # Failed live retrieval must not suppress the next retry.
