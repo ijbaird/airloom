@@ -14,7 +14,7 @@ import sys
 import tempfile
 from unittest import mock
 
-from airloom.app import _sensor_payload
+from airloom.controller import sensor_payload
 from tests.test_app_requests import ScriptMessage, TransactionalActionTest, make_sensor
 
 
@@ -42,7 +42,7 @@ def main() -> None:
                 "events": [[event, payload] for event, payload in app.sent],
                 "location_filter": app.store.data["location_filter"],
                 "published": [
-                    _sensor_payload(sensor, remote_favorite=False) for sensor in sensors
+                    sensor_payload(sensor, remote_favorite=False) for sensor in sensors
                 ],
                 "selected_id": app.selected_id,
             },

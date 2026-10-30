@@ -14,15 +14,11 @@ from __future__ import annotations
 
 import base64
 import json
-import math
 import os
 import sqlite3
 import subprocess
 import sys
 import threading
-import time
-from copy import deepcopy
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -39,7 +35,12 @@ from . import __version__
 from . import geocode as geocode_module
 from .bridge import decode_message
 from .cache import CacheError, CacheWriteError, SensorCache, fetch_area, fetch_favorites
-from .controller import ApplicationController, RefreshRequest
+from .controller import (
+    LOCATION_FILTERS,
+    ApplicationController,
+    RefreshOutcome,
+    RefreshRequest,
+)
 # Release bundles strip airloom/debugport.py (see packaging/*.yml), so debug
 # support degrades to "absent" rather than erroring when the module is gone.
 try:
@@ -56,10 +57,9 @@ except ImportError:  # pragma: no cover — only true in stripped release builds
     CAPTURE_NOTIFICATIONS_ENV = None
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
-from .geography import Bounds, bounds_around, bounds_contains, split_bounds
+from .geography import Bounds, split_bounds
 from .location import GeoClueLocator, is_coarse_fix
 from .models import Sensor
-from .presentation import alert_transitions, visible_sensors
 from .purpleair import (
     MAP_FIELDS,
     TREND_FETCH_FIELDS,
@@ -133,26 +133,6 @@ def _install_place_search_admission() -> None:
         client._airloom_place_search_admission = True
 
 
-@dataclass(slots=True)
-class RefreshOutcome:
-    """Worker-owned readings and transport metadata for one refresh request."""
-
-    request: RefreshRequest
-    sensors: list[Sensor]
-    area_ids: set[int]
-    monitoring_ids: set[int]
-    source: str
-    origin: str
-    delivery: str
-    error: str | None
-    monitoring_error: str | None
-    stale: bool
-    bounds: Bounds
-    capped: bool
-    provenance: dict[int, tuple[str, str]]
-    cache_warning: str | None = None
-
-
 # Runtime persistence failures (locks, I/O, full disks) degrade one refresh to
 # the nonpersistent path; they are never transport failures.
 _CACHE_FAILURES = (CacheError, sqlite3.Error)
@@ -170,69 +150,6 @@ def _open_sensor_cache() -> tuple[SensorCache | None, str | None]:
         warning = f"{exc}. Continuing without persistent caching."
         print(f"Airloom: {warning}", file=sys.stderr)
         return None, warning
-
-
-def _coverage_payload(requested: Bounds, fetched: Bounds) -> dict:
-    return {
-        "north": fetched.north,
-        "west": fetched.west,
-        "south": fetched.south,
-        "east": fetched.east,
-        "capped": requested != fetched,
-    }
-
-
-def _view_from_message(message: dict) -> tuple[Bounds, tuple[float, float]]:
-    view = Bounds(
-        float(message["north"]),
-        float(message["west"]),
-        float(message["south"]),
-        float(message["east"]),
-    )
-    center = (float(message["lat"]), float(message["lon"]))
-    if not (
-        all(math.isfinite(value) for value in center)
-        and -90 <= center[0] <= 90
-        and -180 <= center[1] <= 180
-    ):
-        raise ValueError("view center is outside its valid range")
-    return view, center
-
-
-def _presentation_collections(
-    sensors: list[Sensor],
-    *,
-    area_ids: set[int],
-    monitoring_ids: set[int],
-    hidden_ids: set[int],
-    confidence_filter: bool,
-    location_filter: str,
-) -> tuple[list[Sensor], list[Sensor], list[Sensor]]:
-    """Apply display rules once, keeping area and favorite inputs distinct."""
-    area = [sensor for sensor in sensors if sensor.sensor_id in area_ids]
-    remote = [
-        sensor
-        for sensor in sensors
-        if sensor.sensor_id in monitoring_ids
-        and sensor.sensor_id not in area_ids
-        and sensor.favorite
-    ]
-    visible = visible_sensors(
-        [*area, *remote],
-        hidden_ids=hidden_ids,
-        confidence_filter=confidence_filter,
-        location_filter=location_filter,
-    )
-    visible_ids = {sensor.sensor_id for sensor in visible}
-    visible_area = [sensor for sensor in area if sensor.sensor_id in visible_ids]
-    favorites = [sensor for sensor in visible if sensor.favorite]
-    return visible, visible_area, favorites
-
-
-def _sensor_payload(sensor: Sensor, *, remote_favorite: bool) -> dict:
-    payload = sensor.to_dict()
-    payload["remote_favorite"] = remote_favorite
-    return payload
 
 
 def _sensors_from_rows(rows) -> list[Sensor]:
@@ -468,7 +385,45 @@ def _fetch_readings(
     )
 
 
+def _controller_state(name: str) -> property:
+    """A read/write view of controller-owned state for debug and test access.
+
+    The adapter's own code asks the controller; these accessors keep no state.
+    """
+    return property(
+        lambda self: getattr(self.controller, name),
+        lambda self, value: setattr(self.controller, name, value),
+    )
+
+
 class AirloomApplication(Adw.Application):
+    sensors = _controller_state("sensors")
+    _area_ids = _controller_state("area_ids")
+    _monitoring_ids = _controller_state("monitoring_ids")
+    selected_id = _controller_state("selected_id")
+    refreshing = _controller_state("refreshing")
+    active_fetch = _controller_state("active_fetch")
+    pending_fetch = _controller_state("pending_fetch")
+    current_view = _controller_state("current_view")
+    view_bounds = _controller_state("view_bounds")
+    view_fetched_at = _controller_state("view_fetched_at")
+    coverage_generation = _controller_state("coverage_generation")
+    last_source = _controller_state("last_source")
+    last_origin = _controller_state("last_origin")
+    last_stale = _controller_state("last_stale")
+    coverage = _controller_state("coverage")
+    _trend_inflight = _controller_state("trend_inflight")
+
+    @property
+    def _shutting_down(self) -> bool:
+        return self.controller.stopped
+
+    @_shutting_down.setter
+    def _shutting_down(self, value: bool) -> None:
+        # Lifecycle is controller-owned and one-way.
+        if value:
+            self.controller.shutdown()
+
     def __init__(self):
         # Decided once, up front: every debug-instance signal (window
         # title/color, GApplication uniqueness, the new debug commands)
@@ -498,42 +453,20 @@ class AirloomApplication(Adw.Application):
         self._captured_notifications: list[dict] | None = None
         self._install_debug_fakes(os.environ)
         self.store = Store()
-        self.controller = ApplicationController(self.store.data)
         self.requests = RequestRegistry()
+        self.controller = self._new_controller()
         self._worker_lock = threading.Lock()
         self._active_workers = 0
         self._cache_closed = False
-        self._shutting_down = False
         self.cache, self._cache_error = _open_sensor_cache()
         self._auto_refresh_id: int | None = None
         self.window: Adw.ApplicationWindow | None = None
         self.webview: WebKit.WebView | None = None
         self._shell_recovery_notice: str | None = None
         self.title: Adw.WindowTitle | None = None
-        self.sensors: list[Sensor] = []
-        self._area_ids: set[int] = set()
-        self._monitoring_ids: set[int] = set()
-        self.selected_id: int | None = None
-        self._trend_inflight: dict[int, tuple[RequestToken, int | None]] = {}
-        self.refreshing = False
-        self.active_fetch: RefreshRequest | None = None
-        self.pending_fetch: RefreshRequest | None = None
         self.locator: GeoClueLocator | None = None
         self._locator_focus_handler: int | None = None
         self._locator_focus_fallback: int | None = None
-        self.view_bounds: Bounds | None = None
-        # Last real fetch outcome ("PurpleAir live" / "Demo data"), so callers
-        # that resend sensor state without refetching (e.g. favorite toggles)
-        # never guess a label that contradicts what was actually fetched.
-        self.last_source: str | None = None
-        self.last_origin = "live"
-        self.last_stale = False
-        self.coverage: dict | None = None
-        # Where the user is currently looking, stamped as one (bounds, center)
-        # pair so the auto-refresh timer can never combine a stale half.
-        self.current_view: tuple[Bounds, tuple[float, float]] | None = None
-        self.view_fetched_at = 0.0
-        self.coverage_generation: int | None = None
         # Reverse labels carry both request identity and their exact target;
         # generation alone cannot authorize a callback after coordinates change.
         self._home_name_generation = 0
@@ -542,6 +475,16 @@ class AirloomApplication(Adw.Application):
         self._debug_port: DebugPort | None = None
         self.connect("activate", self._on_activate)
         self.connect("shutdown", self._on_shutdown)
+
+    def _new_controller(self) -> ApplicationController:
+        """The controller reads and persists through whichever store this
+        adapter holds, and launches refresh workers through _start_fetch."""
+        return ApplicationController(
+            lambda: self.store.data,
+            persist=lambda candidate: self.store.apply(candidate),
+            start_fetch=lambda request: self._start_fetch(request),
+            requests=self.requests,
+        )
 
     def _start_worker(self, target, *, name: str, args=()) -> bool:
         """Admit one tracked worker unless shutdown has begun."""
@@ -591,13 +534,9 @@ class AirloomApplication(Adw.Application):
                 return
             self._shutting_down = True
 
-        self.pending_fetch = None
-        self.active_fetch = None
-        self.refreshing = False
+        # The controller's shutdown (above) dropped queued refresh work and
+        # invalidated its callbacks; adapter-only requests end here too.
         self.requests.invalidate()
-        # The pure controller has its own refresh registry. Advancing the
-        # configuration generation invalidates every outstanding completion.
-        self.controller.set_config(self.store.data)
         if self._auto_refresh_id is not None:
             GLib.source_remove(self._auto_refresh_id)
             self._auto_refresh_id = None
@@ -785,7 +724,7 @@ class AirloomApplication(Adw.Application):
             self._locator_focus_fallback = None
 
     def _refresh_seconds(self) -> int:
-        return int(self.store.data.get("refresh_minutes", 2)) * 60
+        return self.controller.refresh_seconds()
 
     def _arm_auto_refresh(self) -> None:
         if self._shutting_down:
@@ -982,22 +921,12 @@ class AirloomApplication(Adw.Application):
                 },
             )
             return
-        candidate = deepcopy(self.store.data)
-        candidate.update({"latitude": float(latitude), "longitude": float(longitude)})
-        try:
-            self.store.apply(candidate)
-        except OSError as exc:
-            self._send(
-                "error",
-                {
-                    "message": (
-                        f"Could not save detected location: {exc}. Check disk space "
-                        "and file permissions, then try again."
-                    )
-                },
-            )
+        result = self.controller.set_detected_home(latitude, longitude)
+        if result is None:
             return
-        self.controller.set_config(self.store.data)
+        if not result.ok:
+            self._send("error", {"message": result.error})
+            return
         self._send(
             "location",
             {
@@ -1046,34 +975,19 @@ class AirloomApplication(Adw.Application):
         generation: int,
         token: RequestToken,
     ) -> bool:
-        config = self.store.data
-        current_home = (config.get("latitude"), config.get("longitude"))
         try:
-            if (
-                not self._shutting_down
-                and self.requests.is_current(token)
+            result = (
+                self.controller.set_home_label(name, latitude, longitude)
+                if self.requests.is_current(token)
                 and generation == self._home_name_generation
-                and config.get("home_mode") == "auto"
-                and current_home == (latitude, longitude)
-            ):
-                candidate = deepcopy(config)
-                candidate["location_name"] = name[:80]
-                try:
-                    self.store.apply(candidate)
-                except OSError as exc:
-                    self._send(
-                        "error",
-                        {
-                            "message": (
-                                f"Could not save detected location name: {exc}. "
-                                "Check disk space and file permissions, then try again."
-                            )
-                        },
-                    )
-                else:
-                    if self.title:
-                        self.title.set_subtitle(name[:80])
-                    self._send("config", self.store.public_config())
+                else None
+            )
+            if result is not None and not result.ok:
+                self._send("error", {"message": result.error})
+            elif result is not None:
+                if self.title:
+                    self.title.set_subtitle(name[:80])
+                self._send("config", self.store.public_config())
         finally:
             self.requests.finish(token)
         return GLib.SOURCE_REMOVE
@@ -1119,100 +1033,22 @@ class AirloomApplication(Adw.Application):
         elif action == "select":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None:
-                self.selected_id = sensor_id
+                self.controller.select(sensor_id)
                 self._ensure_trend(sensor_id)
         elif action == "favorite":
             sensor_id = self._message_sensor_id(message)
-            if sensor_id is not None and any(sensor.sensor_id == sensor_id for sensor in self.sensors):
-                try:
-                    enabled = self.store.toggle_favorite(sensor_id)
-                except OSError as exc:
-                    self._send(
-                        "error",
-                        {
-                            "message": (
-                                f"Could not save favorite: {exc}. Check disk space and "
-                                "file permissions, then try again."
-                            )
-                        },
-                    )
-                    return
-                self._set_publication_config()
-                for sensor in self.sensors:
-                    if sensor.sensor_id == sensor_id:
-                        sensor.favorite = enabled
-                self._send_sensor_state()
+            if sensor_id is not None:
+                self._apply_display_change(self.controller.toggle_favorite(sensor_id))
         elif action == "hide":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None:
-                if self.store.is_hidden(sensor_id):
-                    try:
-                        self.store.unhide(sensor_id)
-                    except OSError as exc:
-                        self._send(
-                            "error",
-                            {
-                                "message": (
-                                    f"Could not unhide sensor: {exc}. Check disk space "
-                                    "and file permissions, then try again."
-                                )
-                            },
-                        )
-                        return
-                    self._set_publication_config()
-                    self._send_sensor_state()
-                else:
-                    sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
-                    if sensor is not None:
-                        try:
-                            self.store.hide(sensor_id, sensor.name)
-                        except OSError as exc:
-                            self._send(
-                                "error",
-                                {
-                                    "message": (
-                                        f"Could not hide sensor: {exc}. Check disk space "
-                                        "and file permissions, then try again."
-                                    )
-                                },
-                            )
-                            return
-                        self._set_publication_config()
-                        self._send_sensor_state()
+                self._apply_display_change(self.controller.toggle_hidden(sensor_id))
         elif action == "unhide":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None:
-                try:
-                    self.store.unhide(sensor_id)
-                except OSError as exc:
-                    self._send(
-                        "error",
-                        {
-                            "message": (
-                                f"Could not unhide sensor: {exc}. Check disk space "
-                                "and file permissions, then try again."
-                            )
-                        },
-                    )
-                    return
-                self._set_publication_config()
-                self._send_sensor_state()
+                self._apply_display_change(self.controller.unhide(sensor_id))
         elif action == "unhide-all":
-            try:
-                self.store.unhide_all()
-            except OSError as exc:
-                self._send(
-                    "error",
-                    {
-                        "message": (
-                            f"Could not unhide all sensors: {exc}. Check disk space "
-                            "and file permissions, then try again."
-                        )
-                    },
-                )
-                return
-            self._set_publication_config()
-            self._send_sensor_state()
+            self._apply_display_change(self.controller.unhide_all())
         elif action == "save-settings":
             self._save_settings(message)
         elif action == "view-changed":
@@ -1228,6 +1064,14 @@ class AirloomApplication(Adw.Application):
         else:
             print(f"Airloom: ignored unknown web action: {action!r}", file=sys.stderr)
 
+    def _apply_display_change(self, result) -> None:
+        if result is None:
+            return
+        if not result.ok:
+            self._send("error", {"message": result.error})
+            return
+        self._send_sensor_state()
+
     @staticmethod
     def _message_sensor_id(message: dict) -> int | None:
         sensor_id = bridge_sensor_id(message.get("id"))
@@ -1238,26 +1082,9 @@ class AirloomApplication(Adw.Application):
     def _on_view_changed(self, message: dict) -> None:
         if self._shutting_down:
             return
-        try:
-            view, center = _view_from_message(message)
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return
-        self.current_view = (view, center)
-        self.controller.set_view(message)
-        # Register new view intent even when cached coverage needs no worker:
-        # the token supersedes active/pending requests for the previous view.
-        request = self.controller.begin_refresh()
-        self.pending_fetch = None
-        fresh = (time.monotonic() - self.view_fetched_at) < self._refresh_seconds()
-        if (
-            self.view_bounds is not None
-            and self.coverage_generation == request.generation
-            and fresh
-            and bounds_contains(self.view_bounds, view)
-        ):
-            return
-        self._start_fetch(request)
-        self._start_view_label(*center)
+        center = self.controller.view_changed(message)
+        if center is not None:
+            self._start_view_label(*center)
 
     def _start_view_label(self, latitude: float, longitude: float) -> None:
         """Label the summary chip with the area the user is now looking at."""
@@ -1356,104 +1183,36 @@ class AirloomApplication(Adw.Application):
         if self._shutting_down:
             return
         value = message.get("value")
-        if value not in ("outdoor", "indoor", "both"):
+        if value not in LOCATION_FILTERS:
             print(f"Airloom: ignored invalid location filter: {value!r}", file=sys.stderr)
             return
-        candidate = deepcopy(self.store.data)
-        candidate["location_filter"] = value
-        try:
-            self.store.apply(candidate)
-        except OSError as exc:
-            self._send(
-                "error",
-                {
-                    "message": (
-                        f"Could not save location filter: {exc}. Check disk space "
-                        "and file permissions, then try again."
-                    )
-                },
-            )
+        result = self.controller.set_location_filter(value)
+        if result is None:
             return
-        self.controller.set_config(self.store.data)
+        if not result.ok:
+            self._send("error", {"message": result.error})
+            return
         self._send("config", self.store.public_config())
         self.refresh()
 
     def _save_settings(self, message: dict) -> None:
         if self._shutting_down:
             return
-        previous_mode = self.store.data.get("home_mode")
-        previous_home = (self.store.data.get("latitude"), self.store.data.get("longitude"))
-        try:
-            radius = max(2.0, min(100.0, float(message["radius_km"])))
-            heatmap = max(5.0, min(1000.0, float(message["heatmap_threshold_km"])))
-            threshold = max(1, min(500, int(message["alert_threshold"])))
-            home_mode = "fixed" if message.get("home_mode") == "fixed" else "auto"
-            updates = {
-                "radius_km": radius,
-                "heatmap_threshold_km": heatmap,
-                "alert_threshold": threshold,
-                "home_mode": home_mode,
-                "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
-                "confidence_filter": bool(message.get("confidence_filter")),
-                "interface_scale": self.store.data.get("interface_scale", 1.0),
-            }
-            if "interface_scale" in message:
-                # The selector's 100% arrives as JSON integer 1.
-                scale = message["interface_scale"]
-                if isinstance(scale, bool) or float(scale) not in (1.0, 1.25, 1.5):
-                    raise ValueError("Interface size must be 100%, 125%, or 150%.")
-                updates["interface_scale"] = float(scale)
-            minutes = int(message["refresh_minutes"])
-            if minutes not in (2, 5, 10, 30):
-                minutes = 2
-            updates["refresh_minutes"] = minutes
-            if home_mode == "fixed":
-                latitude = float(message["home_lat"])
-                longitude = float(message["home_lon"])
-                if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-                    raise ValueError("Coordinates are outside their valid range.")
-                updates["latitude"] = latitude
-                updates["longitude"] = longitude
-                updates["location_name"] = str(message.get("location_name") or "Custom location")[:80]
-        except (KeyError, TypeError, ValueError) as exc:
-            error = f"Could not save preferences: {exc}"
-            self._send("error", {"message": error})
+        result = self.controller.save_settings(message)
+        if result is None:
+            return
+        request_id = message.get("request_id")
+        if result.status != "success":
+            if result.status == "invalid":
+                self._send("error", {"message": result.error})
             self._send(
                 "settings-save-result",
-                {
-                    "request_id": message.get("request_id"),
-                    "status": "error",
-                    "error": error,
-                },
+                {"request_id": request_id, "status": "error", "error": result.error},
             )
             return
-
-        candidate = deepcopy(self.store.data)
-        candidate.update(updates)
-        api_key = str(message.get("api_key") or "").strip()
-        if message.get("clear_api_key"):
-            candidate["api_key"] = ""
-        elif api_key:
-            candidate["api_key"] = api_key
-        try:
-            self.store.apply(candidate)
-        except OSError as exc:
-            self._send(
-                "settings-save-result",
-                {
-                    "request_id": message.get("request_id"),
-                    "status": "error",
-                    "error": (
-                        f"Could not save preferences: {exc}. Check disk space and "
-                        "file permissions, then try again."
-                    ),
-                },
-            )
-            return
-        self.controller.set_config(self.store.data)
         if getattr(self, "webview", None):
             self.webview.set_zoom_level(self._interface_scale())
-        if home_mode != "auto":
+        if result.fixed_home:
             self._clear_locator_focus_wait()
             if self.locator is not None:
                 self.locator.cancel()
@@ -1465,21 +1224,13 @@ class AirloomApplication(Adw.Application):
         self._send("config", self.store.public_config())
         self._send(
             "settings-save-result",
-            {
-                "request_id": message.get("request_id"),
-                "status": "success",
-                "error": None,
-            },
+            {"request_id": request_id, "status": "success", "error": None},
         )
-        if home_mode == "auto" and previous_mode != "auto":
+        if result.entered_auto:
             # The user just clicked Save in our UI, so the window is focused
             # and the permission dialog (if any) can appear immediately.
             self._start_locator()
-        home_pinned = home_mode == "fixed" and (
-            previous_mode != "fixed"
-            or (updates["latitude"], updates["longitude"]) != previous_home
-        )
-        if home_pinned:
+        if result.home_pinned:
             # Glide the map to the newly pinned home instead of leaving it
             # wherever the user happened to be looking when they saved.
             self._send(
@@ -1491,7 +1242,6 @@ class AirloomApplication(Adw.Application):
                     "source": "fixed",
                 },
             )
-        if home_pinned:
             self._refresh_home()
         else:
             # Preference and filter changes keep the current viewport target.
@@ -1500,135 +1250,59 @@ class AirloomApplication(Adw.Application):
     def _paint_cached_home(self) -> None:
         """First paint from the cache so launch never blocks on the network.
         The refresh that follows replaces it under the normal TTL rules."""
-        if self.sensors or self.cache is None or not self.store.data.get("api_key"):
+        if self.cache is None or not self.controller.wants_cached_startup():
             return
-        config = self.store.data
-        bounds = bounds_around(config["latitude"], config["longitude"], config["radius_km"])
+        bounds = self.controller.home_bounds()
         try:
             cached = _sensors_from_rows(self.cache.sensors_in(bounds))
         except _CACHE_FAILURES:
             # First paint is optional; the refresh that follows reports it.
             return
-        if cached:
-            favorites = set(config.get("favorites", []))
-            for sensor in cached:
-                sensor.favorite = sensor.sensor_id in favorites
-                sensor.origin = "live"
-                sensor.delivery = "cache"
-            self.sensors = cached
-            self._area_ids = {sensor.sensor_id for sensor in cached}
-            self._monitoring_ids = set()
-            self.last_origin = "live"
-            self.last_stale = False
-            self.coverage = _coverage_payload(bounds, bounds)
+        if self.controller.apply_cached_startup(cached, bounds):
             self._send_sensor_state("PurpleAir · cached")
-
-    def _set_publication_config(self) -> None:
-        """Keep active or queued refresh work authorized after display changes."""
-        self.controller.set_config(self.store.data)
-        if self.refreshing or self.pending_fetch is not None:
-            # The replacement supersedes both, so it inherits a manual
-            # Refresh's force intent from either of them.
-            force = any(
-                request is not None and request.force
-                for request in (self.active_fetch, self.pending_fetch)
-            )
-            self.pending_fetch = self.controller.begin_refresh(force=force)
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the current view, falling back to home before one exists."""
         if self._shutting_down:
             return
-        self._start_fetch(self.controller.begin_refresh(force=force))
+        self.controller.refresh(force=force)
 
     def _refresh_home(self, force: bool = False) -> None:
         """Explicit recentering is separate from ordinary Refresh actions."""
         if self._shutting_down:
             return
-        config = self.store.data
-        center = (float(config["latitude"]), float(config["longitude"]))
-        bounds = bounds_around(*center, float(config["radius_km"]))
-        self.current_view = (bounds, center)
-        self.controller.set_view(
-            {
-                "north": bounds.north,
-                "west": bounds.west,
-                "south": bounds.south,
-                "east": bounds.east,
-                "lat": center[0],
-                "lon": center[1],
-            }
-        )
-        self.refresh(force=force)
+        self.controller.refresh_home(force=force)
 
-    def _start_fetch(self, request: RefreshRequest) -> None:
+    def _start_fetch(self, request: RefreshRequest) -> bool:
+        """Launch the controller-admitted refresh worker."""
         if self._shutting_down or not self.webview:
-            return
-        if self.refreshing:
-            # The descriptor is already registered, so its newer identity also
-            # supersedes the active completion while only one worker runs.
-            self.pending_fetch = request
-            return
-        self.refreshing = True
-        self.active_fetch = request
+            return False
         bounds = cap_bounds(request.bounds, request.center)
         self._send("loading", {"active": True})
-        config = dict(self.store.data)
+        config = dict(self.controller.config)
         ttl = self._refresh_seconds()
 
         def worker() -> None:
             outcome = _fetch_readings(config, self.cache, request, bounds, ttl)
             GLib.idle_add(self._finish_refresh, outcome)
 
-        self._start_worker(worker, name="airloom-refresh")
+        return self._start_worker(worker, name="airloom-refresh")
 
     def _finish_refresh(self, outcome: RefreshOutcome) -> bool:
         if self._shutting_down:
             return GLib.SOURCE_REMOVE
         try:
-            decision = self.controller.complete_refresh(
-                outcome.request,
-                outcome.sensors,
-                outcome.origin,
-                outcome.delivery,
-            )
+            decision = self.controller.accept_refresh(outcome)
             if decision.publish:
-                for sensor in outcome.sensors:
-                    sensor.origin, sensor.delivery = outcome.provenance.get(
-                        sensor.sensor_id,
-                        (outcome.origin, outcome.delivery),
-                    )
-                self.sensors = outcome.sensors
-                self._area_ids = set(outcome.area_ids)
-                self._monitoring_ids = set(outcome.monitoring_ids)
-                self.last_source = outcome.source
-                self.last_origin = outcome.origin
-                self.last_stale = outcome.stale
-                self.coverage = _coverage_payload(
-                    outcome.request.bounds, outcome.bounds
-                )
                 self._send_sensor_state(outcome.source)
-                if outcome.error:
-                    self._send("error", {"message": outcome.error})
-                if outcome.monitoring_error:
-                    self._send("error", {"message": outcome.monitoring_error})
-                if outcome.cache_warning:
-                    self._send("error", {"message": outcome.cache_warning})
+                for message in decision.messages:
+                    self._send("error", {"message": message})
                 self._check_alerts()
-                if outcome.error is None:
-                    # Failed live retrieval must not suppress the next retry.
-                    self.view_bounds = outcome.bounds
-                    self.view_fetched_at = time.monotonic()
-                    self.coverage_generation = outcome.request.generation
-                if self.selected_id is not None:
-                    self._ensure_trend(self.selected_id)
+                for sensor_id in decision.trend_ids:
+                    self._ensure_trend(sensor_id)
         finally:
-            self.refreshing = False
-            self.active_fetch = None
             self._send("loading", {"active": False})
-            if self.pending_fetch is not None:
-                pending, self.pending_fetch = self.pending_fetch, None
-                self._start_fetch(pending)
+            self.controller.settle_refresh()
         return GLib.SOURCE_REMOVE
 
     def _send_trend_state(
@@ -1651,40 +1325,16 @@ class AirloomApplication(Adw.Application):
         )
 
     def _ensure_trend(self, sensor_id: int) -> None:
-        """Attach one current trend request to a sensor reading.
-
-        Repeated selection reuses identical in-flight work. A newer reading gets
-        a new token, so neither an old request nor an old observation can publish.
-        """
+        """Act on the controller's trend decision for a selected reading."""
         if self._shutting_down:
             return
-        sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
-        reading_last_seen = sensor.last_seen if sensor is not None else None
-        inflight = self._trend_inflight.get(sensor_id)
-        if (
-            sensor is not None
-            and inflight is not None
-            and inflight[1] == reading_last_seen
-            and self.requests.is_current(inflight[0])
-        ):
+        plan = self.controller.begin_trend(sensor_id)
+        if plan is None:
             return
-
-        token = self.requests.begin(
-            f"trend:{sensor_id}", generation=reading_last_seen or 0
-        )
-        if sensor is None:
-            self._send_trend_state(sensor_id, token, "idle", None)
-            self.requests.finish(token)
-            return
-
-        # Provenance, not key presence, decides: demo fallback after an outage
-        # keeps the key but its synthetic IDs must never reach PurpleAir.
-        if sensor.origin == "demo" or not self.store.data.get("api_key"):
-            status = "loaded" if sensor.trend else "unavailable"
+        if plan.kind != "remote":
             self._send_trend_state(
-                sensor_id, token, status, reading_last_seen, sensor.trend
+                sensor_id, plan.token, plan.status, plan.reading_last_seen, plan.trend
             )
-            self.requests.finish(token)
             return
 
         cached = None
@@ -1702,32 +1352,23 @@ class AirloomApplication(Adw.Application):
                     },
                 )
         if cached is not None:
-            status = "loaded" if cached else "unavailable"
-            if cached and sensor.trend != cached:
-                sensor.trend = cached
+            update = self.controller.cached_trend(plan, cached)
+            if update.sensor_changed:
                 self._send_sensor_state()
             self._send_trend_state(
-                sensor_id, token, status, reading_last_seen, cached
+                sensor_id, plan.token, update.status, plan.reading_last_seen, cached
             )
-            self.requests.finish(token)
             return
 
-        self._trend_inflight[sensor_id] = (token, reading_last_seen)
-        self._send_trend_state(sensor_id, token, "loading", reading_last_seen)
-        api_key = self.store.data["api_key"]
+        self.controller.track_trend(plan)
+        self._send_trend_state(sensor_id, plan.token, "loading", plan.reading_last_seen)
+        api_key = self.controller.config["api_key"]
 
         def worker() -> None:
             trend = None
             failed = False
             try:
-                current_sensor = next(
-                    (s for s in self.sensors if s.sensor_id == sensor_id), None
-                )
-                if (
-                    self.requests.is_current(token)
-                    and current_sensor is not None
-                    and current_sensor.last_seen == reading_last_seen
-                ):
+                if self.controller.trend_wanted(plan):
                     result = _new_purpleair_client(api_key).fetch_rows(
                         show_only=[sensor_id], fields=TREND_FETCH_FIELDS
                     )
@@ -1740,8 +1381,8 @@ class AirloomApplication(Adw.Application):
             GLib.idle_add(
                 self._finish_trend,
                 sensor_id,
-                reading_last_seen,
-                token,
+                plan.reading_last_seen,
+                plan.token,
                 trend,
                 failed,
             )
@@ -1756,91 +1397,32 @@ class AirloomApplication(Adw.Application):
         trend: list | None,
         failed: bool,
     ) -> bool:
-        inflight = self._trend_inflight.get(sensor_id)
-        sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
-        owns_inflight = inflight is not None and inflight[0] == token
-        authorized = (
-            not self._shutting_down
-            and owns_inflight
-            and self.requests.is_current(token)
-            and sensor is not None
-            and sensor.last_seen == reading_last_seen
+        update = self.controller.finish_trend(
+            sensor_id, reading_last_seen, token, trend, failed
         )
-        if owns_inflight:
-            # This callback settles the stored request even when its reading is
-            # no longer publishable; a later selection must never reuse it.
-            del self._trend_inflight[sensor_id]
-            self.requests.finish(token)
-        if not authorized:
+        if update is None:
             return GLib.SOURCE_REMOVE
-
-        status = "error" if failed else "loaded" if trend else "unavailable"
-        if status == "loaded":
-            if self.cache is not None:
-                try:
-                    self.cache.store_trend(sensor_id, trend)
-                except Exception as exc:  # noqa: BLE001 — live data remains valid
-                    self._send(
-                        "error",
-                        {
-                            "message": (
-                                f"Could not cache trend: {exc}. "
-                                "Showing the live result without trend caching."
-                            )
-                        },
-                    )
-            sensor.trend = trend
+        if update.store and self.cache is not None:
+            try:
+                self.cache.store_trend(sensor_id, trend)
+            except Exception as exc:  # noqa: BLE001 — live data remains valid
+                self._send(
+                    "error",
+                    {
+                        "message": (
+                            f"Could not cache trend: {exc}. "
+                            "Showing the live result without trend caching."
+                        )
+                    },
+                )
+        if update.sensor_changed:
             self._send_sensor_state()
-        self._send_trend_state(
-            sensor_id, token, status, reading_last_seen, trend
-        )
+        self._send_trend_state(sensor_id, token, update.status, reading_last_seen, trend)
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:
-        visible, area, favorites = _presentation_collections(
-            self.sensors,
-            area_ids=self._area_ids,
-            monitoring_ids=self._monitoring_ids,
-            hidden_ids=self.store.hidden_ids(),
-            confidence_filter=bool(self.store.data.get("confidence_filter", True)),
-            location_filter=self.store.data.get("location_filter", "outdoor"),
-        )
-        # Hiding or filtering the selected sensor must not leave a dangling ID.
-        if self.selected_id not in {sensor.sensor_id for sensor in visible}:
-            self.selected_id = visible[0].sensor_id if visible else None
-        if self.coverage is None:
-            if self.current_view is not None:
-                bounds = self.current_view[0]
-            else:
-                config = self.store.data
-                bounds = bounds_around(
-                    config["latitude"], config["longitude"], config["radius_km"]
-                )
-            self.coverage = _coverage_payload(bounds, bounds)
-        payload = {
-            "items": [
-                _sensor_payload(
-                    sensor,
-                    remote_favorite=sensor.sensor_id not in self._area_ids,
-                )
-                for sensor in visible
-            ],
-            "area": [
-                _sensor_payload(sensor, remote_favorite=False) for sensor in area
-            ],
-            "favorites": [
-                _sensor_payload(
-                    sensor,
-                    remote_favorite=sensor.sensor_id not in self._area_ids,
-                )
-                for sensor in favorites
-            ],
-            "selected_id": self.selected_id,
-            "source": source or self.last_source or ("PurpleAir live" if self.store.data.get("api_key") else "Demo data"),
-            "stale": bool(self.last_stale),
-            "coverage": dict(self.coverage),
-            "config": self.store.public_config(),
-        }
+        payload = self.controller.publication(source)
+        payload["config"] = self.store.public_config()
         self._send("sensors", payload)
 
     def _install_debug_fakes(self, environ) -> None:
@@ -1855,50 +1437,25 @@ class AirloomApplication(Adw.Application):
             self._captured_notifications = []
 
     def _check_alerts(self) -> None:
+        decision = self.controller.evaluate_alerts()
+        for sensor in decision.notify:
+            self._notify_alert(sensor)
+        if decision.error:
+            self._send("error", {"message": decision.error})
+
+    def _notify_alert(self, sensor: Sensor) -> None:
+        title = f"Air quality alert · {sensor.name[:80]}"
+        body = f"AQI is now {sensor.aqi}. Open Airloom for health guidance."
+        if self._captured_notifications is not None:
+            self._captured_notifications.append(
+                {"sensor_id": sensor.sensor_id, "title": title, "body": body}
+            )
+            return
+        notification = Notify.Notification.new(title, body, APP_ID)
         try:
-            threshold = int(self.store.data.get("alert_threshold", 101))
-        except (TypeError, ValueError):
-            threshold = 101
-        visible, _area, _favorites = _presentation_collections(
-            self.sensors,
-            area_ids=self._area_ids,
-            monitoring_ids=self._monitoring_ids,
-            hidden_ids=self.store.hidden_ids(),
-            confidence_filter=bool(self.store.data.get("confidence_filter", True)),
-            location_filter=self.store.data.get("location_filter", "outdoor"),
-        )
-        previous = dict(self.store.data.get("alert_states", {}))
-        alerted, states = alert_transitions(
-            visible,
-            favorites={int(sensor_id) for sensor_id in self.store.data.get("favorites", [])},
-            previous=previous,
-            threshold=threshold,
-            now=time.time(),
-            origin=self.last_origin,
-        )
-        for sensor in alerted:
-            title = f"Air quality alert · {sensor.name[:80]}"
-            body = f"AQI is now {sensor.aqi}. Open Airloom for health guidance."
-            if self._captured_notifications is not None:
-                self._captured_notifications.append(
-                    {"sensor_id": sensor.sensor_id, "title": title, "body": body}
-                )
-                continue
-            notification = Notify.Notification.new(title, body, APP_ID)
-            try:
-                notification.show()
-            except GLib.Error:
-                pass
-        if states != previous:
-            candidate = deepcopy(self.store.data)
-            candidate["alert_states"] = states
-            try:
-                self.store.apply(candidate)
-            except Exception as exc:  # noqa: BLE001 — persistence is nonfatal here
-                self._send(
-                    "error",
-                    {"message": f"Could not save alert state: {exc}"},
-                )
+            notification.show()
+        except GLib.Error:
+            pass
 
     def _send(self, event: str, payload) -> None:
         if self._shutting_down or not self.webview:

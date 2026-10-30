@@ -188,9 +188,8 @@ class ApplicationRequestTestCase(unittest.TestCase):
         app = AirloomApplication.__new__(AirloomApplication)
         app.store = FakeStore(home_mode=home_mode)
         app.cache = FakeCache()
-        app.controller = SimpleNamespace(set_config=lambda _config: None)
         app.requests = RequestRegistry()
-        app._shutting_down = False
+        app.controller = app._new_controller()
         app._worker_lock = threading.Lock()
         app._active_workers = 0
         app._cache_closed = False
@@ -1348,8 +1347,8 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
             app = h.AirloomApplication.__new__(h.AirloomApplication)
             app.store = h.FakeStore()
             app.cache = RecordingCache(cache_path)
-            app.controller = h.ApplicationController(app.store.data)
             app.requests = h.RequestRegistry()
+            app.controller = app._new_controller()
             app._worker_lock = threading.Lock()
             app._active_workers = 0
             app._cache_closed = False

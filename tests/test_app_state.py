@@ -36,6 +36,7 @@ except (ImportError, ValueError):
     sys.modules["gi.repository"] = repository
     from airloom import app as app_module
 
+from airloom import controller as controller_module
 from airloom.app import AirloomApplication
 from airloom.cache import AreaResult, CacheError, SensorCache
 from airloom.controller import ApplicationController
@@ -221,8 +222,8 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app = AirloomApplication.__new__(AirloomApplication)
         app.store = store or FakeStore()
         app.cache = cache
-        app.controller = ApplicationController(app.store.data)
-        app._shutting_down = False
+        app.requests = app_module.RequestRegistry()
+        app.controller = app._new_controller()
         app.sensors = []
         app._area_ids = set()
         app._monitoring_ids = set()
@@ -329,7 +330,7 @@ class PresentationPayloadTest(ApplicationAdapterTestCase):
         requested = Bounds(80.0, -170.0, -80.0, 170.0)
         fetched = Bounds(1.0, -1.0, -1.0, 1.0)
 
-        coverage = app_module._coverage_payload(requested, fetched)
+        coverage = controller_module.coverage_payload(requested, fetched)
 
         self.assertEqual(
             coverage,
@@ -626,7 +627,7 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         alerts = []
         app._check_alerts = lambda: alerts.append(True)
 
-        with mock.patch.object(app_module.time, "monotonic", return_value=1_000.0):
+        with mock.patch.object(controller_module.time, "monotonic", return_value=1_000.0):
             app._on_view_changed(view_b)
             request_b = app.launched[-1][0]
             app.refreshing = True
@@ -655,7 +656,7 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         app.view_fetched_at = 1_000.0
         app.pending_fetch = app.controller.begin_refresh()
 
-        with mock.patch.object(app_module.time, "monotonic", return_value=1_000.0):
+        with mock.patch.object(controller_module.time, "monotonic", return_value=1_000.0):
             app._on_view_changed(VIEW)
 
         self.assertIsNone(app.pending_fetch)
@@ -674,7 +675,7 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         outdoor_request = app.controller.begin_refresh()
         app.refreshing = True
 
-        with mock.patch.object(app_module.time, "monotonic", return_value=1_000.0):
+        with mock.patch.object(controller_module.time, "monotonic", return_value=1_000.0):
             app._set_location_filter({"value": "indoor"})
             app._on_view_changed(VIEW)
             replacement = app.pending_fetch
@@ -846,7 +847,7 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
 
                 with (
                     mock.patch.object(store, "_write", side_effect=failure),
-                    mock.patch.object(app_module.time, "time", return_value=NOW),
+                    mock.patch.object(controller_module.time, "time", return_value=NOW),
                     mock.patch.object(app_module.Notify, "Notification") as notification_type,
                 ):
                     notification_type.new.return_value.show.return_value = None
@@ -1276,7 +1277,7 @@ class FilterSaveFailureTest(ApplicationAdapterTestCase):
                 "network",
             )
             with (
-                mock.patch.object(app_module.time, "time", return_value=NOW),
+                mock.patch.object(controller_module.time, "time", return_value=NOW),
                 mock.patch.object(app_module.Notify, "Notification") as notification_type,
             ):
                 app._check_alerts()
@@ -1335,8 +1336,6 @@ class DemoTrendAfterOutageTest(ApplicationAdapterTestCase):
 
         cache = TrendCache()
         app = self.make_app(store=FakeStore(location_filter="both"), cache=cache)
-        app.requests = app_module.RequestRegistry()
-        app._trend_inflight = {}
         app._start_worker = mock.Mock(return_value=True)
         app._ensure_trend = lambda sensor_id: AirloomApplication._ensure_trend(
             app, sensor_id
@@ -1404,7 +1403,7 @@ class AlertAdapterTest(ApplicationAdapterTestCase):
                 app._monitoring_ids = {1}
                 app.last_origin = origin
                 with (
-                    mock.patch.object(app_module.time, "time", return_value=NOW),
+                    mock.patch.object(controller_module.time, "time", return_value=NOW),
                     mock.patch.object(app_module.Notify, "Notification") as notification_type,
                 ):
                     notification_type.new.return_value.show.return_value = None
