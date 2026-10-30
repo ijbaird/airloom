@@ -256,7 +256,16 @@ class DebugPortSafetyTest(unittest.TestCase):
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(self.path)
         stale.close()
+        # Nothing else holds a closed socket's inode, so once start() unlinks
+        # the path, ext4 can hand the same number to the replacement. A hard
+        # link keeps the stale inode allocated for the identity comparison.
+        stale_link = self.path + ".stale"
+        os.link(self.path, stale_link)
         original = os.lstat(self.path)
+        refused = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with self.assertRaises(ConnectionRefusedError):
+            refused.connect(self.path)
+        refused.close()
         port = DebugPort(self.path, _echo_dispatcher)
         self.addCleanup(port.stop)
 
@@ -264,6 +273,7 @@ class DebugPortSafetyTest(unittest.TestCase):
 
         current = os.lstat(self.path)
         self.assertNotEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+        self.assertTrue(os.path.samestat(os.lstat(stale_link), original), "the stale inode was not kept")
         client = _ClientSession(self.path)
         self.addCleanup(client.close)
         self.assertTrue(client.request({"id": 1, "cmd": "ping"})["ok"])
