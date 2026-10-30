@@ -56,7 +56,8 @@ export XDG_CONFIG_HOME="${work}/config"
 export XDG_CACHE_HOME="${work}/cache"
 export XDG_DATA_HOME="${work}/data"
 export LC_ALL=C
-mkdir -p "${HOME}" "${XDG_CONFIG_HOME}" "${XDG_CACHE_HOME}" "${XDG_DATA_HOME}"
+mkdir -p "${HOME}" "${XDG_CONFIG_HOME}" "${XDG_CACHE_HOME}" "${XDG_DATA_HOME}" "${work}/inspect-gpg"
+chmod 700 "${work}/inspect-gpg"
 
 fail() {
   echo "client verification denied: $*" >&2
@@ -95,6 +96,31 @@ remote_url() {
   flatpak remotes --user --columns=name,url | awk -v origin="${origin}" '$1 == origin {print $2}'
 }
 
+# Fingerprints are read with a scratch GnuPG home so the caller's keyring is
+# never touched.
+key_fingerprint() {
+  GNUPGHOME="${work}/inspect-gpg" gpg --batch --with-colons --show-keys "$1" | awk -F: '/^fpr:/ {print $10; exit}'
+}
+
+# Space-separated, sorted fingerprints an installed remote trusts.
+remote_trusted_keys() {
+  ostree remote gpg-list-keys --repo="${FLATPAK_USER_DIR}/repo" "$1" | awk '/^Key:/ {print $2}' | sort -u | paste -sd' ' -
+}
+
+remote_requires_signatures() {
+  [[ "$(ostree config --repo="${FLATPAK_USER_DIR}/repo" get "remote \"$1\".gpg-verify")" == "true" ]]
+}
+
+# The installed commit carries a good signature by the expected key: a
+# gpg-verified metadata pull against a keyring holding only that key.
+assert_commit_signed_by_expected_key() {
+  local commit="$1" label="$2" check="${work}/signature-check-$1"
+  ostree init --repo="${check}" --mode=archive
+  ostree remote add --repo="${check}" --gpg-import="${public_key}" expected-key "file:///nonexistent"
+  ostree pull-local --repo="${check}" --remote=expected-key --gpg-verify --commit-metadata-only \
+    "${FLATPAK_USER_DIR}/repo" "${commit}" || fail "${label} commit ${commit} has no good GPG signature by ${expected_key}"
+}
+
 assert_version() {
   local expected="$1"
   local label="$2"
@@ -106,14 +132,21 @@ assert_version() {
 verify_bundle() (
   export FLATPAK_USER_DIR="${work}/bundle-client"
   mkdir -p "${FLATPAK_USER_DIR}"
-  flatpak install --user --noninteractive --no-deps --arch="${arch}" --gpg-file="${public_key}" --bundle "${bundle}"
-  local origin url
+  # Install as users do: flatpak verifies the commit against the key that
+  # build-bundle --gpg-keys embedded, and the origin remote keeps trusting it
+  # for updates. Then prove that key is exactly ours. (Passing --gpg-file
+  # instead crashes flatpak 1.18.1 at exit; flatpak#6842, fixed in 1.18.3.)
+  flatpak install --user --noninteractive --no-deps --arch="${arch}" --bundle "${bundle}"
+  local origin url keys
   origin="$(installed_origin)"
-  [[ "${origin}" == "${app_id}-origin" ]] || fail "bundle origin ${origin} does not match ${app_id}-origin"
   url="$(remote_url "${origin}")"
   [[ "${url}" == "${expected_repo_url}" ]] || fail "bundle origin URL ${url} does not match ${expected_repo_url}"
+  remote_requires_signatures "${origin}" || fail "bundle origin ${origin} does not require GPG signatures"
+  keys="$(remote_trusted_keys "${origin}")"
+  [[ "${keys}" == "${expected_key}" ]] || fail "bundle origin ${origin} trusts GPG keys ${keys:-none}, not ${expected_key}"
+  assert_commit_signed_by_expected_key "$(installed_commit)" "bundle"
   assert_version "${version}" "bundle"
-  evidence "bundle_verified origin=${origin} url=${url} version=${version}"
+  evidence "bundle_verified origin=${origin} url=${url} key=${expected_key} version=${version}"
 )
 
 verify_repository_install() (
@@ -134,7 +167,9 @@ verify_previous_upgrade() (
   assert_version "${previous_version}" "previous installation"
   local origin old_commit new_commit
   origin="$(installed_origin)"
-  [[ "${origin}" == "${app_id}-origin" ]] || fail "previous installation origin ${origin} is unexpected"
+  local previous_url
+  previous_url="$(remote_url "${origin}")"
+  [[ "${previous_url}" == "${expected_repo_url}" ]] || fail "previous installation origin URL ${previous_url} does not match ${expected_repo_url}"
   old_commit="$(installed_commit)"
   flatpak remote-modify --user --gpg-verify --gpg-import="${public_key}" --url="${repo_url}" "${origin}"
   flatpak update --user --noninteractive --no-deps --arch="${arch}" "${app_id}"
@@ -166,6 +201,9 @@ verify_wrong_key_rejection() (
   grep -Eiq 'gpg|signature|keyring|public key' <<< "${output}" || fail "wrong-key ${stage} failed for an unrelated reason: ${output}"
   evidence "wrong_key_rejected remote=${remote} stage=${stage}"
 )
+
+expected_key="$(key_fingerprint "${public_key}")"
+[[ -n "${expected_key}" ]] || fail "no key fingerprint found in ${public_key}"
 
 verify_bundle
 verify_repository_install

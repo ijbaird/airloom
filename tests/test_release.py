@@ -1026,28 +1026,39 @@ elif command == "remote-modify":
 elif command == "install":
     bundle = next((arg for arg in args if arg.endswith(".flatpak")), None)
     if bundle is not None:
+        if option("--gpg-file") is not None:
+            # flatpak 1.18.1 frees --gpg-file key bytes as a GObject at
+            # transaction teardown and segfaults (flatpak#6842).
+            print("Segmentation fault (core dumped)", file=sys.stderr)
+            sys.exit(139)
         previous = bundle == env["FAKE_PREVIOUS_BUNDLE"]
-        if not previous:
+        # A bundle carries the keys build-bundle --gpg-keys embedded; its
+        # origin remote trusts exactly those and requires signatures only
+        # when there are any.
+        if previous:
+            keys, signer = ["PREVIOUSFPR"], "PREVIOUSFPR"
+            url = env.get("FAKE_PREVIOUS_BUNDLE_URL", "https://ijbaird.github.io/airloom/repo")
+        else:
             signature = env.get("FAKE_CURRENT_BUNDLE_SIGNATURE", "selected")
-            selected_key = option("--gpg-file")
-            if selected_key is not None:
-                if signature == "unsigned":
-                    print("GPG signature missing for current bundle", file=sys.stderr)
-                    sys.exit(1)
-                if signature != "selected" or not key_matches(selected_key):
-                    print("GPG signature verification failed: bundle was not signed by the selected key", file=sys.stderr)
-                    sys.exit(1)
+            keys, signer = {
+                "selected": (["CORRECTFPR"], "CORRECTFPR"),
+                "unsigned": ([], None),
+                "independent": (["OTHERFPR"], "OTHERFPR"),
+                "extra-key": (["CORRECTFPR", "OTHERFPR"], "CORRECTFPR"),
+                "embedded-but-signed-by-other": (["CORRECTFPR"], "OTHERFPR"),
+            }[signature]
+            url = env.get("FAKE_BUNDLE_URL", "https://ijbaird.github.io/airloom/repo")
+            if keys and signer not in keys:
+                print("GPG signatures found, but none are in trusted keyring", file=sys.stderr)
+                sys.exit(1)
         version = previous_version if previous else current_version
-        origin = env.get("FAKE_ORIGIN", "ai.stealthvision.Airloom-origin")
-        state = {
-            "version": version,
-            "commit": "previous-commit" if previous else "current-commit",
-            "origin": origin,
-        }
-        remotes[origin] = {
-            "url": env.get("FAKE_BUNDLE_URL", "https://ijbaird.github.io/airloom/repo"),
-            "key_ok": True,
-        }
+        origin = env.get("FAKE_ORIGIN", "airloom-origin")
+        commit = "previous-commit" if previous else "current-commit"
+        state = {"version": version, "commit": commit, "origin": origin}
+        remotes[origin] = {"url": url, "key_ok": True, "keys": keys, "gpg_verify": bool(keys)}
+        signers = json.loads((client / "signers.json").read_text()) if (client / "signers.json").exists() else {}
+        signers[commit] = signer
+        (client / "signers.json").write_text(json.dumps(signers))
     else:
         remote_name = args[-2]
         remote = remotes[remote_name]
@@ -1094,11 +1105,57 @@ else:
             gpg.write_text(
                 "#!/usr/bin/env python3\n"
                 "import sys\n"
+                "from pathlib import Path\n"
                 "if '--export' in sys.argv:\n"
-                "    sys.stdout.buffer.write(b'wrong-test-key')\n",
+                "    sys.stdout.buffer.write(b'wrong-test-key')\n"
+                "elif '--show-keys' in sys.argv:\n"
+                "    data = Path(sys.argv[-1]).read_bytes()\n"
+                "    fpr = {b'correct-test-key': 'CORRECTFPR', b'wrong-test-key': 'WRONGFPR'}[data]\n"
+                "    print(f'pub:u:255:22:X:1::::::scESC:\\nfpr:::::::::{fpr}:')\n",
                 encoding="utf-8",
             )
             gpg.chmod(0o755)
+            ostree = bin_dir / "ostree"
+            ostree.write_text(
+                textwrap.dedent(
+                    r'''#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+options = {a.split("=", 1)[0]: (a.split("=", 1)[1] if "=" in a else "") for a in args if a.startswith("--")}
+positional = [a for a in args if not a.startswith("--")]
+repo = Path(options["--repo"])
+client = repo.parent
+KEYS = {b"correct-test-key": "CORRECTFPR", b"wrong-test-key": "WRONGFPR"}
+if positional[:3] == ["remote", "gpg-list-keys", positional[2] if len(positional) > 2 else ""]:
+    remotes = json.loads((client / "remotes.json").read_text())
+    for key in remotes[positional[2]]["keys"]:
+        print(f"Key: {key}")
+elif positional[:2] == ["config", "get"]:
+    name = positional[2].split('"')[1]
+    remotes = json.loads((client / "remotes.json").read_text())
+    print("true" if remotes[name]["gpg_verify"] else "false")
+elif positional[0] == "init":
+    repo.mkdir(parents=True, exist_ok=True)
+elif positional[:2] == ["remote", "add"]:
+    (repo / "keyring").write_text(KEYS.get(Path(options["--gpg-import"]).read_bytes(), "UNKNOWN"))
+elif positional[0] == "pull-local":
+    assert "--gpg-verify" in options and "--commit-metadata-only" in options, args
+    source, commit = positional[1:3]
+    signers = json.loads((Path(source).parent / "signers.json").read_text())
+    if signers.get(commit) is None:
+        sys.exit(f"error: Commit {commit}: GPG verification enabled, but no signatures found")
+    if signers[commit] != (repo / "keyring").read_text():
+        sys.exit(f"error: Commit {commit}: Can't check signature: public key not found")
+else:
+    sys.exit(f"unsupported fake ostree command: {args}")
+'''
+                ),
+                encoding="utf-8",
+            )
+            ostree.chmod(0o755)
 
             env = dict(
                 os.environ,
@@ -1152,8 +1209,10 @@ else:
             if "install" in command
             and any(argument.endswith("Current.flatpak") for argument in command)
         )
-        self.assertTrue(
-            any(argument.startswith("--gpg-file=") for argument in current_bundle_install)
+        # Installed as a user installs a .flatpak: trusting the embedded key,
+        # which the gate then proves is ours (--gpg-file crashes 1.18.1).
+        self.assertFalse(
+            any(argument.startswith("--gpg-file") for command in commands for argument in command)
         )
         self.assertTrue(any("remote-add" in command for command in commands))
         self.assertTrue(any("remote-modify" in command for command in commands))
@@ -1165,8 +1224,8 @@ else:
         self.assertEqual(len(clients), 4)
         self.assertTrue(all("airloom-client-verify." in client for client in clients))
         for evidence in (
-            "bundle_verified origin=ai.stealthvision.Airloom-origin "
-            "url=https://ijbaird.github.io/airloom/repo version=1.2.3",
+            "bundle_verified origin=airloom-origin "
+            "url=https://ijbaird.github.io/airloom/repo key=CORRECTFPR version=1.2.3",
             "repository_install_verified origin=airloom-verify-current version=1.2.3",
             "upgrade_verified previous_version=1.2.2 version=1.2.3",
             "wrong_key_rejected remote=airloom-verify-wrong-key stage=install",
@@ -1190,10 +1249,31 @@ else:
         self.assertRegex(result.stderr, r"(?i)gpg|signature")
         self.assertNotIn("bundle_verified", summary)
 
-    def test_wrong_bundle_origin_is_rejected(self):
-        result, _, _ = self.run_client_gate(FAKE_ORIGIN="untrusted-origin")
+    def test_bundle_origin_trusting_an_extra_key_is_rejected(self):
+        result, _, summary = self.run_client_gate(FAKE_CURRENT_BUNDLE_SIGNATURE="extra-key")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("origin", result.stderr)
+        self.assertIn("trusts GPG keys CORRECTFPR OTHERFPR, not CORRECTFPR", result.stderr)
+        self.assertNotIn("bundle_verified", summary)
+
+    def test_bundle_commit_not_signed_by_the_expected_key_is_rejected(self):
+        result, _, summary = self.run_client_gate(
+            FAKE_CURRENT_BUNDLE_SIGNATURE="embedded-but-signed-by-other"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stderr, r"(?i)gpg|signature")
+        self.assertNotIn("bundle_verified", summary)
+
+    def test_origin_name_is_whatever_flatpak_assigns(self):
+        result, _, summary = self.run_client_gate(FAKE_ORIGIN="ai.stealthvision.Airloom-origin")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bundle_verified origin=ai.stealthvision.Airloom-origin ", summary)
+
+    def test_previous_release_must_update_from_the_published_repository(self):
+        result, _, _ = self.run_client_gate(
+            FAKE_PREVIOUS_BUNDLE_URL="https://example.invalid/other/repo"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation origin URL", result.stderr)
 
     def test_wrong_bundle_origin_url_is_rejected(self):
         result, _, _ = self.run_client_gate(
