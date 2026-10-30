@@ -27,6 +27,7 @@ RUNTIME_COMMIT = "b" * 64
 SDK_COMMIT = "c" * 64
 IMAGE_DIGEST = "sha256:" + "d" * 64
 IMAGE_REF = f"ghcr.io/flathub-infra/flatpak-github-actions@{IMAGE_DIGEST}"
+TURNSTYLE_SHA = "3805450be63b8c80577dc253e8c17e9132036df4"
 
 
 def run_git(root: Path, *args: str) -> None:
@@ -98,8 +99,10 @@ def check_release(root: Path, ref: str, *args: str) -> subprocess.CompletedProce
     )
 
 
-def provenance_command(output: Path, bundle: Path) -> list[str]:
-    return [
+def provenance_command(
+    output: Path, bundle: Path, *, repository_tar: Path | None = None
+) -> list[str]:
+    command = [
         str(RECORD_PROVENANCE),
         "--output",
         str(output),
@@ -128,6 +131,9 @@ def provenance_command(output: Path, bundle: Path) -> list[str]:
         "--bundle",
         str(bundle),
     ]
+    if repository_tar is not None:
+        command.extend(("--repository-tar", str(repository_tar)))
+    return command
 
 
 def job_block(source: str, job_name: str) -> str:
@@ -333,6 +339,33 @@ class ProvenanceTest(unittest.TestCase):
                 },
             )
 
+    def test_records_update_repository_tar_payload_checksum(self):
+        with tempfile.TemporaryDirectory(prefix="airloom-provenance-test-") as temporary:
+            root = Path(temporary)
+            output = root / "provenance.json"
+            bundle = root / "Airloom-x86_64.flatpak"
+            bundle.write_bytes(b"disposable fixture bundle\n")
+            repository_tar = root / "airloom-repo-x86_64.tar"
+            repository_tar.write_bytes(b"disposable repository tar payload\n")
+
+            result = subprocess.run(
+                provenance_command(output, bundle, repository_tar=repository_tar),
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            provenance = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                provenance["repository_checksums"],
+                {
+                    repository_tar.name: hashlib.sha256(
+                        b"disposable repository tar payload\n"
+                    ).hexdigest()
+                },
+            )
+
     def test_required_fields_fail_closed(self):
         required_options = (
             "--output",
@@ -448,6 +481,79 @@ class ProvenanceValidationTest(unittest.TestCase):
         result = self.check()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("checksum", result.stderr)
+
+
+class RepositoryTarProvenanceValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="airloom-repo-tar-check-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.bundle = self.root / "Airloom-x86_64.flatpak"
+        self.bundle.write_bytes(b"fixture bundle\n")
+        self.repository_tar = self.root / "airloom-repo-x86_64.tar"
+        self.repository_tar.write_bytes(b"original repository tar payload\n")
+        self.provenance = self.root / "Airloom-x86_64.provenance.json"
+        result = subprocess.run(
+            provenance_command(
+                self.provenance, self.bundle, repository_tar=self.repository_tar
+            ),
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def check(self, *, source_sha=SOURCE_SHA, provenance=None):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(CHECK_PROVENANCE),
+                "--source-sha",
+                source_sha,
+                "--provenance",
+                str(provenance or self.provenance),
+                "--repository-tar",
+                str(self.repository_tar),
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_matching_repository_tar_checksum_is_accepted(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_replaced_repository_tar_is_rejected_before_it_can_be_used(self):
+        self.repository_tar.write_bytes(b"replacement repository tar payload\n")
+        result = self.check()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repository tar checksum mismatch", result.stderr)
+
+    def test_repository_tar_cannot_use_provenance_for_a_different_payload(self):
+        other = self.root / "other"
+        other.mkdir()
+        other_tar = other / self.repository_tar.name
+        other_tar.write_bytes(b"different repository tar payload\n")
+        other_provenance = other / self.provenance.name
+        result = subprocess.run(
+            provenance_command(
+                other_provenance, self.bundle, repository_tar=other_tar
+            ),
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        result = self.check(provenance=other_provenance)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repository tar checksum mismatch", result.stderr)
+
+    def test_repository_tar_provenance_is_bound_to_the_source_commit(self):
+        result = self.check(source_sha="e" * 40)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("source_sha", result.stderr)
 
 
 class SigningKeyTest(unittest.TestCase):
@@ -1036,19 +1142,62 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                     job.index(f"name: {first_publication_step}"),
                 )
 
-    def test_one_synchronous_coordinator_owns_cross_tag_publication_serialization(self):
-        self.assertIn(
-            "    concurrency:\n"
-            "      group: stable-publication\n"
-            "      cancel-in-progress: false\n",
-            self.coordinator,
-        )
+    def test_turnstyle_preserves_pending_queue_order_across_publication_runs(self):
         self.assertIn("uses: ./.github/workflows/publish.yml", self.coordinator)
-        self.assertNotIn("concurrency:", self.release)
-        self.assertNotIn("concurrency:", self.publish)
-        combined = self.source + "\n" + self.publish_source
-        self.assertEqual(combined.count("group: stable-publication"), 1)
+        for job in (self.coordinator, self.release, self.publish):
+            self.assertNotIn("concurrency:", job)
+
+        queue = step_block(self.release, "Wait for prior stable publications")
+        self.assertIn(f"uses: softprops/turnstyle@{TURNSTYLE_SHA}", queue)
+        self.assertIn("actions: read", self.release)
+        self.assertIn("actions: read", self.coordinator)
+        self.assertNotIn("actions: read", self.publish)
+        self.assertIn("same-branch-only: false", queue)
+        self.assertNotIn("continue-after-seconds", queue)
+        self.assertNotIn("abort-after-seconds", queue)
+        first_step = re.search(r"(?m)^      - (.+)$", self.release)
+        self.assertIsNotNone(first_step)
+        self.assertEqual(first_step.group(1), "name: Wait for prior stable publications")
+        self.assertLess(
+            self.release.index("name: Wait for prior stable publications"),
+            self.release.index("name: Revalidate release eligibility"),
+        )
         self.assertIn("needs: [release]", self.publish)
+
+        # Exercise Turnstyle's oldest-run-first predecessor rule with A holding
+        # the publication critical section, B pending, then C arriving. Unlike
+        # native concurrency, no pending contender is cancelled or bypassed.
+        statuses = {"A": "in_progress", "B": "queued", "C": "queued"}
+        run_ids = {"A": 101, "B": 102, "C": 103}
+        channels = []
+
+        def enter_critical_section(run):
+            predecessors = [
+                candidate
+                for candidate, status in statuses.items()
+                if status in {"queued", "waiting", "in_progress"}
+                and run_ids[candidate] < run_ids[run]
+            ]
+            if predecessors:
+                return False
+            channels.extend((f"{run}:release", f"{run}:pages"))
+            statuses[run] = "in_progress"
+            return True
+
+        statuses["A"] = "waiting"
+        self.assertTrue(enter_critical_section("A"))
+        self.assertFalse(enter_critical_section("B"))
+        self.assertFalse(enter_critical_section("C"))
+        statuses["A"] = "completed"
+        self.assertTrue(enter_critical_section("B"))
+        self.assertFalse(enter_critical_section("C"))
+        statuses["B"] = "completed"
+        self.assertTrue(enter_critical_section("C"))
+        self.assertEqual(
+            channels,
+            ["A:release", "A:pages", "B:release", "B:pages", "C:release", "C:pages"],
+        )
+        self.assertNotIn("cancelled", statuses.values())
 
     def test_release_provenance_is_recorded_uploaded_and_attached(self):
         record = step_block(self.flatpak, "Record release provenance")
@@ -1063,12 +1212,20 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             "--tool-version",
             "--tool-ref",
             "--bundle",
+            "--repository-tar",
         ):
             with self.subTest(argument=argument):
                 self.assertIn(argument, record)
         self.assertIn("flatpak info", record)
         self.assertIn('--source-sha "${EXPECTED_SOURCE_SHA}"', record)
         self.assertNotIn('--source-sha "${GITHUB_SHA}"', record)
+        self.assertIn('airloom-repo-${arch}.tar', record)
+        archive = step_block(self.flatpak, "Archive update-repo artifact")
+        self.assertIn('tar -cf "airloom-repo-${{ matrix.arch }}.tar" repo', archive)
+        self.assertLess(
+            self.flatpak.index("name: Archive update-repo artifact"),
+            self.flatpak.index("name: Record release provenance"),
+        )
         self.assertIn("provenance.json", step_block(self.flatpak, "Upload workflow artifact"))
         self.assertIn(
             "provenance.json",
@@ -1095,6 +1252,29 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn('dist/Airloom-${arch}.flatpak', release_check)
         self.assertIn('dist/Airloom-${arch}.provenance.json', release_check)
 
+    def test_repository_tars_are_verified_before_extraction_or_key_use(self):
+        for job in (self.verify, self.publish):
+            with self.subTest(job=job):
+                check = step_block(job, "Verify downloaded artifact provenance")
+                self.assertIn("--repository-tar", check)
+                self.assertIn(
+                    'repos/airloom-repo-${repo_arch}/airloom-repo-${repo_arch}.tar',
+                    check,
+                )
+                self.assertLess(
+                    job.index("name: Verify downloaded artifact provenance"),
+                    job.index("name: Extract update-repo artifacts"),
+                )
+                key_step = (
+                    "Import production signing key"
+                    if job is self.publish
+                    else "Generate ephemeral signing key"
+                )
+                self.assertLess(
+                    job.index("name: Verify downloaded artifact provenance"),
+                    job.index(f"name: {key_step}"),
+                )
+
     def test_every_checkout_is_pinned_and_verified_against_one_source_commit(self):
         for job_name, job in (
             ("test", job_block(self.source, "test")),
@@ -1114,7 +1294,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("source_sha: ${{ steps.check.outputs.source_sha }}", self.eligibility)
 
     def test_publication_permissions_and_secrets_remain_channel_scoped(self):
-        self.assertIn("permissions:\n      contents: write", self.release)
+        self.assertIn("      contents: write", self.release)
         self.assertNotIn("pages: write", self.release)
         self.assertNotIn("id-token: write", self.release)
         self.assertNotIn("FLATPAK_GPG_PRIVATE_KEY", self.release)

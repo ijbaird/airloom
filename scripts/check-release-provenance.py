@@ -41,6 +41,14 @@ def load_provenance(path: Path, source_sha: str) -> dict:
             raise ProvenanceError(f"invalid bundle name in {path}: {name!r}")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ProvenanceError(f"invalid checksum for {name!r} in {path}")
+    repository_checksums = value.get("repository_checksums", {})
+    if not isinstance(repository_checksums, dict):
+        raise ProvenanceError(f"invalid repository checksums in {path}")
+    for name, digest in repository_checksums.items():
+        if not isinstance(name, str) or not name.endswith(".tar"):
+            raise ProvenanceError(f"invalid repository tar name in {path}: {name!r}")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ProvenanceError(f"invalid repository checksum for {name!r} in {path}")
     return value
 
 
@@ -84,12 +92,38 @@ def validate(args: argparse.Namespace) -> None:
                 f"bundle checksum mismatch for {bundle.name}: expected {expected!r}, got {actual}"
             )
 
+    repository_tar_paths = [Path(value) for value in args.repository_tar]
+    if len(set(repository_tar_paths)) != len(repository_tar_paths):
+        raise ProvenanceError("duplicate --repository-tar path")
+    for repository_tar in repository_tar_paths:
+        if not repository_tar.name.endswith(".tar"):
+            raise ProvenanceError(
+                f"repository tar name must end in .tar: {repository_tar}"
+            )
+        matches = [
+            record["repository_checksums"][repository_tar.name]
+            for record in records.values()
+            if repository_tar.name in record.get("repository_checksums", {})
+        ]
+        if len(matches) != 1:
+            raise ProvenanceError(
+                f"missing or ambiguous matching --provenance for repository tar: {repository_tar}"
+            )
+        expected = matches[0]
+        actual = bundle_digest(repository_tar)
+        if expected != actual:
+            raise ProvenanceError(
+                f"repository tar checksum mismatch for {repository_tar.name}: "
+                f"expected {expected!r}, got {actual}"
+            )
+
 
 def main() -> int:
     parser = ProvenanceArgumentParser(description=__doc__)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--provenance", action="append", required=True)
     parser.add_argument("--bundle", action="append", default=[])
+    parser.add_argument("--repository-tar", action="append", default=[])
     try:
         validate(parser.parse_args())
     except (ProvenanceError, OSError) as error:

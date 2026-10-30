@@ -30,8 +30,13 @@ jobs:
     name: Publish GitHub release
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
     steps:
+      - name: Wait for prior stable publications
+        uses: softprops/turnstyle@3805450be63b8c80577dc253e8c17e9132036df4 # v3.3.3
+        with:
+          same-branch-only: false
       - name: Checkout release history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -142,8 +147,11 @@ jobs:
         run: |
           set -euo pipefail
           args=()
-          for arch in x86_64 aarch64; do
-            args+=(--provenance "repos/airloom-repo-${arch}/Airloom-${arch}.provenance.json")
+          for repo_arch in x86_64 aarch64; do
+            args+=(
+              --provenance "repos/airloom-repo-${repo_arch}/Airloom-${repo_arch}.provenance.json"
+              --repository-tar "repos/airloom-repo-${repo_arch}/airloom-repo-${repo_arch}.tar"
+            )
           done
           python3 scripts/check-release-provenance.py \
             --source-sha "${EXPECTED_SOURCE_SHA}" "${args[@]}"
