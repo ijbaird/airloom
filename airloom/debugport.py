@@ -213,6 +213,68 @@ class DebugPort:
         return out
 
 
+# -- Dev-only fakes ---------------------------------------------------------
+# These live here so release bundles, which strip this module, cannot
+# activate them; app.py only consults them when debug mode is on.
+
+FAKE_PURPLEAIR_ENV = "AIRLOOM_DEBUG_FAKE_PURPLEAIR"
+CAPTURE_NOTIFICATIONS_ENV = "AIRLOOM_DEBUG_CAPTURE_NOTIFICATIONS"
+
+
+class FakePurpleAirClient:
+    """A PurpleAirClient stand-in fed from a JSON fixture.
+
+    The fixture (``{"fail": bool, "rows": [...]}``) is re-read on every call so
+    a harness can switch to an outage mid-run. Each row's ``age_s`` becomes
+    ``last_seen`` relative to now; rows are filtered like the API filters
+    them (bounds, ``location_type``, ``show_only``).
+    """
+
+    def __init__(self, fixture_path: str, clock: Callable[[], float] | None = None) -> None:
+        import time
+
+        self._path = fixture_path
+        self._clock = clock or time.time
+
+    def fetch_rows(self, bounds=None, show_only=None, location_filter="outdoor",
+                   fields=(), modified_since=None):
+        from .purpleair import FetchResult, PurpleAirError
+
+        with open(self._path, encoding="utf-8") as handle:
+            fixture = json.load(handle)
+        if fixture.get("fail"):
+            raise PurpleAirError("Fake PurpleAir outage.")
+        now = int(self._clock())
+        wanted = {int(value) for value in show_only} if show_only else None
+        rows = []
+        for source in fixture.get("rows", []):
+            row = dict(source)
+            row["last_seen"] = now - int(row.pop("age_s", 0))
+            if wanted is not None:
+                if row["sensor_index"] not in wanted:
+                    continue
+            else:
+                if bounds is not None and not (
+                    bounds.south <= row["latitude"] <= bounds.north
+                    and bounds.west <= row["longitude"] <= bounds.east
+                ):
+                    continue
+                if location_filter == "outdoor" and row.get("location_type") != 0:
+                    continue
+                if location_filter == "indoor" and row.get("location_type") != 1:
+                    continue
+            rows.append(row)
+        return FetchResult(rows=rows, time_stamp=now)
+
+
+def debug_purpleair_factory(environ) -> Callable[[str], FakePurpleAirClient] | None:
+    """Return a client factory for the fixture named in `environ`, if any."""
+    path = environ.get(FAKE_PURPLEAIR_ENV)
+    if not path:
+        return None
+    return lambda _api_key: FakePurpleAirClient(path)
+
+
 # -- Command validation -----------------------------------------------------
 # GTK-free by construction: each validator only reads the request dict and
 # returns either (normalized_params, None) or (None, error_message). app.py's
@@ -270,6 +332,7 @@ _VALIDATORS: dict[str, Callable[[dict], "tuple[dict | None, str | None]"]] = {
     "version": _validate_no_params,
     "state": _validate_no_params,
     "quit": _validate_no_params,
+    "notifications": _validate_no_params,
     "tap": _validate_tap,
     "search": _validate_search,
     "key": _validate_key,

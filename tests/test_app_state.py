@@ -4,6 +4,7 @@ import errno
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from copy import deepcopy
@@ -242,6 +243,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app.title = None
         app._cache_error = None
         app._shell_recovery_notice = None
+        app._captured_notifications = None
         app.sent = []
         app.launched = []
         app.trends = []
@@ -896,6 +898,62 @@ class ShellRecoveryTest(ApplicationAdapterTestCase):
         self.assertEqual(statuses[-1]["status"], "error")
         self.assertIn("reloaded", statuses[-1]["message"].lower())
         self.assertTrue(statuses[-1]["can_reload"])
+
+
+class DebugFakeWiringTest(ApplicationAdapterTestCase):
+    def setUp(self):
+        original = app_module._purpleair_client_factory
+        self.addCleanup(setattr, app_module, "_purpleair_client_factory", original)
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.fixture = Path(self._tempdir.name) / "purpleair.json"
+        self.fixture.write_text('{"rows": []}', encoding="utf-8")
+        self.environ = {
+            "AIRLOOM_DEBUG_FAKE_PURPLEAIR": str(self.fixture),
+            "AIRLOOM_DEBUG_CAPTURE_NOTIFICATIONS": "1",
+        }
+
+    def test_fakes_stay_inert_outside_debug_mode(self):
+        app = self.make_app()
+        app.debug_mode = False
+        app._install_debug_fakes(self.environ)
+        self.assertIsNone(app_module._purpleair_client_factory)
+        self.assertIsInstance(app_module._new_purpleair_client("key"), app_module.PurpleAirClient)
+        self.assertIsNone(app._captured_notifications)
+
+    def test_fakes_stay_inert_when_the_debug_module_is_stripped(self):
+        app = self.make_app()
+        app.debug_mode = True
+        with mock.patch.object(app_module, "debug_purpleair_factory", None):
+            app._install_debug_fakes(self.environ)
+        self.assertIsNone(app_module._purpleair_client_factory)
+        self.assertIsInstance(app_module._new_purpleair_client("key"), app_module.PurpleAirClient)
+
+    def test_debug_mode_installs_the_fixture_client_and_notification_capture(self):
+        app = self.make_app()
+        app.debug_mode = True
+        app._install_debug_fakes(self.environ)
+        client = app_module._new_purpleair_client("fake-key")
+        self.assertEqual(type(client).__name__, "FakePurpleAirClient")
+        self.assertEqual(app._captured_notifications, [])
+
+    def test_captured_alerts_never_reach_libnotify(self):
+        app = self.make_app(store=FakeStore(favorites=[1], alert_threshold=101))
+        app._captured_notifications = []
+        app.sensors = [make_sensor(1, aqi=180, last_seen=int(time.time()) - 60)]
+        app._area_ids = {1}
+        notify = SimpleNamespace(Notification=SimpleNamespace(new=mock.Mock(side_effect=AssertionError)))
+        with mock.patch.object(app_module, "Notify", notify):
+            app._check_alerts()
+        self.assertEqual([item["sensor_id"] for item in app._captured_notifications], [1])
+        self.assertIn("AQI is now 180", app._captured_notifications[0]["body"])
+
+    def test_notifications_debug_command_reports_captures(self):
+        app = self.make_app()
+        app._captured_notifications = [{"sensor_id": 1, "title": "t", "body": "b"}]
+        replies = []
+        app._handle_debug_command({"cmd": "notifications"}, replies.append)
+        self.assertEqual(replies, [{"ok": True, "result": [{"sensor_id": 1, "title": "t", "body": "b"}]}])
 
 
 class FakeGtkSettings:

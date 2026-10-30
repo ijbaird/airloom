@@ -42,10 +42,17 @@ from .controller import ApplicationController, RefreshRequest
 # Release bundles strip airloom/debugport.py (see packaging/*.yml), so debug
 # support degrades to "absent" rather than erroring when the module is gone.
 try:
-    from .debugport import DebugPort, validate_command
+    from .debugport import (
+        CAPTURE_NOTIFICATIONS_ENV,
+        DebugPort,
+        debug_purpleair_factory,
+        validate_command,
+    )
 except ImportError:  # pragma: no cover — only true in stripped release builds
     DebugPort = None
     validate_command = None
+    debug_purpleair_factory = None
+    CAPTURE_NOTIFICATIONS_ENV = None
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
 from .geography import Bounds, bounds_around, bounds_contains, split_bounds
@@ -236,6 +243,17 @@ def _age_label(seconds: float) -> str:
     return "just now" if seconds < 90 else f"{int(seconds // 60)} min ago"
 
 
+# Debug launches may swap in debugport's fixture client (see
+# _install_debug_fakes); release builds always use the real client.
+_purpleair_client_factory = None
+
+
+def _new_purpleair_client(api_key: str):
+    if _purpleair_client_factory is not None:
+        return _purpleair_client_factory(api_key)
+    return PurpleAirClient(api_key)
+
+
 def _fetch_readings(
     config: dict,
     cache: SensorCache | None,
@@ -258,7 +276,7 @@ def _fetch_readings(
 
     try:
         if config.get("api_key"):
-            client = PurpleAirClient(config["api_key"])
+            client = _new_purpleair_client(config["api_key"])
             try:
                 cached_favorite_ids: set[int] = set()
                 if cache is None:
@@ -435,6 +453,8 @@ class AirloomApplication(Adw.Application):
         # `git describe` once at startup, not per `version` call — see
         # _compute_build_id.
         self._debug_build_id: str | None = self._compute_build_id() if self.debug_mode else None
+        self._captured_notifications: list[dict] | None = None
+        self._install_debug_fakes(os.environ)
         self.store = Store()
         self.controller = ApplicationController(self.store.data)
         self.requests = RequestRegistry()
@@ -1659,7 +1679,7 @@ class AirloomApplication(Adw.Application):
                     and current_sensor is not None
                     and current_sensor.last_seen == reading_last_seen
                 ):
-                    result = PurpleAirClient(api_key).fetch_rows(
+                    result = _new_purpleair_client(api_key).fetch_rows(
                         show_only=[sensor_id], fields=TREND_FETCH_FIELDS
                     )
                     if result.rows:
@@ -1774,6 +1794,17 @@ class AirloomApplication(Adw.Application):
         }
         self._send("sensors", payload)
 
+    def _install_debug_fakes(self, environ) -> None:
+        """Let debug launches use fixture PurpleAir data and capture alerts."""
+        global _purpleair_client_factory
+        if not self.debug_mode or debug_purpleair_factory is None:
+            return
+        factory = debug_purpleair_factory(environ)
+        if factory is not None:
+            _purpleair_client_factory = factory
+        if environ.get(CAPTURE_NOTIFICATIONS_ENV) == "1":
+            self._captured_notifications = []
+
     def _check_alerts(self) -> None:
         try:
             threshold = int(self.store.data.get("alert_threshold", 101))
@@ -1797,11 +1828,14 @@ class AirloomApplication(Adw.Application):
             origin=self.last_origin,
         )
         for sensor in alerted:
-            notification = Notify.Notification.new(
-                f"Air quality alert · {sensor.name[:80]}",
-                f"AQI is now {sensor.aqi}. Open Airloom for health guidance.",
-                APP_ID,
-            )
+            title = f"Air quality alert · {sensor.name[:80]}"
+            body = f"AQI is now {sensor.aqi}. Open Airloom for health guidance."
+            if self._captured_notifications is not None:
+                self._captured_notifications.append(
+                    {"sensor_id": sensor.sensor_id, "title": title, "body": body}
+                )
+                continue
+            notification = Notify.Notification.new(title, body, APP_ID)
             try:
                 notification.show()
             except GLib.Error:
@@ -1891,6 +1925,8 @@ class AirloomApplication(Adw.Application):
             self._debug_screenshot(params, reply)
         elif cmd == "quit":
             self._debug_quit(reply)
+        elif cmd == "notifications":
+            reply({"ok": True, "result": list(self._captured_notifications or [])})
 
     def _debug_pinch(self, message: dict, reply) -> None:
         phase = message.get("phase")

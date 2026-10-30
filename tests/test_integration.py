@@ -33,10 +33,25 @@ from airloom.requests import RequestRegistry
 PROJECT = Path(__file__).resolve().parent.parent
 SCRIPT = PROJECT / "scripts" / "test-ui-regression"
 
-REQUIRED_SCENARIOS = {
-    "labels", "away-refresh", "save", "search", "motion", "focus", "filters",
-    "trend-retry", "reduced-motion", "shell-recovery", "layouts", "stripped-debug",
+# Every live scenario the integration plan and its reviews require, mapped to
+# the script scenario that covers it. The script must list exactly these.
+REQUIRED_COVERAGE = {
+    "demo/limited-coverage/stale labels": "labels",
+    "away-from-home refresh": "away-refresh",
+    "save success and failure": "save",
+    "delayed, out-of-order, and canceled search": "search",
+    "interrupted fly/zoom/pinch": "motion",
+    "keyboard focus restoration": "focus",
+    "filter persistence": "filters",
+    "trend retry": "trend-retry",
+    "renderer crash recovery": "shell-recovery",
+    "system reduced-motion preference": "reduced-motion",
+    "demo/expired/fresh alert behavior": "alerts",
+    "filtered cached fallback with provenance": "cache-fallback",
+    "popup/search/narrow layouts at all scales and preview actions": "layouts",
+    "stripped debug module on a private bus": "stripped-debug",
 }
+REQUIRED_SCENARIOS = set(REQUIRED_COVERAGE.values())
 
 
 def load_script():
@@ -410,6 +425,111 @@ class GeocoderReadinessTest(unittest.TestCase):
         self.assertIsInstance(outcomes["first"][0], geocode.GeocodeError)
         self.assertEqual(outcomes["second"], [[Place("Recovered place", 1.0, 2.0)]])
         self.assertEqual(len(calls), 2)
+
+
+class CachedFallbackAlertIntegrationTest(unittest.TestCase):
+    """Fixture PurpleAir through the real fetch, cache, filter, publication
+    and alert path: demo and expired observations never alert, a fresh
+    favorite alerts once, and stale cached fallback keeps filtering and
+    provenance without re-alerting."""
+
+    def setUp(self):
+        from airloom import app as app_module
+        from airloom.cache import SensorCache
+        from airloom.debugport import FakePurpleAirClient
+        from airloom.store import Store
+        from tests.test_app_state import ApplicationAdapterTestCase
+
+        self.app_module = app_module
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        root = Path(self._tempdir.name)
+        self.fixture = root / "purpleair.json"
+        self.store = Store(root / "config.json")
+        self.store.data.update({
+            "api_key": "fake-key", "latitude": 45.0, "longitude": -122.0,
+            "favorites": [1, 2, 3, 900000], "alert_threshold": 101,
+            "alert_states": {"900000": False}, "location_filter": "outdoor",
+        })
+        self.store.save()
+        self.cache = SensorCache(root / "cache.db")
+        self.addCleanup(self.cache.close)
+        original = app_module._purpleair_client_factory
+        self.addCleanup(setattr, app_module, "_purpleair_client_factory", original)
+        app_module._purpleair_client_factory = lambda _key: FakePurpleAirClient(str(self.fixture))
+        helper = ApplicationAdapterTestCase()
+        self.app = helper.make_app(store=self.store, cache=self.cache)
+        self.app._captured_notifications = []
+
+    def write_fixture(self, *, fail=False):
+        def row(sensor_id, location_type, age_s, pm):
+            return {"sensor_index": sensor_id, "name": f"Fixture {sensor_id}", "latitude": 45.001,
+                    "longitude": -122.001, "location_type": location_type, "age_s": age_s,
+                    "humidity": 50, "temperature": 70, "pm1.0": 5, "pm2.5_cf_1": pm,
+                    "pm10.0": 9, "confidence": 100}
+        rows = [row(1, 0, 30, 150),         # fresh outdoor favorite above threshold
+                row(2, 0, 3 * 3600, 150),   # expired outdoor favorite above threshold
+                row(3, 1, 30, 150),         # fresh indoor favorite above threshold
+                row(4, 0, 30, 5)]           # ordinary clean outdoor sensor
+        self.fixture.write_text(json.dumps({"fail": fail, "rows": rows}), encoding="utf-8")
+
+    def set_filter(self, value):
+        candidate = dict(self.store.data, location_filter=value)
+        self.store.apply(candidate)
+        self.app.controller.set_config(self.store.data)
+
+    def refresh(self):
+        request = self.app.controller.begin_refresh(force=True)
+        outcome = self.app_module._fetch_readings(
+            dict(self.store.data), self.cache, request,
+            self.app_module.cap_bounds(request.bounds, request.center), 120.0)
+        self.app._finish_refresh(outcome)
+        return [p for e, p in self.app.sent if e == "sensors"][-1]
+
+    def alerted(self):
+        return [item["sensor_id"] for item in self.app._captured_notifications]
+
+    def persisted_states(self):
+        return json.loads((Path(self._tempdir.name) / "config.json").read_text())["alert_states"]
+
+    def test_fixture_fetch_cache_fallback_filters_and_alerts(self):
+        # Outage with an empty cache: demo fallback must neither alert nor
+        # touch alert state, even for demo favorites above the threshold.
+        self.write_fixture(fail=True)
+        demo = self.refresh()
+        self.assertEqual(demo["source"], "Demo data")
+        self.assertTrue(any(s["aqi"] >= 101 for s in demo["items"]))
+        self.assertEqual(self.alerted(), [])
+        self.assertEqual(self.persisted_states(), {"900000": False})
+
+        # Live: only the fresh favorite alerts; the expired one does not.
+        self.write_fixture()
+        live = self.refresh()
+        self.assertEqual(live["source"], "PurpleAir live")
+        self.assertEqual(sorted(s["id"] for s in live["items"]), [1, 2, 4])
+        self.assertEqual(self.alerted(), [1])
+        self.set_filter("both")
+        self.refresh()
+        self.assertEqual(self.alerted(), [1, 3])
+        self.assertEqual(self.persisted_states(), {"900000": False, "1": True, "3": True})
+
+        # Outage after a populated cache: stale cached readings, still
+        # filtered per the preference, labeled stale, and no repeat alerts.
+        self.write_fixture(fail=True)
+        self.set_filter("outdoor")
+        stale = self.refresh()
+        self.assertEqual(stale["source"], "PurpleAir · cached")
+        self.assertIs(stale["stale"], True)
+        self.assertEqual(sorted(s["id"] for s in stale["items"]), [1, 2, 4])
+        self.assertTrue(all(s["delivery"] == "cache" and s["origin"] == "live" for s in stale["items"]))
+        self.set_filter("indoor")
+        indoor = self.refresh()
+        self.assertEqual([s["id"] for s in indoor["items"]], [3])
+        self.assertIs(indoor["stale"], True)
+        self.assertEqual(self.alerted(), [1, 3])
+        self.assertEqual(self.persisted_states(), {"900000": False, "1": True, "3": True})
+        errors = [p["message"] for e, p in self.app.sent if e == "error"]
+        self.assertTrue(any("Showing cached readings" in message for message in errors))
 
 
 if __name__ == "__main__":

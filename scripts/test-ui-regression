@@ -632,6 +632,161 @@ def scenario_reduced_motion(root: Path, geocoder: GeocoderStub):
         app.stop()
 
 
+# ------------------------------------------------- fixture PurpleAir data
+
+DEAD_PROXY_ENV = {name: "http://127.0.0.1:9" for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")}
+DEAD_PROXY_ENV.update(no_proxy="127.0.0.1,localhost", NO_PROXY="127.0.0.1,localhost")
+FIXTURE_FAVORITES = [1, 2, 3, *range(900000, 900018)]  # fixture ids plus every demo id
+
+SENSOR_SPY_JS = """
+(() => {
+  if (!window.__sensorSpy) {
+    window.__sensorSpy = { count: 0, last: null };
+    const receive = window.Airloom.receive;
+    window.Airloom.receive = (event, payload) => {
+      if (event === "sensors") { window.__sensorSpy.count += 1; window.__sensorSpy.last = payload; }
+      return receive(event, payload);
+    };
+  }
+  return window.__sensorSpy.count;
+})()
+"""
+
+PUBLICATION_JS = """
+(() => {
+  const last = window.__sensorSpy.last;
+  const label = document.querySelector("#summary-provenance");
+  return last && { count: window.__sensorSpy.count, source: last.source, stale: last.stale === true,
+    ids: last.items.map((s) => s.id).sort((a, b) => a - b),
+    deliveries: [...new Set(last.items.map((s) => s.delivery))],
+    maxAqi: Math.max(...last.items.map((s) => s.aqi ?? 0)),
+    label: label.hidden ? "" : label.textContent,
+    toasts: [...document.querySelectorAll("#toast-stack .toast")].map((t) => t.textContent) };
+})()
+"""
+
+
+def fixture_rows() -> list[dict]:
+    def row(sensor_id, location_type, age_s, pm):
+        return {"sensor_index": sensor_id, "name": f"Fixture {sensor_id}",
+                "latitude": HOME["latitude"] + 0.004 * sensor_id, "longitude": HOME["longitude"] + 0.004,
+                "location_type": location_type, "age_s": age_s, "humidity": 50, "temperature": 70,
+                "pm1.0": 5, "pm2.5_cf_1": pm, "pm10.0": 9, "confidence": 100}
+    return [row(1, 0, 30, 150),        # fresh outdoor favorite above the threshold
+            row(2, 0, 3 * 3600, 150),  # expired outdoor favorite above the threshold
+            row(3, 1, 30, 150),        # fresh indoor favorite above the threshold
+            row(4, 0, 30, 5)]          # clean outdoor sensor
+
+
+class FixtureApp(DebugApp):
+    """A debug instance fed by debugport's fixture PurpleAir client, with
+    desktop notifications captured instead of shown."""
+
+    def __init__(self, root: Path, name: str, geocoder: GeocoderStub, *, fail: bool):
+        self.fixture = root / f"{name}-purpleair.json"
+        self.set_fixture(fail=fail)
+        super().__init__(root, name, geocoder.url, config={
+            "api_key": "fixture-key", "favorites": FIXTURE_FAVORITES, "alert_threshold": 101,
+            "alert_states": {"900000": False}, "location_filter": "outdoor",
+        }, extra_env={"AIRLOOM_DEBUG_FAKE_PURPLEAIR": str(self.fixture),
+                      "AIRLOOM_DEBUG_CAPTURE_NOTIFICATIONS": "1",
+                      # Fail closed: if the fixture seam were ever inactive, the
+                      # placeholder key must not reach live PurpleAir.
+                      **DEAD_PROXY_ENV})
+
+    def set_fixture(self, *, fail: bool):
+        self.fixture.write_text(json.dumps({"fail": fail, "rows": fixture_rows()}), encoding="utf-8")
+
+    def publish(self, action_js: str, what: str) -> dict:
+        before = eval_js(self.sock_path, SENSOR_SPY_JS)
+        eval_js(self.sock_path, action_js)
+        wait_for(lambda: eval_js(self.sock_path, SENSOR_SPY_JS) > before
+                 and request(self.sock_path, "state") is not None, 20, what)
+        time.sleep(0.5)  # let alert persistence and toasts settle
+        return eval_js(self.sock_path, PUBLICATION_JS)
+
+    def notifications(self) -> list[int]:
+        return [item["sensor_id"] for item in request(self.sock_path, "notifications")]
+
+    def alert_states(self) -> dict:
+        return json.loads((self.config_dir / "config.json").read_text(encoding="utf-8")).get("alert_states")
+
+    def set_filter(self, value: str, what: str) -> dict:
+        for _ in range(3):
+            if request(self.sock_path, "state")["location_filter"] == value:
+                break
+            result = self.publish("document.querySelector('#filter-chip').click()", what)
+        return result
+
+
+REFRESH_JS = "document.querySelector('#footer-refresh').click()"
+
+
+def scenario_alerts(root: Path, geocoder: GeocoderStub):
+    print("— demo, expired, and fresh observations through the alert path —")
+    app = FixtureApp(root, "alerts", geocoder, fail=True)
+    try:
+        app.start().wait_ready()
+        sock = app.sock_path
+        eval_js(sock, SENSOR_SPY_JS)
+        demo = app.publish(REFRESH_JS, "the demo fallback")
+        check(demo["source"] == "Demo data" and demo["label"] == "Demo data",
+              "an outage with an empty cache falls back to labeled demo data")
+        check(demo["maxAqi"] >= 101, f"demo favorites include readings above the threshold ({demo['maxAqi']})")
+        check(app.notifications() == [], "demo readings raise no alert")
+        check(app.alert_states() == {"900000": False}, "demo readings leave alert state untouched")
+
+        app.set_fixture(fail=False)
+        live = app.publish(REFRESH_JS, "live fixture readings")
+        check(live["source"] == "PurpleAir live" and live["ids"] == [1, 2, 4],
+              f"live outdoor readings are published ({live['source']}, {live['ids']})")
+        check(app.notifications() == [1], f"only the fresh favorite alerts ({app.notifications()})")
+        live = app.set_filter("both", "all sensors")
+        check(live["ids"] == [1, 2, 3, 4], f"the indoor favorite appears with All sensors ({live['ids']})")
+        check(app.notifications() == [1, 3], f"the fresh indoor favorite alerts once ({app.notifications()})")
+        app.publish(REFRESH_JS, "a repeat refresh")
+        check(app.notifications() == [1, 3], "a repeat refresh does not alert again")
+        check(app.alert_states() == {"900000": False, "1": True, "3": True},
+              f"alert state records fresh favorites only ({app.alert_states()})")
+    finally:
+        app.stop()
+
+
+def scenario_cache_fallback(root: Path, geocoder: GeocoderStub):
+    print("— populated cache serves filtered, labeled stale readings during an outage —")
+    app = FixtureApp(root, "cache-fallback", geocoder, fail=False)
+    try:
+        app.start().wait_ready()
+        sock = app.sock_path
+        eval_js(sock, SENSOR_SPY_JS)
+        app.publish(REFRESH_JS, "live fixture readings")
+        live = app.set_filter("both", "every fixture sensor cached")
+        check(live["ids"] == [1, 2, 3, 4] and live["label"] == "", "live readings carry no fallback label")
+        alerted = app.notifications()
+
+        app.set_fixture(fail=True)
+        # Within the refresh TTL a filter change is served from the cache
+        # without a request; the forced Refresh then meets the outage.
+        app.set_filter("outdoor", "outdoor readings")
+        stale = app.publish(REFRESH_JS, "stale outdoor readings")
+        check(stale["source"] == "PurpleAir · cached" and stale["stale"],
+              f"the outage serves cached readings ({stale['source']})")
+        check(stale["ids"] == [1, 2, 4], f"cached fallback still applies the Outdoor filter ({stale['ids']})")
+        check(stale["deliveries"] == ["cache"], "every fallback reading is marked as cache delivery")
+        check(stale["label"] == "Stale cached data", f"the summary is labeled stale ({stale['label']!r})")
+        check(any("Showing cached readings" in toast for toast in stale["toasts"]),
+              "the outage is explained to the user")
+        app.set_filter("indoor", "indoor readings")
+        stale = app.publish(REFRESH_JS, "stale indoor readings")
+        check(stale["ids"] == [3] and stale["label"] == "Stale cached data",
+              f"switching to Indoor filters the cached fallback ({stale['ids']})")
+        check(app.notifications() == alerted, "cached fallback raises no repeat alerts")
+        check(app.alert_states() == {"900000": False, "1": True, "3": True},
+              f"alert state survives the fallback ({app.alert_states()})")
+    finally:
+        app.stop()
+
+
 def make_stripped_tree(destination: Path, source: Path = PROJECT) -> Path:
     """Copy the runnable tree the way release bundles ship it: no debug port."""
     shutil.copytree(source / "airloom", destination / "airloom",
@@ -975,6 +1130,8 @@ APP_SCENARIOS = {
 STANDALONE_SCENARIOS = {
     "layouts": lambda root, _geocoder: scenario_layouts(root),
     "reduced-motion": scenario_reduced_motion,
+    "alerts": scenario_alerts,
+    "cache-fallback": scenario_cache_fallback,
     "stripped-debug": scenario_stripped_debug,
 }
 ALL_SCENARIOS = [*APP_SCENARIOS, *STANDALONE_SCENARIOS]
