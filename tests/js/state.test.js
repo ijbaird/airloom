@@ -275,7 +275,7 @@ function loadApp({ reducedMotion = false, preview = false } = {}) {
     return element;
   };
   const settingsForm = elements.get("settings-form");
-  for (const name of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes", "home_lat", "home_lon", "location_name"]) {
+  for (const name of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes", "interface_scale", "home_lat", "home_lon", "location_name"]) {
     settingsForm.elements[name] = new FakeElement("input");
   }
   for (const name of ["api_key", "clear_api_key", "confidence_filter"]) {
@@ -1453,6 +1453,47 @@ test("a Save acknowledgment arriving after Preferences closed is ignored", () =>
   app.context.Airloom.receive("settings-save-result", { request_id: requestId, status: "success", error: null });
 
   assert.equal(app.elements.get("settings-dialog").open, true);
+});
+
+test("Preferences offers a labeled Interface size selector with three sizes", () => {
+  const html = fs.readFileSync(indexPath, "utf8");
+  const label = html.match(/<label[^>]*>\s*<span>Interface size<\/span>\s*<select name="interface_scale"[^>]*>([\s\S]*?)<\/select>/);
+  assert.ok(label, "an Interface size label must wrap the interface_scale select");
+  const options = [...label[1].matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g)].map((match) => [match[1], match[2]]);
+  assert.deepEqual(options, [["1", "100%"], ["1.25", "125%"], ["1.5", "150%"]]);
+});
+
+test("desktop Save round-trips the chosen interface size with its request id", () => {
+  const app = loadApp();
+  configureMap(app, { interface_scale: 1.25 });
+  openSettings(app, { interface_scale: 1.25 });
+  const form = app.elements.get("settings-form");
+  assert.equal(form.elements.interface_scale.value, "1.25");
+
+  form.elements.interface_scale.value = "1.5";
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+
+  const request = app.messages.find((message) => message.action === "save-settings");
+  assert.equal(request.interface_scale, 1.5);
+  assert.equal(Number.isInteger(request.request_id), true);
+  app.context.Airloom.receive("config", { interface_scale: 1.5 });
+  app.context.Airloom.receive("settings-save-result", { request_id: request.request_id, status: "success", error: null });
+  assert.equal(app.elements.get("settings-dialog").open, false);
+  assert.equal(app.document.documentElement.dataset.interfaceScale, "1.5");
+});
+
+test("preview Interface size applies through CSS without the bridge", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  assert.equal(form.elements.interface_scale.value, "1");
+  form.elements.interface_scale.value = "1.25";
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1.25");
+  assert.equal(app.elements.get("settings-dialog").open, false);
 });
 
 test("preview demo Now point equals the displayed current AQI", () => {

@@ -928,6 +928,53 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(Store(path).data["interface_scale"], scale)
                 self.assertEqual(app.webview.zoom_level, scale)
 
+    def test_save_accepts_interface_size_numbers_from_the_selector(self):
+        # JSON turns the selector's 100% (Number 1) into a Python int.
+        for sent, expected in ((1, 1.0), (1.25, 1.25), (1.5, 1.5), ("1.25", 1.25)):
+            with self.subTest(sent=sent), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.json"
+                store = Store(path)
+                store.data["interface_scale"] = 1.5 if expected != 1.5 else 1.0
+                store.save()
+                app = self.make_app(store=store)
+                app.webview = FakeWebView(store.data["interface_scale"])
+                app._arm_auto_refresh = lambda: None
+                app.refresh = lambda *args, **kwargs: None
+
+                app._on_script_message(None, ScriptMessage({
+                    "action": "save-settings", "request_id": 4,
+                    "radius_km": 22, "heatmap_threshold_km": 40, "alert_threshold": 101,
+                    "refresh_minutes": 2, "temperature_unit": "F", "home_mode": "auto",
+                    "interface_scale": sent,
+                }))
+
+                results = [p for e, p in app.sent if e == "settings-save-result"]
+                self.assertEqual(results[-1]["status"], "success")
+                self.assertEqual(Store(path).data["interface_scale"], expected)
+                self.assertEqual(app.webview.zoom_level, expected)
+
+    def test_save_rejects_unsupported_interface_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            store.data["interface_scale"] = 1.25
+            store.save()
+            app = self.make_app(store=store)
+            app.webview = FakeWebView(1.25)
+            app._arm_auto_refresh = lambda: None
+            app.refresh = lambda *args, **kwargs: None
+
+            app._on_script_message(None, ScriptMessage({
+                "action": "save-settings", "request_id": 5,
+                "radius_km": 22, "heatmap_threshold_km": 40, "alert_threshold": 101,
+                "refresh_minutes": 2, "temperature_unit": "F", "home_mode": "auto",
+                "interface_scale": 3,
+            }))
+
+            results = [p for e, p in app.sent if e == "settings-save-result"]
+            self.assertEqual(results[-1]["status"], "error")
+            self.assertEqual(Store(path).data["interface_scale"], 1.25)
+
     def test_native_pinch_uses_document_coordinates_at_every_interface_scale(self):
         cases = (
             (1.0, 40.0, 60.0),

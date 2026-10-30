@@ -1106,6 +1106,8 @@
     // no confidence_filter key — matching the Python default of on.
     form.elements.confidence_filter.checked = config.confidence_filter !== false;
     form.elements.temperature_unit.value = config.temperature_unit || "F";
+    const scale = Number(config.interface_scale);
+    form.elements.interface_scale.value = String([1, 1.25, 1.5].includes(scale) ? scale : 1);
     form.elements.home_mode.value = config.home_mode || "auto";
     $("#home-place-row").hidden = form.elements.home_mode.value !== "fixed";
     form.elements.home_lat.value = config.latitude;
@@ -1536,6 +1538,7 @@
       confidence_filter: form.get("confidence_filter") === "on",
       home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
       radius_km: form.get("radius_km"), heatmap_threshold_km: form.get("heatmap_threshold_km"), alert_threshold: form.get("alert_threshold"), refresh_minutes: form.get("refresh_minutes"), temperature_unit: form.get("temperature_unit"),
+      interface_scale: Number(form.get("interface_scale")),
     });
   });
   new ResizeObserver(() => renderMap()).observe($("#map-panel"));

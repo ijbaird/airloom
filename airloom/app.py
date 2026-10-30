@@ -1315,10 +1315,14 @@ class AirloomApplication(Adw.Application):
                 "home_mode": home_mode,
                 "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
                 "confidence_filter": bool(message.get("confidence_filter")),
-                "interface_scale": message.get(
-                    "interface_scale", self.store.data.get("interface_scale", 1.0)
-                ),
+                "interface_scale": self.store.data.get("interface_scale", 1.0),
             }
+            if "interface_scale" in message:
+                # The selector's 100% arrives as JSON integer 1.
+                scale = message["interface_scale"]
+                if isinstance(scale, bool) or float(scale) not in (1.0, 1.25, 1.5):
+                    raise ValueError("Interface size must be 100%, 125%, or 150%.")
+                updates["interface_scale"] = float(scale)
             minutes = int(message["refresh_minutes"])
             if minutes not in (2, 5, 10, 30):
                 minutes = 2
