@@ -1,4 +1,8 @@
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,6 +14,92 @@ DEPLOY_PAGES_SHA = "368f82528645a54fb793d4d04e342629a3f51346"
 FLATPAK_BUILDER_SHA = "79327416609af08178ad73b352877e51450790b3"
 TURNSTYLE_SHA = "3805450be63b8c80577dc253e8c17e9132036df4"
 FLATPAK_IMAGE = "ghcr.io/flathub-infra/flatpak-github-actions@sha256:"
+
+
+SANDBOX_VARIABLE = "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"
+UI_SCRIPT_STEPS = ("Run isolated WebKit UI regressions", "Run cross-layer UI regression")
+SANDBOX_EXEMPT_DIRS = {".git", "tests", "docs", "__pycache__"}
+
+
+def repository_files(root):
+    """Every file the repository would ship, tracked or new, minus tests/docs.
+
+    With git, ignored local-only files (build output, agent notes) are
+    skipped; a pristine export has no git and no ignored files to skip.
+    """
+    if (root / ".git").exists():
+        listed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            check=True, capture_output=True,
+        ).stdout.decode().split("\0")
+        paths = [root / name for name in listed if name]
+    else:
+        paths = [Path(top) / name for top, _dirs, names in os.walk(root) for name in names]
+    for path in paths:
+        relative = path.relative_to(root)
+        if path.is_file() and not SANDBOX_EXEMPT_DIRS.intersection(relative.parts):
+            yield path
+
+
+def permitted_sandbox_step(relative, lines, index):
+    """Name of the webkit-ui UI-script step whose env: sets the variable on
+    lines[index], or None when that occurrence is anywhere else."""
+    if relative != Path(".github/workflows/flatpak.yml"):
+        return None
+    if lines[index] != f'          {SANDBOX_VARIABLE}: "1"':
+        return None
+    # The enclosing step's env: block: only deeper-indented lines or comments.
+    cursor = index - 1
+    while cursor >= 0 and (lines[cursor].startswith(" " * 10) or lines[cursor].strip().startswith("#")):
+        cursor -= 1
+    if cursor < 0 or lines[cursor] != "        env:":
+        return None
+    # The enclosing step and job.
+    step_start = cursor
+    while step_start >= 0 and not lines[step_start].startswith("      - "):
+        if lines[step_start] and not lines[step_start].startswith(" " * 8):
+            return None
+        step_start -= 1
+    job_start = step_start
+    while job_start >= 0 and not re.match(r"^  \S", lines[job_start]):
+        if re.match(r"^\S", lines[job_start]):
+            return None
+        job_start -= 1
+    if step_start < 0 or job_start < 0 or lines[job_start] != "  webkit-ui:":
+        return None
+    step_end = step_start + 1
+    while step_end < len(lines) and lines[step_end].startswith(" " * 8):
+        step_end += 1
+    for line in lines[step_start:step_end]:
+        name = re.match(r"^      (?:- |  )name: (.*)$", line)
+        if name and name.group(1).strip() in UI_SCRIPT_STEPS:
+            return name.group(1).strip()
+    return None
+
+
+def sandbox_variable_occurrences(root):
+    """(permitted step names, other locations) for every occurrence of the
+    variable anywhere in the repository outside tests/ and docs/."""
+    permitted, elsewhere = [], []
+    for path in repository_files(root):
+        data = path.read_bytes()
+        if SANDBOX_VARIABLE.encode() not in data:
+            continue
+        relative = path.relative_to(root)
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        found = False
+        for index, line in enumerate(lines):
+            if SANDBOX_VARIABLE not in line:
+                continue
+            found = True
+            step = permitted_sandbox_step(relative, lines, index)
+            if step:
+                permitted.append(step)
+            else:
+                elsewhere.append(f"{relative}:{index + 1}")
+        if not found:  # e.g. split across a binary boundary
+            elsewhere.append(str(relative))
+    return sorted(permitted), elsewhere
 
 
 def workflow(name):
@@ -248,40 +338,75 @@ class WorkflowContractTest(unittest.TestCase):
 
     def test_only_the_ci_ui_script_steps_disable_the_webkit_sandbox(self):
         # Docker's default seccomp blocks bubblewrap, so WebKit's web-process
-        # sandbox cannot start in the webkit-ui container. Nothing else (app,
-        # packaging, release jobs) may turn the sandbox off.
-        variable = "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"
-        ui_steps = {"Run isolated WebKit UI regressions", "Run cross-layer UI regression"}
-        for path in WORKFLOWS.glob("*.yml"):
-            source = path.read_text(encoding="utf-8")
-            for job_name in re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", source):
-                for step in re.split(r"(?m)^      - ", job_block(source, job_name))[1:]:
-                    name = re.match(r"name: (.*)", step)
-                    name = name.group(1).strip() if name else ""
-                    code = "\n".join(line for line in step.splitlines() if not line.strip().startswith("#"))
-                    with self.subTest(workflow=path.name, job=job_name, step=name):
-                        if path.name == "flatpak.yml" and job_name == "webkit-ui" and name in ui_steps:
-                            self.assertRegex(code, rf'(?m)^        env:\n(?:          [^\n]*\n)*?          {variable}: "1"$')
-                            self.assertEqual(code.count(variable), 1)
-                            ui_steps.discard(name)
-                        else:
-                            self.assertNotIn(variable, code)
-        self.assertEqual(ui_steps, set(), "both UI script steps must exist")
+        # sandbox cannot start in the webkit-ui container. Exactly those two
+        # steps may turn it off: not the workflow, a job, another step or
+        # workflow, an action, the app, packaging, or any script.
+        permitted, elsewhere = sandbox_variable_occurrences(PROJECT)
+        self.assertEqual(elsewhere, [], f"{SANDBOX_VARIABLE} is set outside the webkit-ui UI script steps")
+        self.assertEqual(permitted, sorted(UI_SCRIPT_STEPS))
 
         ui_job = job_block(workflow("flatpak.yml"), "webkit-ui")
+        for step_name in UI_SCRIPT_STEPS:
+            with self.subTest(step=step_name):
+                step = re.search(rf"(?ms)^      - name: {re.escape(step_name)}\n(.*?)(?=^      - |\Z)", ui_job)
+                self.assertTrue(step, "both UI script steps must exist")
+                code = "\n".join(line for line in step.group(1).splitlines() if not line.strip().startswith("#"))
+                self.assertRegex(code, rf'(?m)^        env:\n(?:          [^\n]*\n)*?          {SANDBOX_VARIABLE}: "1"$')
+
         runuser = re.search(r"(?m)^\s*runuser .*scripts/test-ui-regression$", ui_job)
         self.assertTrue(runuser)
         # The unprivileged step must hand the inherited environment on.
         self.assertNotRegex(runuser.group(0), r"runuser (?:-l|--login|-)\s|\benv -i\b|--ignore-environment")
 
-        for relative in ("airloom", "packaging", "scripts", "run", "Makefile"):
-            target = PROJECT / relative
-            files = [target] if target.is_file() else [
-                path for path in target.rglob("*") if path.is_file() and "__pycache__" not in path.parts
-            ]
-            for path in files:
-                with self.subTest(file=str(path.relative_to(PROJECT))):
-                    self.assertNotIn(variable.encode(), path.read_bytes())
+    def test_sandbox_guard_rejects_every_other_setting_location(self):
+        injections = {
+            "workflow-level env": ("flatpak.yml", "permissions:\n  contents: read\n\njobs:\n",
+                                   f'permissions:\n  contents: read\n\nenv:\n  {SANDBOX_VARIABLE}: "1"\n\njobs:\n'),
+            "flatpak job-level env": ("flatpak.yml", "    needs: [test, webkit-ui, release-eligibility]\n",
+                                      f'    needs: [test, webkit-ui, release-eligibility]\n    env:\n      {SANDBOX_VARIABLE}: "1"\n'),
+            "webkit-ui job-level env": ("flatpak.yml", "    container:\n      image: fedora:44\n",
+                                        f'    container:\n      image: fedora:44\n    env:\n      {SANDBOX_VARIABLE}: "1"\n'),
+            "another webkit-ui step": ("flatpak.yml", "      - name: Install headless WebKit dependencies\n",
+                                       "      - name: Install headless WebKit dependencies\n"
+                                       f'        env:\n          {SANDBOX_VARIABLE}: "1"\n'),
+            "publish workflow env": ("publish.yml", "permissions:\n  contents: read\n",
+                                     f'permissions:\n  contents: read\n\nenv:\n  {SANDBOX_VARIABLE}: "1"\n'),
+        }
+        added_files = {
+            "new .yaml workflow": (".github/workflows/extra.yaml",
+                                   "name: Extra\non: [push]\njobs:\n  extra:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                                   f'      - name: Anything\n        env:\n          {SANDBOX_VARIABLE}: "1"\n        run: "true"\n'),
+            "composite action": (".github/actions/setup/action.yml",
+                                 f'runs:\n  using: composite\n  steps:\n    - run: export {SANDBOX_VARIABLE}=1\n      shell: bash\n'),
+            "script": ("scripts/ci-env", f"#!/bin/sh\nexport {SANDBOX_VARIABLE}=1\n"),
+            "app module": ("airloom/sandbox.py", f'import os\nos.environ["{SANDBOX_VARIABLE}"] = "1"\n'),
+            "packaging": ("packaging/extra.yml", f"finish-args:\n  - --env={SANDBOX_VARIABLE}=1\n"),
+            "Makefile": ("Makefile", f"export {SANDBOX_VARIABLE} = 1\n"),
+        }
+        cases = [(name, edit, None) for name, edit in injections.items()]
+        cases += [(name, None, added) for name, added in added_files.items()]
+        for name, edit, added in cases:
+            with self.subTest(injection=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for entry in (".github", "airloom", "packaging", "scripts", "run", "Makefile"):
+                    source = PROJECT / entry
+                    if source.is_dir():
+                        shutil.copytree(source, root / entry, ignore=shutil.ignore_patterns("__pycache__"))
+                    else:
+                        shutil.copy2(source, root / entry)
+                self.assertEqual(sandbox_variable_occurrences(root), (sorted(UI_SCRIPT_STEPS), []))
+                if edit:
+                    target = root / ".github" / "workflows" / edit[0]
+                    text = target.read_text(encoding="utf-8")
+                    self.assertEqual(text.count(edit[1]), 1)
+                    target.write_text(text.replace(edit[1], edit[2]), encoding="utf-8")
+                else:
+                    target = root / added[0]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with target.open("a", encoding="utf-8") as stream:
+                        stream.write(added[1])
+                _permitted, elsewhere = sandbox_variable_occurrences(root)
+                self.assertEqual(len(elsewhere), 1, elsewhere)
 
     def test_publication_queue_retries_transient_github_api_errors(self):
         publish = workflow("publish.yml")
