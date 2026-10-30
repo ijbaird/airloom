@@ -296,6 +296,33 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         self.assertIs(launched.get("private_bus"), True)
         self.assertIs(launched.get("debug_socket"), False)
 
+    def test_viewport_width_excludes_the_window_frame_before_scaling(self):
+        # Under a compositor (mutter) the webview spans the whole window; under
+        # Xvfb GTK draws a solid CSD frame inside the requested size.
+        self.assertEqual(self.script.viewport_width(1240), 1240)
+        self.assertEqual(self.script.viewport_width(1240, 1.5), 826)
+        self.assertEqual(self.script.viewport_width(1240, frame=10), 1230)
+        self.assertEqual(self.script.viewport_width(480, 1.5, 10), 313)
+
+    def test_window_frame_is_measured_from_the_default_window_and_bounded(self):
+        def probe_once(probe, _timeout, what):
+            value = probe()
+            if value is None or value is False:
+                raise AssertionError(f"timed out waiting for {what}")
+            return value
+
+        for inner, frame in ((1240, 0), (1230, 10)):
+            with self.subTest(inner=inner), \
+                    mock.patch.object(self.script, "wait_for", probe_once), \
+                    mock.patch.object(self.script, "eval_js", return_value={"width": inner}):
+                self.assertEqual(self.script.measure_window_frame("sock"), frame)
+        for inner in (1241, 1240 - self.script.WINDOW_FRAME_MAX_PX - 1, 360):
+            with self.subTest(inner=inner), \
+                    mock.patch.object(self.script, "wait_for", probe_once), \
+                    mock.patch.object(self.script, "eval_js", return_value={"width": inner}):
+                with self.assertRaises(AssertionError):
+                    self.script.measure_window_frame("sock")
+
     def test_caller_snapshot_detects_any_change(self):
         target = self.root / "airloom"
         target.mkdir()

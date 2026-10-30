@@ -16,7 +16,8 @@ the caller's own Airloom state:
   actual layout boxes.
 
 Requires GTK 4, WebKitGTK 6.0 and a display (for CI, run it under a private
-headless compositor, e.g. `dbus-run-session -- xvfb-run -a
+headless compositor or, as the webkit-ui CI job does, `dbus-run-session --
+xvfb-run -a -s "-screen 0 1280x800x24" env GDK_DEBUG=no-portals python3
 scripts/test-ui-regression`). Not part of `make test`; tests/test_integration.py
 covers this script's isolation contract without a display. Exits 0 when
 every selected scenario passes.
@@ -594,9 +595,29 @@ RESIZE_PROBE_JS = """
 """
 
 
-def wait_for_width(sock: str, width: int, scale: float = 1.0) -> dict:
+DEFAULT_WINDOW_WIDTH = 1240
+# Without a compositing manager (Xvfb), GTK draws a solid CSD frame (resize
+# border) inside the requested window size; under mutter it is zero.
+WINDOW_FRAME_MAX_PX = 16
+
+
+def viewport_width(width: int, scale: float = 1.0, frame: int = 0) -> int:
+    """CSS width of the page in a `width`-px window with `frame` px of chrome."""
+    return int((width - frame) / scale)
+
+
+def measure_window_frame(sock: str) -> int:
+    """Horizontal window chrome around the webview, measured at 100% scale."""
+    inner = wait_for(
+        lambda: (lambda w: w if DEFAULT_WINDOW_WIDTH - WINDOW_FRAME_MAX_PX <= w <= DEFAULT_WINDOW_WIDTH
+                 else None)(eval_js(sock, RESIZE_PROBE_JS)["width"]),
+        15, f"the default {DEFAULT_WINDOW_WIDTH}px window (at most {WINDOW_FRAME_MAX_PX}px of frame)")
+    return DEFAULT_WINDOW_WIDTH - inner
+
+
+def wait_for_width(sock: str, width: int, scale: float = 1.0, frame: int = 0) -> dict:
     """Wait for the viewport, then for the map's resize frame to settle."""
-    expected = int(width / scale)
+    expected = viewport_width(width, scale, frame)
     wait_for(lambda: abs(eval_js(sock, RESIZE_PROBE_JS)["width"] - expected) <= 1,
              15, f"a {width}px window ({expected} CSS px)")
     time.sleep(0.5)
@@ -626,7 +647,9 @@ def open_visible_popup(sock: str):
 def scenario_resize(app: DebugApp):
     print("— resizing the live window across the narrow breakpoint —")
     sock = app.sock_path
-    wide = wait_for_width(sock, 1240)
+    frame = measure_window_frame(sock)
+    check(True, f"the webview spans the window inside {frame}px of window frame")
+    wide = wait_for_width(sock, 1240, frame=frame)
     check(not wide["narrow"], f"the default window uses the wide layout ({wide['width']}px)")
     check(open_visible_popup(sock) is not None, "a marker popup is open before resizing")
     shown = eval_js(sock, """(() => {
@@ -639,7 +662,7 @@ def scenario_resize(app: DebugApp):
     before_km = request(sock, "state")["viewportKm"]
 
     request(sock, "resize", width=360, height=700)
-    narrow = wait_for_width(sock, 360)
+    narrow = wait_for_width(sock, 360, frame=frame)
     check(narrow["narrow"], "the narrow layout takes over after shrinking the window")
     check(abs(narrow["mapWidth"] - narrow["width"]) <= 1, "the map panel follows the new width")
     check(request(sock, "state")["viewportKm"] < before_km, "the map reconciles its visible extent")
@@ -649,7 +672,7 @@ def scenario_resize(app: DebugApp):
     assert_layout_fits(sock, "360px window with search results and popup")
 
     request(sock, "resize", width=1240, height=780)
-    wide = wait_for_width(sock, 1240)
+    wide = wait_for_width(sock, 1240, frame=frame)
     check(not wide["narrow"] and abs(wide["mapWidth"] - wide["width"]) <= 1, "widening restores the wide layout")
     assert_layout_fits(sock, "1240px window after the round trip")
     eval_js(sock, CLEAR_SEARCH_JS)
@@ -668,9 +691,9 @@ def scenario_resize(app: DebugApp):
     saved = json.loads((app.config_dir / "config.json").read_text(encoding="utf-8"))
     check(saved["interface_scale"] == 1.5, "the Interface size selector persisted 150%")
     try:
-        wait_for_width(sock, 1240, 1.5)
+        wait_for_width(sock, 1240, 1.5, frame)
         request(sock, "resize", width=480, height=760)
-        scaled = wait_for_width(sock, 480, 1.5)
+        scaled = wait_for_width(sock, 480, 1.5, frame)
         check(scaled["narrow"], f"480px at 150% is a {scaled['width']} CSS px narrow layout")
         check(open_visible_popup(sock) is not None, "a marker popup opens at 150%")
         time.sleep(0.3)
@@ -681,7 +704,7 @@ def scenario_resize(app: DebugApp):
         request(sock, "resize", width=1240, height=780)
         eval_js(sock, set_scale % "1")
         wait_for(lambda: not eval_js(sock, SETTINGS_STATE_JS)["open"], 15, "the 100% save to finish")
-        wait_for_width(sock, 1240)
+        wait_for_width(sock, 1240, frame=frame)
 
 
 def scenario_shell_recovery(app: DebugApp):
