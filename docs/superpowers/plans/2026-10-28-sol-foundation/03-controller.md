@@ -65,11 +65,11 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 
 **Interfaces:** Consumes `Store.apply`, transactional favorite/hide methods, `SensorCache.close`, and safe `DebugPort.start/stop` from their owning plans.
 
-- [ ] Write failing tests for PermissionError/ENOSPC settings/favorite/hide/alert saves, no false config publication, continued pending refresh, rejected new work after shutdown, and one cache/debug/location/timer cleanup.
-- [ ] Run focused tests; reproduce inconsistent/false-success behavior.
-- [ ] Persist candidates before publishing, acknowledge success/failure to JS, keep Preferences open on failure, make alert-state save nonfatal, and implement idempotent shutdown/draining.
-- [ ] Run full Python suite with ResourceWarnings as errors; expect PASS.
-- [ ] Commit `fix: make UI persistence and shutdown transactional`.
+- [x] Write failing tests for PermissionError/ENOSPC settings/favorite/hide/alert saves, no false config publication, continued pending refresh, rejected new work after shutdown, and one cache/debug/location/timer cleanup.
+- [x] Run focused tests; reproduce inconsistent/false-success behavior.
+- [x] Persist candidates before publishing, acknowledge success/failure to JS, keep Preferences open on failure, make alert-state save nonfatal, and implement idempotent shutdown/draining.
+- [x] Run full Python suite with ResourceWarnings as errors; expect PASS.
+- [x] Commit `fix: make UI persistence and shutdown transactional`.
 
 ### Task 5: Shell trust and failure recovery
 
