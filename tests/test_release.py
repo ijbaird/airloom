@@ -1036,26 +1036,35 @@ elif command == "install":
         # origin remote trusts exactly those and requires signatures only
         # when there are any.
         if previous:
-            keys, signer = ["PREVIOUSFPR"], "PREVIOUSFPR"
+            keys, signer, gpg_verify = ["PREVIOUSFPR"], "PREVIOUSFPR", True
             url = env.get("FAKE_PREVIOUS_BUNDLE_URL", "https://ijbaird.github.io/airloom/repo")
         else:
             signature = env.get("FAKE_CURRENT_BUNDLE_SIGNATURE", "selected")
-            keys, signer = {
-                "selected": (["CORRECTFPR"], "CORRECTFPR"),
-                "unsigned": ([], None),
-                "independent": (["OTHERFPR"], "OTHERFPR"),
-                "extra-key": (["CORRECTFPR", "OTHERFPR"], "CORRECTFPR"),
-                "embedded-but-signed-by-other": (["CORRECTFPR"], "OTHERFPR"),
+            # (trusted keys, commit signer, origin gpg-verify, install enforces
+            # signatures). The last two let each gate check be exercised alone,
+            # e.g. a correct key with verification off, or an install that
+            # succeeded although the commit is not signed by our key.
+            keys, signer, gpg_verify, enforced = {
+                "selected": (["CORRECTFPR"], "CORRECTFPR", True, True),
+                "unsigned": ([], None, False, True),
+                "independent": (["OTHERFPR"], "OTHERFPR", True, True),
+                "extra-key": (["CORRECTFPR", "OTHERFPR"], "CORRECTFPR", True, True),
+                "embedded-but-signed-by-other": (["CORRECTFPR"], "OTHERFPR", True, True),
+                "verification-disabled": (["CORRECTFPR"], "CORRECTFPR", False, True),
+                "installed-but-signed-by-other": (["CORRECTFPR"], "OTHERFPR", True, False),
             }[signature]
             url = env.get("FAKE_BUNDLE_URL", "https://ijbaird.github.io/airloom/repo")
-            if keys and signer not in keys:
+            if enforced and keys and signer not in keys:
                 print("GPG signatures found, but none are in trusted keyring", file=sys.stderr)
                 sys.exit(1)
-        version = previous_version if previous else current_version
+        if previous:
+            version = env.get("FAKE_PREVIOUS_REPORTED_VERSION", previous_version)
+        else:
+            version = env.get("FAKE_BUNDLE_REPORTED_VERSION", current_version)
         origin = env.get("FAKE_ORIGIN", "airloom-origin")
         commit = "previous-commit" if previous else "current-commit"
         state = {"version": version, "commit": commit, "origin": origin}
-        remotes[origin] = {"url": url, "key_ok": True, "keys": keys, "gpg_verify": bool(keys)}
+        remotes[origin] = {"url": url, "key_ok": True, "keys": keys, "gpg_verify": gpg_verify}
         signers = json.loads((client / "signers.json").read_text()) if (client / "signers.json").exists() else {}
         signers[commit] = signer
         (client / "signers.json").write_text(json.dumps(signers))
@@ -1079,8 +1088,12 @@ elif command == "update":
     if not remote["key_ok"] and env.get("FAKE_ACCEPT_WRONG_KEY") != "1":
         print("GPG signature verification failed: wrong key", file=sys.stderr)
         sys.exit(1)
-    if env.get("FAKE_STALE_UPGRADE") != "1":
+    # FAKE_UPGRADE_RESULT models partial upgrades so the version and commit
+    # checks are each exercised alone.
+    result = "stale" if env.get("FAKE_STALE_UPGRADE") == "1" else env.get("FAKE_UPGRADE_RESULT", "complete")
+    if result in ("complete", "same-commit"):
         state["version"] = current_version
+    if result in ("complete", "old-version"):
         state["commit"] = "current-commit"
     save()
 elif command == "info":
@@ -1267,6 +1280,45 @@ else:
         result, _, summary = self.run_client_gate(FAKE_ORIGIN="ai.stealthvision.Airloom-origin")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("bundle_verified origin=ai.stealthvision.Airloom-origin ", summary)
+
+    def test_bundle_origin_must_require_signatures_even_with_the_right_key(self):
+        result, _, summary = self.run_client_gate(FAKE_CURRENT_BUNDLE_SIGNATURE="verification-disabled")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("does not require GPG signatures", result.stderr)
+        self.assertNotIn("bundle_verified", summary)
+
+    def test_installed_bundle_commit_must_carry_our_signature(self):
+        # Installation and the origin's key policy look right, but the
+        # installed commit itself is not signed by our key.
+        result, _, summary = self.run_client_gate(FAKE_CURRENT_BUNDLE_SIGNATURE="installed-but-signed-by-other")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bundle commit current-commit has no good GPG signature by CORRECTFPR", result.stderr)
+        self.assertNotIn("bundle_verified", summary)
+
+    def test_bundle_installation_must_report_the_current_version(self):
+        # Only the bundle client reports a wrong version; later stages are fine.
+        result, _, summary = self.run_client_gate(FAKE_BUNDLE_REPORTED_VERSION="9.9.9")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bundle version 9.9.9 does not match expected 1.2.3", result.stderr)
+        self.assertNotIn("bundle_verified", summary)
+
+    def test_previous_installation_must_report_the_previous_version(self):
+        result, _, summary = self.run_client_gate(FAKE_PREVIOUS_REPORTED_VERSION="1.2.1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation version 1.2.1 does not match expected 1.2.2", result.stderr)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_upgrade_must_report_the_current_version(self):
+        result, _, summary = self.run_client_gate(FAKE_UPGRADE_RESULT="old-version")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("upgrade version 1.2.2 does not match expected 1.2.3", result.stderr)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_upgrade_must_reach_a_new_commit(self):
+        result, _, summary = self.run_client_gate(FAKE_UPGRADE_RESULT="same-commit")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("upgrade did not reach a new commit", result.stderr)
+        self.assertNotIn("upgrade_verified", summary)
 
     def test_previous_release_must_update_from_the_published_repository(self):
         result, _, _ = self.run_client_gate(
