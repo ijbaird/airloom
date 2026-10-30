@@ -759,7 +759,6 @@
   }
 
   let tileLayer = { zoom: null, tiles: new Map(), pending: 0 };
-  let retireTimer = null;
   const MARKER_CULL_PAD = 300; // generous cull margin so mid-pan gaps are rare
 
   function tileZoomLevel() { return Math.max(3, Math.min(17, Math.round(state.zoom))); }
@@ -779,14 +778,14 @@
   function retireTiles() {
     const live = $("#tiles");
     const old = $("#tiles-old");
-    if (!live.querySelector(".tile.loaded")) {
-      // The outgoing layer never finished loading (e.g. a fast double zoom
-      // crossed tile levels before any tile arrived) — discard its blank
-      // tiles but keep whatever imagery #tiles-old is already showing rather
-      // than replacing it with nothing.
+    const outgoing = [...live.children];
+    const usable = outgoing.some((img) => img.classList.contains("loaded"));
+    const complete = outgoing.length > 0 && outgoing.every((img) => img.classList.contains("loaded"));
+    if (!usable || (old.firstChild && !complete)) {
+      // The outgoing layer is blank or incomplete (e.g. a fast double zoom
+      // or failed requests) — discard it but keep whatever imagery
+      // #tiles-old is already showing rather than trading it for less.
       while (live.firstChild) { live.firstChild.onload = live.firstChild.onerror = null; live.firstChild.remove(); }
-      clearTimeout(retireTimer);
-      retireTimer = setTimeout(clearRetiredTiles, 1500);
       return;
     }
     old.textContent = "";
@@ -797,12 +796,11 @@
     }
     old.dataset.zoom = tileLayer.zoom;
     old.hidden = !old.firstChild;
-    clearTimeout(retireTimer);
-    retireTimer = setTimeout(clearRetiredTiles, 1500);
   }
 
+  // Retired imagery leaves only once a replacement layer fully covers it
+  // (clearRetiredTilesWhenCovered); no timer may discard the last usable tiles.
   function clearRetiredTiles() {
-    clearTimeout(retireTimer);
     const old = $("#tiles-old");
     old.textContent = "";
     old.hidden = true;

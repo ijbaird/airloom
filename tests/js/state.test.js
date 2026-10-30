@@ -654,6 +654,10 @@ test("failed tile settlement keeps failed imagery hidden and retains retired cov
   for (const image of failed) assert.equal(image.classList.contains("loaded"), false);
   assert.ok(old.childNodes.length > 0, "failed replacements must not clear successful retired imagery");
   assert.equal(old.hidden, false);
+
+  app.runTimers();
+  assert.ok(old.childNodes.length > 0, "queued timers must not discard the only usable imagery");
+  assert.equal(old.hidden, false);
 });
 
 test("mixed tile settlement ending in failure retains retired coverage", () => {
@@ -678,6 +682,61 @@ test("mixed tile settlement ending in failure retains retired coverage", () => {
   assert.equal(successful.classList.contains("loaded"), true);
   assert.ok(old.childNodes.length > 0, "a partially failed replacement must not clear retired imagery");
   assert.equal(old.hidden, false);
+
+  app.runTimers();
+  assert.ok(old.childNodes.length > 0, "queued timers must not discard partially replaced coverage");
+  assert.equal(old.hidden, false);
+});
+
+test("an unloaded intermediate zoom layer keeps retained imagery through timers", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const old = app.elements.get("tiles-old");
+  for (const image of [...live.childNodes]) image.onload();
+  app.context.Airloom.debugZoomTo(13);
+  const retained = [...old.childNodes];
+  assert.ok(retained.length > 0);
+
+  app.context.Airloom.debugZoomTo(15);
+  app.runTimers();
+
+  assert.deepEqual([...old.childNodes], retained, "blank intermediate tiles must not replace usable imagery");
+  assert.equal(old.hidden, false);
+});
+
+test("a partially loaded intermediate layer does not replace complete retired imagery", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const old = app.elements.get("tiles-old");
+  for (const image of [...live.childNodes]) image.onload();
+  app.context.Airloom.debugZoomTo(13);
+  const retained = [...old.childNodes];
+  const intermediate = [...live.childNodes];
+  intermediate[0].onload();
+  for (const image of intermediate.slice(1)) image.onerror();
+
+  app.context.Airloom.debugZoomTo(15);
+  app.runTimers();
+
+  assert.deepEqual([...old.childNodes], retained);
+  assert.equal(old.hidden, false);
+});
+
+test("a completely successful replacement retires the old imagery", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const old = app.elements.get("tiles-old");
+  for (const image of [...live.childNodes]) image.onload();
+  app.context.Airloom.debugZoomTo(13);
+  assert.ok(old.childNodes.length > 0);
+
+  for (const image of [...live.childNodes]) image.onload();
+
+  assert.equal(old.childNodes.length, 0);
+  assert.equal(old.hidden, true);
 });
 
 test("reconcileKeyed preserves keyed controls and returns removed logical focus", () => {
