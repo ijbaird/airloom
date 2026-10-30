@@ -192,6 +192,42 @@ class WorkflowContractTest(unittest.TestCase):
                     self.assertTrue(install, "git must be installed in the container")
                     self.assertLess(install.start(), checkout.start(), "git must be installed before checkout")
 
+    def test_container_jobs_trust_their_workspace_before_any_git_use(self):
+        # Container steps run as root against a workspace the runner's host
+        # user owns, so git refuses it as dubious unless a later-persisting
+        # global safe.directory names exactly that container path. checkout
+        # only trusts it for its own commands under a temporary HOME.
+        git_use = re.compile(
+            r"\bgit (?!config --global --add safe\.directory)[a-z-]+"
+            r"|[\"']git[\"'],|scripts/check-release\.py"
+        )
+        trust = re.compile(r'(?m)^\s*run: git config --global --add safe\.directory "\$\{GITHUB_WORKSPACE\}"$')
+        checked = []
+        for name in ("flatpak.yml", "publish.yml"):
+            source = workflow(name)
+            for job_name in re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", source):
+                block = job_block(source, job_name)
+                if not re.search(r"(?m)^    container:$", block):
+                    continue
+                code = "\n".join(
+                    "" if line.strip().startswith("#") else line for line in block.splitlines()
+                )
+                first_use = git_use.search(code)
+                if not first_use:
+                    continue
+                checked.append(job_name)
+                with self.subTest(workflow=name, job=job_name):
+                    self.assertNotRegex(code, r"safe\.directory\s+['\"]?\*")
+                    self.assertNotRegex(code, r"safe\.directory[^\n]*github\.workspace")
+                    checkout = re.search(r"(?m)^\s*(?:- )?uses: actions/checkout@", code)
+                    trusted = trust.search(code)
+                    self.assertTrue(checkout, "a git-using container job needs a checkout")
+                    self.assertTrue(trusted, "the job must add $GITHUB_WORKSPACE to safe.directory")
+                    self.assertLess(checkout.start(), trusted.start(), "trust the workspace after checkout")
+                    self.assertLess(trusted.start(), first_use.start(),
+                                    f"workspace must be trusted before {first_use.group(0)!r}")
+        self.assertEqual(sorted(checked), ["flatpak", "publish-repo", "verify-client", "webkit-ui"])
+
     def test_publication_queue_retries_transient_github_api_errors(self):
         publish = workflow("publish.yml")
         step = re.search(
