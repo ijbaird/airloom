@@ -82,6 +82,7 @@ def main() -> int:
     sock_path = str(workdir / "debug.sock")
     env = {**os.environ, "AIRLOOM_DEBUG_SOCKET": sock_path}
     env["XDG_CONFIG_HOME"] = str(workdir / "config")
+    env["XDG_CACHE_HOME"] = str(workdir / "cache")
     print(f"work dir (screenshots): {workdir}")
     app = subprocess.Popen([str(PROJECT / "scripts" / "debug-run")], env=env)
     try:

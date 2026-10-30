@@ -80,5 +80,7 @@
   <content_rating type="oars-1.1" />
   <url type="homepage">https://github.com/ijbaird/airloom</url>
   <url type="bugtracker">https://github.com/ijbaird/airloom/issues</url>
+  <url type="vcs-browser">https://github.com/ijbaird/airloom</url>
+  <url type="help">https://github.com/ijbaird/airloom#readme</url>
   <developer id="ai.stealthvision"><name>Stealth Vision</name></developer>
 </component>

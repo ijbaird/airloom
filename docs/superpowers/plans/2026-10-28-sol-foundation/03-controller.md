@@ -29,11 +29,11 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 - `RefreshDecision(publish: bool, sensors: tuple, trend_ids: tuple[int, ...])` frozen dataclass.
 - `ApplicationController(config: dict)` with `set_view(view: dict)`, `set_config(config: dict)`, `begin_refresh(force=False)`, `complete_refresh(request, sensors, origin, delivery)`.
 
-- [ ] Write failing tests for current-view manual/auto refresh, home fallback before view, A superseded by B/config/filter, cached superseded results not publishing or starting trends, and latest B publishing once.
-- [ ] Run `python3 -m unittest tests.test_controller -v`; expect import failure.
-- [ ] Implement generation-based newest-request authorization; cache writes remain adapter-side and do not require `publish=True`.
-- [ ] Re-run focused tests; expect PASS.
-- [ ] Commit `feat: add authoritative refresh controller`.
+- [x] Write failing tests for current-view manual/auto refresh, home fallback before view, A superseded by B/config/filter, cached superseded results not publishing or starting trends, and latest B publishing once.
+- [x] Run `python3 -m unittest tests.test_controller -v`; expect import failure.
+- [x] Implement generation-based newest-request authorization; cache writes remain adapter-side and do not require `publish=True`.
+- [x] Re-run focused tests; expect PASS.
+- [x] Commit `feat: add authoritative refresh controller`.
 
 ### Task 2: Port sensor state, filters, summaries, and alerts
 
@@ -41,11 +41,11 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 
 **Interfaces:** Consumes `visible_sensors`, `alert_transitions`, controller refresh methods, and data `fetch_area`/`fetch_favorites`; JS payload includes origin, delivery, coverage, and area/favorite collections.
 
-- [ ] Add failing tests for cached startup/stale fallback/opposite favorite filters, antimeridian view acceptance/split fetching, CacheError nonpersistent degradation, remote favorite summary exclusion inputs, demo/stale alert suppression, fresh real alert once, alert-save failure finalization, and capped coverage metadata.
-- [ ] Run focused tests; reproduce current mixed-state behavior.
-- [ ] Port `_on_view_changed`, `_start_fetch`, `_finish_refresh`, `_paint_cached_home`, `_send_sensor_state`, and `_check_alerts` to geography/controller/presentation decisions. Keep favorite monitoring separate; route both Refresh controls through current-view `begin_refresh`; surface cache-open failure and continue without persistence; drain pending work in `finally`.
-- [ ] Run focused tests and `python3 -m unittest discover -s tests -v`; expect PASS.
-- [ ] Commit `fix: authorize sensor publication and alert eligibility`.
+- [x] Add failing tests for cached startup/stale fallback/opposite favorite filters, antimeridian view acceptance/split fetching, CacheError nonpersistent degradation, remote favorite summary exclusion inputs, demo/stale alert suppression, fresh real alert once, alert-save failure finalization, and capped coverage metadata.
+- [x] Run focused tests; reproduce current mixed-state behavior.
+- [x] Port `_on_view_changed`, `_start_fetch`, `_finish_refresh`, `_paint_cached_home`, `_send_sensor_state`, and `_check_alerts` to geography/controller/presentation decisions. Keep favorite monitoring separate; route both Refresh controls through current-view `begin_refresh`; surface cache-open failure and continue without persistence; drain pending work in `finally`.
+- [x] Run focused tests and `python3 -m unittest discover -s tests -v`; expect PASS.
+- [x] Commit `fix: authorize sensor publication and alert eligibility`.
 
 ### Task 3: Coordinated trends, search, and labels
 
@@ -53,11 +53,11 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 
 **Interfaces:** Bridge `place-search` accepts `{request_id, context, query}` and `places` returns the same; trend events include `sensor_id`, `status`, `trend`; `GeoClueLocator.cancel()` cancels its `Gio.Cancellable`.
 
-- [ ] Write failing tests for duplicate in-flight trends, terminal trend error/unavailable, obsolete search/label responses, home A/B reversal, auto→fixed cancellation, deferred-start mode recheck, and dispatcher exception replies for non-string commands.
-- [ ] Run focused tests; confirm current missing identity/cancellation/failure behavior.
-- [ ] Integrate `RequestRegistry`, single-flight trend state, contextual place search with obsolete queued requests dropped before network I/O, coordinate/home-generation labels, real location cancellation, and safe async debug error replies.
-- [ ] Re-run focused tests; expect PASS.
-- [ ] Commit `fix: coordinate asynchronous application requests`.
+- [x] Write failing tests for duplicate in-flight trends, terminal trend error/unavailable, obsolete search/label responses, home A/B reversal, auto→fixed cancellation, deferred-start mode recheck, and dispatcher exception replies for non-string commands.
+- [x] Run focused tests; confirm current missing identity/cancellation/failure behavior.
+- [x] Integrate `RequestRegistry`, single-flight trend state, contextual place search with obsolete queued requests dropped before network I/O, coordinate/home-generation labels, real location cancellation, and safe async debug error replies.
+- [x] Re-run focused tests; expect PASS.
+- [x] Commit `fix: coordinate asynchronous application requests`.
 
 ### Task 4: Transactional UI actions and lifecycle
 
@@ -65,18 +65,18 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 
 **Interfaces:** Consumes `Store.apply`, transactional favorite/hide methods, `SensorCache.close`, and safe `DebugPort.start/stop` from their owning plans.
 
-- [ ] Write failing tests for PermissionError/ENOSPC settings/favorite/hide/alert saves, no false config publication, continued pending refresh, rejected new work after shutdown, and one cache/debug/location/timer cleanup.
-- [ ] Run focused tests; reproduce inconsistent/false-success behavior.
-- [ ] Persist candidates before publishing, acknowledge success/failure to JS, keep Preferences open on failure, make alert-state save nonfatal, and implement idempotent shutdown/draining.
-- [ ] Run full Python suite with ResourceWarnings as errors; expect PASS.
-- [ ] Commit `fix: make UI persistence and shutdown transactional`.
+- [x] Write failing tests for PermissionError/ENOSPC settings/favorite/hide/alert saves, no false config publication, continued pending refresh, rejected new work after shutdown, and one cache/debug/location/timer cleanup.
+- [x] Run focused tests; reproduce inconsistent/false-success behavior.
+- [x] Persist candidates before publishing, acknowledge success/failure to JS, keep Preferences open on failure, make alert-state save nonfatal, and implement idempotent shutdown/draining.
+- [x] Run full Python suite with ResourceWarnings as errors; expect PASS.
+- [x] Commit `fix: make UI persistence and shutdown transactional`.
 
 ### Task 5: Shell trust and failure recovery
 
 **Files:** Modify `airloom/app.py`, `tests/test_app_state.py`; update `index.html` only for reload/status hooks if frontend has landed, otherwise define the contract for integration.
 
-- [ ] Add failing policy/lifecycle tests for unrelated `file://` rejection, bundled document allowance, approved external links, load failure, web-process termination recovery, persistent interface scale, and map-pinch independence.
-- [ ] Run focused tests; confirm unrestricted file navigation/missing recovery.
-- [ ] Restrict navigation, add explicit error/reload handling, and replace forced zoom 1.0 with persisted interface-scale handling that does not interfere with native map pinch.
-- [ ] Run `make check`; expect PASS.
-- [ ] Commit `fix: harden WebKit navigation and recovery`; request Sol controller-workstream review.
+- [x] Add failing policy/lifecycle tests for unrelated `file://` rejection, bundled document allowance, approved external links, load failure, web-process termination recovery, persistent interface scale, and map-pinch independence.
+- [x] Run focused tests; confirm unrestricted file navigation/missing recovery.
+- [x] Restrict navigation, add explicit error/reload handling, and replace forced zoom 1.0 with persisted interface-scale handling that does not interfere with native map pinch.
+- [x] Run `make check`; expect PASS.
+- [x] Commit `fix: harden WebKit navigation and recovery`; request Sol controller-workstream review.

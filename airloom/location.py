@@ -32,6 +32,7 @@ class GeoClueLocator:
         self._fix_delivered = False
         self._fallback_sent = False
         self._timeout_id = None
+        self._cancellable = None
 
     def _note_fix(self) -> bool:
         """Record a genuine fix; True when it should be delivered."""
@@ -52,7 +53,7 @@ class GeoClueLocator:
             import gi
 
             gi.require_version("Geoclue", "2.0")
-            from gi.repository import Geoclue, GLib
+            from gi.repository import Geoclue, Gio, GLib
         except (ImportError, ValueError) as exc:
             print(f"Airloom: GeoClue unavailable: {exc}", file=sys.stderr)
             if self._note_fallback():
@@ -90,13 +91,22 @@ class GeoClueLocator:
                 cancel_timeout()
                 on_fix(latitude, longitude, accuracy)
 
+        self._cancellable = Gio.Cancellable()
         self._timeout_id = GLib.timeout_add_seconds(self.timeout_seconds, on_timeout)
-        Geoclue.Simple.new(APP_ID, Geoclue.AccuracyLevel.NEIGHBORHOOD, None, finished)
+        Geoclue.Simple.new(
+            APP_ID,
+            Geoclue.AccuracyLevel.NEIGHBORHOOD,
+            self._cancellable,
+            finished,
+        )
 
     def cancel(self) -> None:
-        """Silence this locator: a newer request (or a pinned home) owns the outcome now."""
+        """Silence this locator and cancel its in-flight GeoClue request."""
         self._fix_delivered = True
         self._fallback_sent = True
+        if self._cancellable is not None:
+            self._cancellable.cancel()
+            self._cancellable = None
         if self._timeout_id is not None:
             from gi.repository import GLib
 

@@ -21,6 +21,7 @@ check-js:
 flatpak:
 	./scripts/build-flatpak.sh
 
+# DESTDIR is staging only; run-installed finds its prefix relative to its bin directory.
 install:
 	install -d $(DESTDIR)$(PREFIX)/share/airloom
 	tar --exclude='__pycache__' --exclude='*.pyc' -cf - airloom | tar -xf - -C $(DESTDIR)$(PREFIX)/share/airloom
