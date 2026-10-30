@@ -231,6 +231,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app.current_view = None
         app.view_bounds = None
         app.view_fetched_at = 0.0
+        app.coverage_generation = 0
         app.last_source = None
         app.last_origin = "live"
         app.last_stale = False
@@ -536,6 +537,35 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
 
         self.assertIsNone(app.pending_fetch)
         self.assertEqual(app.launched, [])
+
+    def test_filter_change_invalidates_covered_view_before_delayed_completion(self):
+        app = self.make_app()
+        app.webview = object()
+        app._start_worker = mock.Mock(return_value=True)
+        app._start_fetch = lambda request: AirloomApplication._start_fetch(app, request)
+        app.controller.set_view(VIEW)
+        bounds = Bounds(20.0, -30.0, 10.0, -10.0)
+        app.current_view = (bounds, (15.0, -20.0))
+        app.view_bounds = bounds
+        app.view_fetched_at = 1_000.0
+        outdoor_request = app.controller.begin_refresh()
+        app.refreshing = True
+
+        with mock.patch.object(app_module.time, "monotonic", return_value=1_000.0):
+            app._set_location_filter({"value": "indoor"})
+            app._on_view_changed(VIEW)
+            replacement = app.pending_fetch
+            app._finish_refresh(
+                self.make_outcome(
+                    app,
+                    [make_sensor(1)],
+                    request=outdoor_request,
+                )
+            )
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.generation, outdoor_request.generation + 1)
+        self.assertEqual(app._start_worker.call_count, 1)
 
     def test_refresh_ensures_preserved_non_first_selection_trend(self):
         app = self.make_app()

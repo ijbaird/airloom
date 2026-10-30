@@ -461,6 +461,7 @@ class AirloomApplication(Adw.Application):
         # pair so the auto-refresh timer can never combine a stale half.
         self.current_view: tuple[Bounds, tuple[float, float]] | None = None
         self.view_fetched_at = 0.0
+        self.coverage_generation: int | None = None
         # Reverse labels carry both request identity and their exact target;
         # generation alone cannot authorize a callback after coordinates change.
         self._home_name_generation = 0
@@ -1125,7 +1126,12 @@ class AirloomApplication(Adw.Application):
         request = self.controller.begin_refresh()
         self.pending_fetch = None
         fresh = (time.monotonic() - self.view_fetched_at) < self._refresh_seconds()
-        if self.view_bounds is not None and fresh and bounds_contains(self.view_bounds, view):
+        if (
+            self.view_bounds is not None
+            and self.coverage_generation == request.generation
+            and fresh
+            and bounds_contains(self.view_bounds, view)
+        ):
             return
         self._start_fetch(request)
         self._start_view_label(*center)
@@ -1465,6 +1471,7 @@ class AirloomApplication(Adw.Application):
                     # Failed live retrieval must not suppress the next retry.
                     self.view_bounds = outcome.bounds
                     self.view_fetched_at = time.monotonic()
+                    self.coverage_generation = outcome.request.generation
                 if self.selected_id is not None:
                     self._ensure_trend(self.selected_id)
         finally:
