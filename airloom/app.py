@@ -23,6 +23,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import gi
 
@@ -75,6 +76,7 @@ DEBUG_BUILD_ID_TIMEOUT_SECONDS = 2
 
 APP_ID = "ai.stealthvision.Airloom"
 RESOURCE_DIR = Path(__file__).parent / "resources"
+BUNDLED_ENTRY_URI = (RESOURCE_DIR / "index.html").as_uri()
 LOCATOR_FOCUS_FALLBACK_SECONDS = 20
 
 
@@ -435,6 +437,7 @@ class AirloomApplication(Adw.Application):
         self._auto_refresh_id: int | None = None
         self.window: Adw.ApplicationWindow | None = None
         self.webview: WebKit.WebView | None = None
+        self._shell_recovery_notice: str | None = None
         self.title: Adw.WindowTitle | None = None
         self.sensors: list[Sensor] = []
         self._area_ids: set[int] = set()
@@ -575,8 +578,11 @@ class AirloomApplication(Adw.Application):
         settings.set_enable_developer_extras(False)
         settings.set_user_agent_with_application_details("Airloom", __version__)
         self.webview.connect("decide-policy", self._on_decide_policy)
+        self.webview.connect("load-failed", self._on_load_failed)
+        self.webview.connect("web-process-terminated", self._on_web_process_terminated)
         self.webview.connect("notify::zoom-level", self._on_zoom_level_changed)
-        self.webview.load_uri((RESOURCE_DIR / "index.html").as_uri())
+        self.webview.set_zoom_level(self._interface_scale())
+        self.webview.load_uri(BUNDLED_ENTRY_URI)
 
         # WebKitGTK's own gesture controller silently claims trackpad pinch
         # as an internal page-scale zoom before the DOM ever sees a
@@ -724,27 +730,76 @@ class AirloomApplication(Adw.Application):
         return GLib.SOURCE_CONTINUE
 
     def _on_decide_policy(self, _webview, decision, decision_type) -> bool:
-        # The UI is a local page; anything else (e.g. the OSM attribution
-        # link) belongs in the system browser, and a remote origin must never
-        # gain access to the script-message bridge.
+        # Only the bundled entry may use the script-message bridge. Approved
+        # web links open in the system browser; every other navigation is
+        # ignored rather than being allowed to inherit this WebView's trust.
         if decision_type not in (
             WebKit.PolicyDecisionType.NAVIGATION_ACTION,
             WebKit.PolicyDecisionType.NEW_WINDOW_ACTION,
         ):
             return False
         uri = decision.get_navigation_action().get_request().get_uri() or ""
-        if uri.startswith("file://"):
-            return False
+        if uri == BUNDLED_ENTRY_URI:
+            decision.use()
+            return True
         decision.ignore()
-        if uri.startswith(("http://", "https://")) and self.window:
+        try:
+            parsed = urlsplit(uri)
+        except ValueError:
+            return True
+        if parsed.scheme.lower() in ("http", "https") and parsed.netloc:
             Gtk.UriLauncher.new(uri).launch(self.window, None, None)
         return True
 
+    def _on_load_failed(self, _webview, _load_event, _failing_uri, error) -> bool:
+        self._send(
+            "shell-status",
+            {
+                "status": "error",
+                "message": f"Airloom could not load its interface ({error}). Reload to try again.",
+                "can_reload": True,
+            },
+        )
+        # Keep WebKit's own error page as a visible fallback when the bundled
+        # document is not alive to display the bridge status above.
+        return False
+
+    def _on_web_process_terminated(self, _webview, _reason) -> None:
+        # A dead renderer cannot display an error event. Reload the trusted
+        # entry immediately, then surface the queued notice after its ready
+        # handshake instead of leaving a silent blank WebView.
+        self._shell_recovery_notice = (
+            "Airloom's interface process stopped unexpectedly. The interface "
+            "was reloaded; Reload to try again if the problem continues."
+        )
+        self._reload_shell()
+
+    def _reload_shell(self) -> None:
+        if self._shutting_down or not self.webview:
+            return
+        self._send(
+            "shell-status",
+            {
+                "status": "loading",
+                "message": "Reloading Airloom…",
+                "can_reload": False,
+            },
+        )
+        self.webview.set_zoom_level(self._interface_scale())
+        self.webview.load_uri(BUNDLED_ENTRY_URI)
+
+    def _interface_scale(self) -> float:
+        scale = self.store.data.get("interface_scale", 1.0)
+        if isinstance(scale, float) and scale in (1.0, 1.25, 1.5):
+            return scale
+        return 1.0
+
     def _on_zoom_level_changed(self, webview, _pspec) -> None:
-        # The map handles pinch itself; engine-level page zoom would scale the
-        # whole document and clip the overlays, so snap it straight back.
-        if webview.get_zoom_level() != 1.0:
-            webview.set_zoom_level(1.0)
+        # Native map pinch is forwarded to the DOM, not page zoom. If WebKit
+        # changes page scale anyway, restore the persisted interface choice.
+        scale = self._interface_scale()
+        if webview.get_zoom_level() != scale:
+            webview.set_zoom_level(scale)
 
     def _pinch_centroid(self, gesture: Gtk.GestureZoom) -> tuple[float, float]:
         ok, x, y = gesture.get_bounding_box_center()
@@ -914,8 +969,21 @@ class AirloomApplication(Adw.Application):
             return
 
         action = message.get("action")
-        if action == "ready":
+        if action == "reload-shell":
+            self._reload_shell()
+        elif action == "ready":
             self._send("config", self.store.public_config())
+            recovery_notice = getattr(self, "_shell_recovery_notice", None)
+            if recovery_notice:
+                self._shell_recovery_notice = None
+                self._send(
+                    "shell-status",
+                    {
+                        "status": "error",
+                        "message": recovery_notice,
+                        "can_reload": True,
+                    },
+                )
             if self._cache_error:
                 self._send("error", {"message": self._cache_error})
             self._paint_cached_home()
@@ -1193,6 +1261,9 @@ class AirloomApplication(Adw.Application):
                 "home_mode": home_mode,
                 "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
                 "confidence_filter": bool(message.get("confidence_filter")),
+                "interface_scale": message.get(
+                    "interface_scale", self.store.data.get("interface_scale", 1.0)
+                ),
             }
             minutes = int(message["refresh_minutes"])
             if minutes not in (2, 5, 10, 30):
@@ -1242,6 +1313,8 @@ class AirloomApplication(Adw.Application):
             )
             return
         self.controller.set_config(self.store.data)
+        if getattr(self, "webview", None):
+            self.webview.set_zoom_level(self._interface_scale())
         if home_mode != "auto":
             self._clear_locator_focus_wait()
             if self.locator is not None:

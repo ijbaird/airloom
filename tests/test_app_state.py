@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import sys
 import tempfile
 import types
@@ -156,6 +157,64 @@ class FakeClient:
         return FetchResult(list(self.rows), 123)
 
 
+class FakePolicyDecision:
+    def __init__(self, uri):
+        self.uri = uri
+        self.used = False
+        self.ignored = False
+
+    def get_navigation_action(self):
+        return self
+
+    def get_request(self):
+        return self
+
+    def get_uri(self):
+        return self.uri
+
+    def use(self):
+        self.used = True
+
+    def ignore(self):
+        self.ignored = True
+
+
+class FakeWebView:
+    def __init__(self, zoom_level=1.0):
+        self.zoom_level = zoom_level
+        self.zoom_levels = []
+        self.loaded_uris = []
+
+    def get_zoom_level(self):
+        return self.zoom_level
+
+    def set_zoom_level(self, scale):
+        self.zoom_level = scale
+        self.zoom_levels.append(scale)
+
+    def load_uri(self, uri):
+        self.loaded_uris.append(uri)
+
+
+class FakePinchGesture:
+    def __init__(self):
+        self.state = None
+
+    def get_bounding_box_center(self):
+        return True, 40.0, 60.0
+
+    def set_state(self, state):
+        self.state = state
+
+
+class ScriptMessage:
+    def __init__(self, message):
+        self.message = message
+
+    def to_json(self, _options=0):
+        return json.dumps(self.message)
+
+
 class ApplicationAdapterTestCase(unittest.TestCase):
     def make_app(self, store=None, cache=None):
         app = AirloomApplication.__new__(AirloomApplication)
@@ -176,6 +235,11 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app.last_origin = "live"
         app.last_stale = False
         app.coverage = None
+        app.window = SimpleNamespace()
+        app.webview = None
+        app.title = None
+        app._cache_error = None
+        app._shell_recovery_notice = None
         app.sent = []
         app.launched = []
         app.trends = []
@@ -558,6 +622,167 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
                 )
                 self.assertEqual(store.data, previous)
                 self.assertEqual(Store(store.path).data, previous)
+
+
+class ShellPolicyTest(ApplicationAdapterTestCase):
+    def decide(self, app, uri):
+        decision = FakePolicyDecision(uri)
+        decision_types = SimpleNamespace(
+            NAVIGATION_ACTION="navigation",
+            NEW_WINDOW_ACTION="new-window",
+        )
+        with mock.patch.object(
+            app_module.WebKit, "PolicyDecisionType", decision_types, create=True
+        ):
+            handled = app._on_decide_policy(None, decision, "navigation")
+        return handled, decision
+
+    def test_unrelated_file_navigation_is_rejected(self):
+        app = self.make_app()
+
+        handled, decision = self.decide(app, "file:///tmp/untrusted.html")
+
+        self.assertTrue(handled)
+        self.assertTrue(decision.ignored)
+        self.assertFalse(decision.used)
+
+    def test_bundled_entry_document_is_explicitly_allowed(self):
+        app = self.make_app()
+        entry_uri = (app_module.RESOURCE_DIR / "index.html").as_uri()
+
+        handled, decision = self.decide(app, entry_uri)
+
+        self.assertTrue(handled)
+        self.assertTrue(decision.used)
+        self.assertFalse(decision.ignored)
+
+    def test_approved_external_links_open_outside_the_bridge_webview(self):
+        app = self.make_app()
+        for uri in (
+            "https://www.openstreetmap.org/copyright",
+            "HTTP://example.com/legacy",
+        ):
+            with self.subTest(uri=uri):
+                launcher = mock.Mock()
+                launcher_type = SimpleNamespace(new=mock.Mock(return_value=launcher))
+                with mock.patch.object(
+                    app_module.Gtk, "UriLauncher", launcher_type, create=True
+                ):
+                    handled, decision = self.decide(app, uri)
+
+                self.assertTrue(handled)
+                self.assertTrue(decision.ignored)
+                self.assertFalse(decision.used)
+                launcher_type.new.assert_called_once_with(uri)
+                launcher.launch.assert_called_once_with(app.window, None, None)
+
+
+class ShellRecoveryTest(ApplicationAdapterTestCase):
+    def test_load_failure_reports_recoverable_status_and_keeps_error_page(self):
+        app = self.make_app()
+        handler = getattr(app, "_on_load_failed", None)
+        self.assertIsNotNone(handler)
+
+        handled = handler(None, None, "file:///missing/index.html", "read failed")
+
+        self.assertFalse(handled)
+        self.assertEqual(
+            app.sent[-1],
+            (
+                "shell-status",
+                {
+                    "status": "error",
+                    "message": mock.ANY,
+                    "can_reload": True,
+                },
+            ),
+        )
+        message = app.sent[-1][1]["message"]
+        self.assertIn("read failed", message)
+        self.assertIn("reload", message.lower())
+
+    def test_reload_shell_action_loads_only_the_bundled_entry(self):
+        app = self.make_app()
+        app.webview = FakeWebView()
+        entry_uri = (app_module.RESOURCE_DIR / "index.html").as_uri()
+
+        app._on_script_message(None, ScriptMessage({"action": "reload-shell"}))
+
+        self.assertEqual(app.webview.loaded_uris, [entry_uri])
+
+    def test_web_process_termination_reloads_and_reports_after_ready(self):
+        app = self.make_app()
+        app.webview = FakeWebView()
+        entry_uri = (app_module.RESOURCE_DIR / "index.html").as_uri()
+        handler = getattr(app, "_on_web_process_terminated", None)
+        self.assertIsNotNone(handler)
+
+        handler(None, "crashed")
+        app._on_script_message(None, ScriptMessage({"action": "ready"}))
+
+        self.assertEqual(app.webview.loaded_uris, [entry_uri])
+        statuses = [
+            payload for event, payload in app.sent if event == "shell-status"
+        ]
+        self.assertEqual(statuses[-1]["status"], "error")
+        self.assertIn("reloaded", statuses[-1]["message"].lower())
+        self.assertTrue(statuses[-1]["can_reload"])
+
+
+class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
+    def test_all_supported_scales_persist_and_apply_to_the_webview(self):
+        for scale in (1.0, 1.25, 1.5):
+            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.json"
+                store = Store(path)
+                starting_scale = 1.5 if scale == 1.0 else 1.0
+                store.data["interface_scale"] = starting_scale
+                store.save()
+                app = self.make_app(store=store)
+                app.webview = FakeWebView(starting_scale)
+                app._arm_auto_refresh = lambda: None
+                app.refresh = lambda *args, **kwargs: None
+
+                app._save_settings(
+                    {
+                        "radius_km": 55.5,
+                        "heatmap_threshold_km": 40.0,
+                        "alert_threshold": 101,
+                        "home_mode": "auto",
+                        "temperature_unit": "F",
+                        "confidence_filter": True,
+                        "refresh_minutes": 2,
+                        "interface_scale": scale,
+                    }
+                )
+
+                self.assertEqual(Store(path).data["interface_scale"], scale)
+                self.assertEqual(app.webview.zoom_level, scale)
+
+    def test_native_map_pinch_never_replaces_the_persisted_interface_scale(self):
+        for scale in (1.0, 1.25, 1.5):
+            with self.subTest(scale=scale):
+                app = self.make_app(store=FakeStore(interface_scale=scale))
+                app.webview = FakeWebView(scale)
+                gesture = FakePinchGesture()
+                claimed = object()
+                sequence_state = SimpleNamespace(CLAIMED=claimed)
+                with mock.patch.object(
+                    app_module.Gtk, "EventSequenceState", sequence_state, create=True
+                ):
+                    app._on_native_pinch_begin(gesture, None)
+                    app._on_native_pinch_scale(gesture, 1.4)
+
+                # If WebKit still emits a page-scale notification, restore the
+                # interface preference rather than confusing it with map zoom.
+                app.webview.zoom_level = 1.75
+                app._on_zoom_level_changed(app.webview, None)
+
+                self.assertIs(gesture.state, claimed)
+                self.assertEqual(
+                    [event for event, _payload in app.sent], ["pinch", "pinch"]
+                )
+                self.assertEqual(app.webview.zoom_level, scale)
 
 
 class AlertAdapterTest(ApplicationAdapterTestCase):
