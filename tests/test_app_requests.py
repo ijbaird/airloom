@@ -438,6 +438,34 @@ class TrendRequestTest(ApplicationRequestTestCase):
         self.assertEqual(loaded[0]["reading_last_seen"], 200)
         self.assertEqual(sensor.trend, new_trend)
 
+    def test_queued_trend_rechecks_token_and_reading_before_paid_fetch(self):
+        for authority in ("token", "reading"):
+            with self.subTest(authority=authority):
+                sensor = make_sensor(last_seen=100)
+                app = self.make_app(sensors=[sensor])
+                threads = ThreadQueue()
+                idles = IdleQueue()
+                client = mock.Mock()
+                client.fetch_rows.return_value = FetchResult([], 1)
+
+                with (
+                    mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                    mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                    mock.patch.object(app_module, "PurpleAirClient", return_value=client),
+                ):
+                    app._ensure_trend(1)
+                    if authority == "token":
+                        app.requests.invalidate("trend:1")
+                    else:
+                        sensor.last_seen = 200
+                    threads.threads[0].run()
+
+                    client.fetch_rows.assert_not_called()
+                    self.assertEqual(len(idles.callbacks), 1)
+                    idles.run(0)
+
+                self.assertNotIn(1, app._trend_inflight)
+
     def test_unpublishable_completion_is_not_reused_after_reselection(self):
         sensor = make_sensor(last_seen=100)
         app = self.make_app(sensors=[sensor])

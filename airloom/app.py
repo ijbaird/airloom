@@ -1607,11 +1607,19 @@ class AirloomApplication(Adw.Application):
             trend = None
             failed = False
             try:
-                result = PurpleAirClient(api_key).fetch_rows(
-                    show_only=[sensor_id], fields=TREND_FETCH_FIELDS
+                current_sensor = next(
+                    (s for s in self.sensors if s.sensor_id == sensor_id), None
                 )
-                if result.rows:
-                    trend = trend_from_values(result.rows[0])
+                if (
+                    self.requests.is_current(token)
+                    and current_sensor is not None
+                    and current_sensor.last_seen == reading_last_seen
+                ):
+                    result = PurpleAirClient(api_key).fetch_rows(
+                        show_only=[sensor_id], fields=TREND_FETCH_FIELDS
+                    )
+                    if result.rows:
+                        trend = trend_from_values(result.rows[0])
             except PurpleAirError:
                 failed = True
             except Exception:  # noqa: BLE001 — worker failures must reach a terminal state
