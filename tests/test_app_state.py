@@ -1197,6 +1197,63 @@ class DemoPublicationTest(ApplicationAdapterTestCase):
                     self.assertTrue(-180.0 <= item["longitude"] <= 180.0, item)
 
 
+class DemoTrendAfterOutageTest(ApplicationAdapterTestCase):
+    def test_outage_demo_selection_publishes_local_trend_without_purpleair(self):
+        class TrendCache(FakeCache):
+            def __init__(self):
+                super().__init__()
+                self.trend_calls = []
+
+            def get_trend(self, *args):
+                self.trend_calls.append(("get", args))
+                return [{"label": "Now", "aqi": 1}]
+
+            def store_trend(self, *args):
+                self.trend_calls.append(("store", args))
+
+        cache = TrendCache()
+        app = self.make_app(store=FakeStore(location_filter="both"), cache=cache)
+        app.requests = app_module.RequestRegistry()
+        app._trend_inflight = {}
+        app._start_worker = mock.Mock(return_value=True)
+        app._ensure_trend = lambda sensor_id: AirloomApplication._ensure_trend(
+            app, sensor_id
+        )
+        request = app.controller.begin_refresh()
+        clients = []
+
+        def offline(_key):
+            client = mock.Mock()
+            client.fetch_rows.side_effect = PurpleAirError("PurpleAir is down.")
+            clients.append(client)
+            return client
+
+        with mock.patch.object(app_module, "_new_purpleair_client", side_effect=offline):
+            # No cached area exists, so the outage falls back to demo data.
+            outcome = app_module._fetch_readings(
+                app.store.data, None, request, request.bounds, 120
+            )
+            self.assertEqual(outcome.origin, "demo")
+            app._finish_refresh(outcome)
+            clients.clear()
+            demo = app.sensors[3]
+            app._on_script_message(
+                None, ScriptMessage({"action": "select", "id": demo.sensor_id})
+            )
+
+        self.assertEqual(demo.origin, "demo")
+        self.assertEqual(clients, [])
+        app._start_worker.assert_not_called()
+        self.assertEqual(cache.trend_calls, [])
+        trends = [
+            payload
+            for event, payload in app.sent
+            if event == "trend" and payload["sensor_id"] == demo.sensor_id
+        ]
+        self.assertEqual(trends[-1]["status"], "loaded")
+        self.assertEqual(trends[-1]["trend"], demo.trend)
+
+
 class AlertAdapterTest(ApplicationAdapterTestCase):
     def test_only_fresh_real_crossing_alerts_once(self):
         cases = (

@@ -1630,7 +1630,9 @@ class AirloomApplication(Adw.Application):
             self.requests.finish(token)
             return
 
-        if not self.store.data.get("api_key"):
+        # Provenance, not key presence, decides: demo fallback after an outage
+        # keeps the key but its synthetic IDs must never reach PurpleAir.
+        if sensor.origin == "demo" or not self.store.data.get("api_key"):
             status = "loaded" if sensor.trend else "unavailable"
             self._send_trend_state(
                 sensor_id, token, status, reading_last_seen, sensor.trend
