@@ -359,6 +359,9 @@ def scenario_labels(app: DebugApp):
     check("demo" in state["source"].lower(), f"data source names demo data ({state['source']!r})")
     check(eval_js(sock, "document.querySelector('#shell-status').hidden") is True,
           "no shell recovery notice during a healthy launch")
+    check(state["reducedMotion"] is False and eval_js(
+        sock, "document.documentElement.classList.contains('reduce-motion')") is False,
+          "default system animations keep animated navigation")
 
     coverage_js = """(() => { const e = document.querySelector("#coverage-status");
       return e.hidden ? "" : e.textContent; })()"""
@@ -590,26 +593,35 @@ def scenario_shell_recovery(app: DebugApp):
     check(True, "manual Reload restores a healthy interface")
 
 
-def scenario_reduced_motion(app: DebugApp):
-    print("— reduced motion jumps instead of animating —")
-    # WebKitGTK 6 does not derive prefers-reduced-motion from GTK's
-    # gtk-enable-animations setting (checked on Fedora 44), so the media
-    # query is forced inside the page; the fly itself runs for real.
-    sock = app.sock_path
-    eval_js(sock, """(() => {
-      window.__realMatchMedia = window.__realMatchMedia || window.matchMedia;
-      window.matchMedia = (query) => ({ media: query, matches: query.includes("prefers-reduced-motion"),
-        addEventListener() {}, removeEventListener() {} });
-      return "forced";
-    })()""")
+def scenario_reduced_motion(root: Path, geocoder: GeocoderStub):
+    print("— disabled system animations reach the UI as reduced motion —")
+    # A private settings.ini turns GTK animations off for this instance only;
+    # GTK honors it when it is not asking a settings portal. The page's own
+    # prefers-reduced-motion query stays false, so passing proves the shell
+    # bridge, not the browser media query.
+    app = DebugApp(root, "reduced-motion", geocoder.url, extra_env={"GDK_DEBUG": "no-portals"})
+    settings = app.config_home / "gtk-4.0" / "settings.ini"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("[Settings]\ngtk-enable-animations=false\n", encoding="utf-8")
     try:
-        eval_js(sock, location_js(FLY_TARGET))
-        check(near(request(sock, "state")["center"], FLY_TARGET), "a reduced-motion fly lands immediately")
+        app.start().wait_ready()
+        sock = app.sock_path
+        check(eval_js(sock, "matchMedia('(prefers-reduced-motion: reduce)').matches") is False,
+              "WebKit's own media query does not report the GTK setting")
+        wait_for(lambda: request(sock, "state")["reducedMotion"] is True, 10, "the bridged motion preference")
+        check(eval_js(sock, "document.documentElement.classList.contains('reduce-motion')") is True,
+              "the effective preference reaches CSS")
+        animation = eval_js(sock, """(() => {
+          document.body.classList.add("loading");
+          const name = getComputedStyle(document.querySelector("#loading-pulse")).animationName;
+          document.body.classList.remove("loading");
+          return name;
+        })()""")
+        check(animation == "none", f"decorative loading pulse does not animate ({animation})")
+        eval_js(sock, location_js(AWAY))
+        check(near(request(sock, "state")["center"], AWAY), "a fly lands immediately without animation")
     finally:
-        eval_js(sock, "(() => { window.matchMedia = window.__realMatchMedia; return 'restored'; })()")
-    eval_js(sock, location_js(AWAY))
-    wait_for(lambda: near(request(sock, "state")["center"], AWAY), 15, "an animated fly back to Seattle")
-    check(True, "ordinary motion animates again once the preference is gone")
+        app.stop()
 
 
 def make_stripped_tree(destination: Path, source: Path = PROJECT) -> Path:
@@ -942,11 +954,11 @@ APP_SCENARIOS = {
     "focus": scenario_keyboard_focus,
     "filters": scenario_filters,
     "trend-retry": scenario_trend_retry,
-    "reduced-motion": scenario_reduced_motion,
     "shell-recovery": scenario_shell_recovery,  # reloads the page; keep last
 }
 STANDALONE_SCENARIOS = {
     "layouts": lambda root, _geocoder: scenario_layouts(root),
+    "reduced-motion": scenario_reduced_motion,
     "stripped-debug": scenario_stripped_debug,
 }
 ALL_SCENARIOS = [*APP_SCENARIOS, *STANDALONE_SCENARIOS]

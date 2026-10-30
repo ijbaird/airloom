@@ -898,6 +898,56 @@ class ShellRecoveryTest(ApplicationAdapterTestCase):
         self.assertTrue(statuses[-1]["can_reload"])
 
 
+class FakeGtkSettings:
+    def __init__(self, animations):
+        self.props = SimpleNamespace(gtk_enable_animations=animations)
+        self.handlers = []
+
+    def connect(self, signal, handler):
+        self.handlers.append((signal, handler))
+        return len(self.handlers)
+
+
+class MotionPreferenceAdapterTest(ApplicationAdapterTestCase):
+    def _with_settings(self, settings):
+        gtk = SimpleNamespace(Settings=SimpleNamespace(get_default=lambda: settings))
+        return mock.patch.object(app_module, "Gtk", gtk)
+
+    def motion_events(self, app):
+        return [payload for event, payload in app.sent if event == "motion"]
+
+    def test_ready_publishes_disabled_system_animations_as_reduced_motion(self):
+        app = self.make_app()
+        app._paint_cached_home = lambda: None
+        app.refresh = lambda *args, **kwargs: None
+        with self._with_settings(FakeGtkSettings(False)):
+            app._on_script_message(None, ScriptMessage({"action": "ready"}))
+        self.assertEqual(self.motion_events(app), [{"reduced": True}])
+
+    def test_ready_publishes_enabled_animations_and_tolerates_no_settings(self):
+        for settings, expected in ((FakeGtkSettings(True), False), (None, False)):
+            with self.subTest(settings=settings):
+                app = self.make_app()
+                app._paint_cached_home = lambda: None
+                app.refresh = lambda *args, **kwargs: None
+                with self._with_settings(settings):
+                    app._on_script_message(None, ScriptMessage({"action": "ready"}))
+                self.assertEqual(self.motion_events(app), [{"reduced": expected}])
+
+    def test_system_animation_changes_are_republished_live(self):
+        settings = FakeGtkSettings(True)
+        app = self.make_app()
+        with self._with_settings(settings):
+            app._watch_motion_preference()
+            self.assertEqual([signal for signal, _ in settings.handlers],
+                             ["notify::gtk-enable-animations"])
+            settings.props.gtk_enable_animations = False
+            settings.handlers[0][1](settings, None)
+            settings.props.gtk_enable_animations = True
+            settings.handlers[0][1](settings, None)
+        self.assertEqual(self.motion_events(app), [{"reduced": True}, {"reduced": False}])
+
+
 class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
     def test_all_supported_scales_persist_and_apply_to_the_webview(self):
         for scale in (1.0, 1.25, 1.5):

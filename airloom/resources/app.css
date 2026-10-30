@@ -210,6 +210,9 @@ fieldset label { display: flex; align-items: center; gap: calc(5px * var(--inter
 .dialog-actions .secondary { background: var(--soft); color: var(--ink); }
 .dialog-actions .primary { background: var(--accent); color: white; }
 
+/* Effective reduced motion (GTK setting bridged by the shell, or the media query). */
+.reduce-motion *, .reduce-motion *::before, .reduce-motion *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+
 @media (max-width: 640px) {
   .search-overlay { top: calc(10px * var(--interface-scale)); left: calc(10px * var(--interface-scale)); width: calc(100vw - 20px); }
   .summary-chip { top: calc(64px * var(--interface-scale)); left: calc(10px * var(--interface-scale)); right: auto; max-width: calc(100vw - 20px); }

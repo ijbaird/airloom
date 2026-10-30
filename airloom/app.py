@@ -595,6 +595,7 @@ class AirloomApplication(Adw.Application):
         self.webview.connect("notify::zoom-level", self._on_zoom_level_changed)
         self.webview.set_zoom_level(self._interface_scale())
         self.webview.load_uri(BUNDLED_ENTRY_URI)
+        self._watch_motion_preference()
 
         # WebKitGTK's own gesture controller silently claims trackpad pinch
         # as an internal page-scale zoom before the DOM ever sees a
@@ -799,6 +800,23 @@ class AirloomApplication(Adw.Application):
         )
         self.webview.set_zoom_level(self._interface_scale())
         self.webview.load_uri(BUNDLED_ENTRY_URI)
+
+    # WebKitGTK does not derive prefers-reduced-motion from GTK's animation
+    # setting, so the shell forwards it; the page combines it with the query.
+    @staticmethod
+    def _gtk_settings():
+        settings_class = getattr(Gtk, "Settings", None)
+        return settings_class.get_default() if settings_class is not None else None
+
+    def _watch_motion_preference(self) -> None:
+        settings = self._gtk_settings()
+        if settings is not None:
+            settings.connect("notify::gtk-enable-animations", self._send_motion_preference)
+
+    def _send_motion_preference(self, *_args) -> None:
+        settings = self._gtk_settings()
+        reduced = settings is not None and not settings.props.gtk_enable_animations
+        self._send("motion", {"reduced": reduced})
 
     def _interface_scale(self) -> float:
         scale = self.store.data.get("interface_scale", 1.0)
@@ -1018,6 +1036,7 @@ class AirloomApplication(Adw.Application):
             self._reload_shell()
         elif action == "ready":
             self._send("config", self.store.public_config())
+            self._send_motion_preference()
             recovery_notice = getattr(self, "_shell_recovery_notice", None)
             if recovery_notice:
                 self._shell_recovery_notice = None

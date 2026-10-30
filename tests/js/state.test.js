@@ -560,6 +560,44 @@ test("reduced motion completes flight immediately", () => {
   assertCenter(app, { lat: 10, lon: 20 });
 });
 
+test("system reduced-motion preference from the shell skips flight animation", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.context.Airloom.receive("motion", { reduced: true });
+  assert.equal(app.document.documentElement.classList.contains("reduce-motion"), true);
+  assert.equal(app.context.Airloom.debugState().reducedMotion, true);
+
+  app.context.Airloom.receive("location", { latitude: 10, longitude: 20, name: "Target", source: "fixed" });
+  assertCenter(app, { lat: 10, lon: 20 });
+  app.elements.get("zoom-in").click();
+  assert.equal(app.context.Airloom.debugState().zoom, 13);
+});
+
+test("re-enabled system animations animate again unless the browser asks otherwise", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.context.Airloom.receive("motion", { reduced: true });
+  app.context.Airloom.receive("motion", { reduced: false });
+  assert.equal(app.document.documentElement.classList.contains("reduce-motion"), false);
+  assert.equal(app.context.Airloom.debugState().reducedMotion, false);
+  app.context.Airloom.receive("location", { latitude: 10, longitude: 20, name: "Target", source: "fixed" });
+  assert.notEqual(app.context.Airloom.debugState().center.lat, 10);
+
+  const media = loadApp({ reducedMotion: true });
+  configureMap(media);
+  media.context.Airloom.receive("motion", { reduced: false });
+  assert.equal(media.context.Airloom.debugState().reducedMotion, true, "the media query still applies");
+  assert.equal(media.document.documentElement.classList.contains("reduce-motion"), true);
+});
+
+test("effective reduced motion also stops decorative CSS motion", () => {
+  const css = fs.readFileSync(cssPath, "utf8");
+  const rule = css.match(/\.reduce-motion \*,[^{]*\{([^}]*)\}/);
+  assert.ok(rule, "a .reduce-motion rule must cover every element");
+  assert.match(rule[1], /animation:\s*none\s*!important/);
+  assert.match(rule[1], /transition:\s*none\s*!important/);
+});
+
 test("reduced motion completes button zoom immediately", () => {
   const app = loadApp({ reducedMotion: true });
   configureMap(app);

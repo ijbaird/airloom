@@ -21,6 +21,9 @@
     placeRequests: { main: null, home: null },
     nextPlaceRequestId: 0,
     trends: new Map(),
+    // The desktop shell forwards GTK's animation setting, which WebKitGTK
+    // does not expose as prefers-reduced-motion.
+    systemReducedMotion: false,
     // Save is acknowledged only by the settings-save-result carrying this id;
     // other config or error publications never complete a pending Save.
     settingsSaveRequestId: null,
@@ -91,6 +94,7 @@
       if (event === "location") applyLocation(payload);
       if (event === "view-name" && payload.name) { state.viewName = payload.name; stampPlaceName(); }
       if (event === "pinch") nativePinch(payload);
+      if (event === "motion") { state.systemReducedMotion = payload.reduced === true; applyMotionPreference(); }
       if (event === "trend") applyTrend(payload);
       if (event === "places") applyPlaces(payload);
     },
@@ -111,6 +115,7 @@
       hiddenCount: (state.config.hidden || []).length,
       source: state.source,
       viewportScale: window.visualViewport ? window.visualViewport.scale : null,
+      reducedMotion: prefersReducedMotion(),
     }),
     debugSearch(query) {
       const input = $("#search");
@@ -928,7 +933,12 @@
   }
 
   const navigation = new AirloomState.NavigationGate();
-  const prefersReducedMotion = () => Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+  const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+  const prefersReducedMotion = () => state.systemReducedMotion || Boolean(window.matchMedia?.(REDUCED_MOTION_QUERY)?.matches);
+  // CSS reads the effective preference from this class (see app.css).
+  function applyMotionPreference() {
+    document.documentElement.classList.toggle("reduce-motion", prefersReducedMotion());
+  }
   let zoomAnim = null;
 
   function cancelZoomAnimation() {
@@ -1542,6 +1552,8 @@
     });
   });
   new ResizeObserver(() => renderMap()).observe($("#map-panel"));
+  window.matchMedia?.(REDUCED_MOTION_QUERY)?.addEventListener?.("change", applyMotionPreference);
+  applyMotionPreference();
   bridge({ action: "ready" });
   // Makes the interface directly previewable in an ordinary browser while the
   // desktop build continues to receive its state from the Python bridge.
