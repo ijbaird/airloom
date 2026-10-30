@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 import sys
 import tempfile
 import types
 import unittest
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +40,7 @@ from airloom.controller import ApplicationController
 from airloom.geography import Bounds
 from airloom.models import Sensor
 from airloom.purpleair import FetchResult, PurpleAirError
+from airloom.store import Store
 
 
 NOW = 1_800_000_000
@@ -126,14 +129,13 @@ class FakeStore:
     def public_config(self):
         return {"location_filter": self.data["location_filter"]}
 
-    def save(self):
+    def apply(self, candidate):
         self.saves += 1
+        self.data = deepcopy(candidate)
+        return self.data
 
-
-class FailingAlertStore(FakeStore):
     def save(self):
-        self.saves += 1
-        raise OSError("alert state disk full")
+        self.apply(deepcopy(self.data))
 
 
 class FakeCache:
@@ -160,6 +162,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app.store = store or FakeStore()
         app.cache = cache
         app.controller = ApplicationController(app.store.data)
+        app._shutting_down = False
         app.sensors = []
         app._area_ids = set()
         app._monitoring_ids = set()
@@ -511,34 +514,50 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         self.assertIsNone(app.pending_fetch)
         self.assertFalse(app.refreshing)
 
-    def test_alert_save_failure_still_drains_pending_refresh(self):
-        store = FailingAlertStore(favorites=[1], alert_states={"1": False})
-        app = self.make_app(store=store)
-        reading = make_sensor(1, favorite=True)
-        outcome = self.make_outcome(app, [reading])
-        app.pending_fetch = replace(outcome.request, request_id=999)
-        app.refreshing = True
-
-        with (
-            mock.patch.object(app_module.time, "time", return_value=NOW),
-            mock.patch.object(app_module.Notify, "Notification") as notification_type,
-        ):
-            notification_type.new.return_value.show.return_value = None
-            app._finish_refresh(outcome)
-
-        self.assertEqual(len(app.launched), 1)
-        self.assertEqual(app.launched[0][0].request_id, 999)
-        self.assertIsNone(app.pending_fetch)
-        self.assertFalse(app.refreshing)
-        self.assertEqual(len(self.sensor_payloads(app)), 1)
-        self.assertIn(
-            "Could not save alert state",
-            [payload.get("message", "") for event, payload in app.sent if event == "error"][-1],
+    def test_alert_permission_and_space_failures_preserve_state_and_drain_pending_refresh(self):
+        failures = (
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
         )
-        self.assertEqual(
-            [payload for event, payload in app.sent if event == "loading"][-1],
-            {"active": False},
-        )
+        for failure in failures:
+            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                store = Store(Path(directory) / "config.json")
+                store.data.update({"favorites": [1], "alert_states": {"1": False}})
+                store.save()
+                previous = deepcopy(store.data)
+                app = self.make_app(store=store)
+                reading = make_sensor(1, favorite=True)
+                outcome = self.make_outcome(app, [reading])
+                app.pending_fetch = replace(outcome.request, request_id=999)
+                app.refreshing = True
+
+                with (
+                    mock.patch.object(store, "_write", side_effect=failure),
+                    mock.patch.object(app_module.time, "time", return_value=NOW),
+                    mock.patch.object(app_module.Notify, "Notification") as notification_type,
+                ):
+                    notification_type.new.return_value.show.return_value = None
+                    app._finish_refresh(outcome)
+
+                self.assertEqual(len(app.launched), 1)
+                self.assertEqual(app.launched[0][0].request_id, 999)
+                self.assertIsNone(app.pending_fetch)
+                self.assertFalse(app.refreshing)
+                self.assertEqual(len(self.sensor_payloads(app)), 1)
+                self.assertIn(
+                    "Could not save alert state",
+                    [
+                        payload.get("message", "")
+                        for event, payload in app.sent
+                        if event == "error"
+                    ][-1],
+                )
+                self.assertEqual(
+                    [payload for event, payload in app.sent if event == "loading"][-1],
+                    {"active": False},
+                )
+                self.assertEqual(store.data, previous)
+                self.assertEqual(Store(store.path).data, previous)
 
 
 class AlertAdapterTest(ApplicationAdapterTestCase):

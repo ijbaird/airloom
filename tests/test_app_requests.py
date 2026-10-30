@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import errno
 import io
+import json
 import sys
+import tempfile
 import threading
 import types
 import unittest
+from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -31,10 +36,12 @@ except (ImportError, ValueError):
 
 from airloom import geocode as geocode_module
 from airloom.app import AirloomApplication
+from airloom.controller import ApplicationController
 from airloom.geocode import Place
 from airloom.models import Sensor
 from airloom.purpleair import FetchResult, PurpleAirError
 from airloom.requests import RequestRegistry
+from airloom.store import Store
 
 
 CONFIG = {
@@ -75,8 +82,13 @@ class FakeStore:
         self.data = {**CONFIG, **updates}
         self.saves = 0
 
-    def save(self):
+    def apply(self, candidate):
         self.saves += 1
+        self.data = deepcopy(candidate)
+        return self.data
+
+    def save(self):
+        self.apply(deepcopy(self.data))
 
     def public_config(self):
         return {
@@ -91,12 +103,24 @@ class FakeStore:
 class FakeCache:
     def __init__(self):
         self.stored = []
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
 
     def get_trend(self, _sensor_id, _ttl):
         return None
 
     def store_trend(self, sensor_id, trend):
         self.stored.append((sensor_id, trend))
+
+
+class ScriptMessage:
+    def __init__(self, message):
+        self.message = message
+
+    def to_json(self, _options=0):
+        return json.dumps(self.message)
 
 
 class FakeWindow:
@@ -163,6 +187,14 @@ class ApplicationRequestTestCase(unittest.TestCase):
         app.cache = FakeCache()
         app.controller = SimpleNamespace(set_config=lambda _config: None)
         app.requests = RequestRegistry()
+        app._shutting_down = False
+        app._worker_lock = threading.Lock()
+        app._active_workers = 0
+        app._cache_closed = False
+        app._debug_port = None
+        app._auto_refresh_id = None
+        app.refreshing = False
+        app.pending_fetch = None
         app.sensors = list(sensors)
         app.selected_id = None
         app._trend_inflight = {}
@@ -652,6 +684,348 @@ class LocationModeRequestTest(ApplicationRequestTestCase):
         app._start_locator.assert_not_called()
         self.assertIsNone(app._locator_focus_handler)
         self.assertIsNone(app._locator_focus_fallback)
+
+
+class TransactionalActionTest(ApplicationRequestTestCase):
+    def make_real_store_app(self, directory, *, sensors=()):
+        app = self.make_app(sensors=sensors)
+        app.store = Store(Path(directory) / "config.json")
+        app.store.save()
+        return app
+
+    @staticmethod
+    def capture_os_error(callback):
+        try:
+            callback()
+        except OSError as exc:
+            return exc
+        return None
+
+    @staticmethod
+    def settings_message():
+        return {
+            "request_id": "settings-17",
+            "radius_km": 55.5,
+            "heatmap_threshold_km": 50.0,
+            "alert_threshold": 101,
+            "home_mode": "fixed",
+            "temperature_unit": "F",
+            "confidence_filter": True,
+            "refresh_minutes": 2,
+            "home_lat": 30.0,
+            "home_lon": 40.0,
+            "location_name": "Pinned home",
+        }
+
+    def test_settings_permission_and_space_failures_preserve_memory_disk_and_acknowledge(self):
+        failures = (
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        )
+        for failure in failures:
+            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                app = self.make_real_store_app(directory)
+                path = app.store.path
+                previous = deepcopy(app.store.data)
+                with mock.patch.object(app.store, "_write", side_effect=failure):
+                    caught = self.capture_os_error(
+                        lambda: app._save_settings(self.settings_message())
+                    )
+
+                self.assertIsNone(caught)
+                self.assertEqual(app.store.data, previous)
+                self.assertEqual(Store(path).data, previous)
+                self.assertEqual(
+                    [payload for event, payload in app.sent if event == "config"], []
+                )
+                results = [
+                    payload
+                    for event, payload in app.sent
+                    if event == "settings-save-result"
+                ]
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["request_id"], "settings-17")
+                self.assertEqual(results[0]["status"], "error")
+                self.assertIn(str(failure), results[0]["error"])
+                self.assertIn("try again", results[0]["error"].lower())
+
+    def test_successful_settings_save_publishes_config_and_matching_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.make_real_store_app(directory)
+
+            app._save_settings(self.settings_message())
+
+            self.assertEqual(app.store.data["location_name"], "Pinned home")
+            self.assertEqual(Store(app.store.path).data, app.store.data)
+            published = [
+                (event, payload)
+                for event, payload in app.sent
+                if event in ("config", "settings-save-result")
+            ]
+            self.assertEqual([event for event, _payload in published], [
+                "config",
+                "settings-save-result",
+            ])
+            self.assertEqual(
+                published[1][1],
+                {"request_id": "settings-17", "status": "success", "error": None},
+            )
+
+    def test_favorite_permission_and_space_failures_are_actionable_and_unchanged(self):
+        failures = (
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        )
+        for failure in failures:
+            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                sensor = make_sensor(1)
+                app = self.make_real_store_app(directory, sensors=[sensor])
+                with mock.patch.object(app.store, "_write", side_effect=failure):
+                    caught = self.capture_os_error(
+                        lambda: app._on_script_message(
+                            None, ScriptMessage({"action": "favorite", "id": 1})
+                        )
+                    )
+
+                self.assertIsNone(caught)
+                self.assertEqual(app.store.data["favorites"], [])
+                self.assertEqual(Store(app.store.path).data["favorites"], [])
+                self.assertFalse(sensor.favorite)
+                self.assertEqual(app.sensor_state_sends, 0)
+                errors = [
+                    payload["message"]
+                    for event, payload in app.sent
+                    if event == "error"
+                ]
+                self.assertEqual(len(errors), 1)
+                self.assertIn("favorite", errors[0].lower())
+                self.assertIn(str(failure), errors[0])
+                self.assertIn("try again", errors[0].lower())
+
+    def test_hide_permission_and_space_failures_are_actionable_and_unchanged(self):
+        failures = (
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        )
+        for failure in failures:
+            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                sensor = make_sensor(1)
+                app = self.make_real_store_app(directory, sensors=[sensor])
+                with mock.patch.object(app.store, "_write", side_effect=failure):
+                    caught = self.capture_os_error(
+                        lambda: app._on_script_message(
+                            None, ScriptMessage({"action": "hide", "id": 1})
+                        )
+                    )
+
+                self.assertIsNone(caught)
+                self.assertEqual(app.store.data["hidden"], {})
+                self.assertEqual(Store(app.store.path).data["hidden"], {})
+                self.assertEqual(app.sensor_state_sends, 0)
+                errors = [
+                    payload["message"]
+                    for event, payload in app.sent
+                    if event == "error"
+                ]
+                self.assertEqual(len(errors), 1)
+                self.assertIn("hide", errors[0].lower())
+                self.assertIn(str(failure), errors[0])
+                self.assertIn("try again", errors[0].lower())
+
+    def test_invalid_settings_also_receive_matching_error_result(self):
+        app = self.make_app()
+        previous = deepcopy(app.store.data)
+        message = self.settings_message()
+        del message["radius_km"]
+
+        app._save_settings(message)
+
+        self.assertEqual(app.store.data, previous)
+        results = [
+            payload
+            for event, payload in app.sent
+            if event == "settings-save-result"
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["request_id"], "settings-17")
+        self.assertEqual(results[0]["status"], "error")
+        self.assertIn("radius_km", results[0]["error"])
+        self.assertEqual(
+            [payload for event, payload in app.sent if event == "config"], []
+        )
+
+    def test_unhide_permission_and_space_failures_are_actionable_and_unchanged(self):
+        failures = (
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        )
+        for action in ("unhide", "unhide-all"):
+            for failure in failures:
+                with self.subTest(action=action, error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                    app = self.make_real_store_app(directory)
+                    app.store.data["hidden"] = {"1": "Sensor 1"}
+                    app.store.save()
+                    with mock.patch.object(app.store, "_write", side_effect=failure):
+                        caught = self.capture_os_error(
+                            lambda: app._on_script_message(
+                                None, ScriptMessage({"action": action, "id": 1})
+                            )
+                        )
+
+                    self.assertIsNone(caught)
+                    self.assertEqual(app.store.data["hidden"], {"1": "Sensor 1"})
+                    self.assertEqual(
+                        Store(app.store.path).data["hidden"], {"1": "Sensor 1"}
+                    )
+                    self.assertEqual(app.sensor_state_sends, 0)
+                    errors = [
+                        payload["message"]
+                        for event, payload in app.sent
+                        if event == "error"
+                    ]
+                    self.assertEqual(len(errors), 1)
+                    self.assertIn("unhide", errors[0].lower())
+                    self.assertIn(str(failure), errors[0])
+                    self.assertIn("try again", errors[0].lower())
+
+    def test_filter_permission_and_space_failures_are_actionable_and_unchanged(self):
+        failures = (
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        )
+        for failure in failures:
+            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                app = self.make_real_store_app(directory)
+                refreshes = []
+                app.refresh = lambda *args, **_kwargs: refreshes.append(args)
+                with mock.patch.object(app.store, "_write", side_effect=failure):
+                    caught = self.capture_os_error(
+                        lambda: app._set_location_filter({"value": "indoor"})
+                    )
+
+                self.assertIsNone(caught)
+                self.assertEqual(app.store.data["location_filter"], "outdoor")
+                self.assertEqual(Store(app.store.path).data["location_filter"], "outdoor")
+                self.assertEqual(refreshes, [])
+                self.assertEqual(
+                    [payload for event, payload in app.sent if event == "config"], []
+                )
+                errors = [
+                    payload["message"]
+                    for event, payload in app.sent
+                    if event == "error"
+                ]
+                self.assertEqual(len(errors), 1)
+                self.assertIn("location filter", errors[0].lower())
+                self.assertIn(str(failure), errors[0])
+                self.assertIn("try again", errors[0].lower())
+
+
+class ShutdownLifecycleTest(ApplicationRequestTestCase):
+    def test_shutdown_cleans_every_owned_resource_exactly_once(self):
+        app = self.make_app()
+        locator = FakeLocator()
+        debug_stops = []
+        removed_sources = []
+        app.locator = locator
+        app._debug_port = SimpleNamespace(stop=lambda: debug_stops.append(True))
+        app._auto_refresh_id = 11
+        app._locator_focus_handler = 21
+        app._locator_focus_fallback = 22
+        app.pending_fetch = object()
+        app.refreshing = True
+        shutdown = getattr(app, "_on_shutdown", None)
+        self.assertIsNotNone(shutdown)
+
+        with mock.patch.object(
+            app_module.GLib, "source_remove", new=removed_sources.append
+        ):
+            shutdown()
+            shutdown()
+
+        self.assertEqual(removed_sources, [11, 22])
+        self.assertEqual(app.window.disconnected, [21])
+        self.assertEqual(locator.cancel_calls, 1)
+        self.assertEqual(debug_stops, [True])
+        self.assertEqual(app.cache.close_calls, 1)
+        self.assertIsNone(app._auto_refresh_id)
+        self.assertIsNone(app._locator_focus_handler)
+        self.assertIsNone(app._locator_focus_fallback)
+        self.assertIsNone(app.pending_fetch)
+        self.assertFalse(app.refreshing)
+
+    def test_shutdown_rejects_new_work_and_invalidates_old_callbacks(self):
+        sensor = make_sensor(1)
+        app = self.make_app(sensors=[sensor])
+        app.controller = ApplicationController(app.store.data)
+        app.webview = object()
+        old_refresh = app.controller.begin_refresh()
+        old_search = app.requests.begin("place-search:main")
+        shutdown = getattr(app, "_on_shutdown", None)
+        self.assertIsNotNone(shutdown)
+        shutdown()
+        previous = deepcopy(app.store.data)
+        threads = ThreadQueue()
+        replies = []
+
+        with mock.patch.object(app_module.threading, "Thread", new=threads.factory):
+            AirloomApplication.refresh(app, force=True)
+            app._on_place_search(
+                {"request_id": "new", "context": "main", "query": "new work"}
+            )
+            app._ensure_trend(1)
+            app._start_view_label(10.0, 20.0)
+            app._on_location_fix(30.0, 40.0, 50.0)
+            app._on_script_message(
+                None,
+                ScriptMessage({
+                    "action": "save-settings",
+                    **TransactionalActionTest.settings_message(),
+                }),
+            )
+            app._dispatch_debug_command({"cmd": "ping"}, replies.append)
+
+        self.assertEqual(threads.threads, [])
+        self.assertFalse(app.requests.is_current(old_search))
+        self.assertFalse(
+            app.controller.complete_refresh(
+                old_refresh, [sensor], "live", "network"
+            ).publish
+        )
+        self.assertEqual(app.store.data, previous)
+        self.assertEqual(
+            [
+                payload
+                for event, payload in app.sent
+                if event == "settings-save-result"
+            ],
+            [],
+        )
+        self.assertEqual(len(replies), 1)
+        self.assertFalse(replies[0]["ok"])
+        self.assertIn("shutting down", replies[0]["error"])
+
+    def test_shutdown_closes_cache_after_active_worker_drains(self):
+        app = self.make_app()
+        threads = ThreadQueue()
+        completed = []
+        start_worker = getattr(app, "_start_worker", None)
+        self.assertIsNotNone(start_worker)
+
+        with mock.patch.object(app_module.threading, "Thread", new=threads.factory):
+            admitted = start_worker(
+                lambda: completed.append(True), name="airloom-test-worker"
+            )
+            self.assertTrue(admitted)
+            app._on_shutdown()
+            self.assertEqual(app.cache.close_calls, 0)
+            threads.threads[0].run()
+
+        self.assertEqual(completed, [True])
+        self.assertEqual(app._active_workers, 0)
+        self.assertEqual(app.cache.close_calls, 1)
+        app._on_shutdown()
+        self.assertEqual(app.cache.close_calls, 1)
 
 
 class DebugDispatcherRequestTest(ApplicationRequestTestCase):

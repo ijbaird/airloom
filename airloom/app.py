@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -426,6 +427,10 @@ class AirloomApplication(Adw.Application):
         self.store = Store()
         self.controller = ApplicationController(self.store.data)
         self.requests = RequestRegistry()
+        self._worker_lock = threading.Lock()
+        self._active_workers = 0
+        self._cache_closed = False
+        self._shutting_down = False
         self.cache, self._cache_error = _open_sensor_cache()
         self._auto_refresh_id: int | None = None
         self.window: Adw.ApplicationWindow | None = None
@@ -460,8 +465,73 @@ class AirloomApplication(Adw.Application):
         self._pinch_gesture: Gtk.GestureZoom | None = None
         self._debug_port: DebugPort | None = None
         self.connect("activate", self._on_activate)
+        self.connect("shutdown", self._on_shutdown)
+
+    def _start_worker(self, target, *, name: str, args=()) -> bool:
+        """Admit one tracked worker unless shutdown has begun."""
+        with self._worker_lock:
+            if self._shutting_down:
+                return False
+            self._active_workers += 1
+
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                self._worker_finished()
+
+        try:
+            threading.Thread(target=run, name=name, daemon=True).start()
+        except BaseException:
+            self._worker_finished()
+            raise
+        return True
+
+    def _worker_finished(self) -> None:
+        with self._worker_lock:
+            self._active_workers -= 1
+        self._close_cache_if_drained()
+
+    def _close_cache_if_drained(self) -> None:
+        with self._worker_lock:
+            if (
+                not self._shutting_down
+                or self._active_workers
+                or self._cache_closed
+            ):
+                return
+            self._cache_closed = True
+            cache = self.cache
+        if cache is not None:
+            cache.close()
+
+    def _on_shutdown(self, _application=None) -> None:
+        with self._worker_lock:
+            if self._shutting_down:
+                return
+            self._shutting_down = True
+
+        self.pending_fetch = None
+        self.refreshing = False
+        self.requests.invalidate()
+        # The pure controller has its own refresh registry. Advancing the
+        # configuration generation invalidates every outstanding completion.
+        self.controller.set_config(self.store.data)
+        if self._auto_refresh_id is not None:
+            GLib.source_remove(self._auto_refresh_id)
+            self._auto_refresh_id = None
+        self._clear_locator_focus_wait()
+        if self.locator is not None:
+            self.locator.cancel()
+            self.locator = None
+        if self._debug_port is not None:
+            self._debug_port.stop()
+            self._debug_port = None
+        self._close_cache_if_drained()
 
     def _on_activate(self, _application) -> None:
+        if self._shutting_down:
+            return
         if self.window:
             self.window.present()
             return
@@ -577,12 +647,16 @@ class AirloomApplication(Adw.Application):
         return build or None
 
     def _start_locator(self) -> None:
+        if self._shutting_down:
+            return
         if self.locator is not None:
             self.locator.cancel()
         self.locator = GeoClueLocator()
         self.locator.start(self._on_location_fix)
 
     def _start_locator_when_focused(self) -> None:
+        if self._shutting_down:
+            return
         # GNOME Shell only shows the location-permission dialog for the
         # focused app; a request fired before our window is focused crashes
         # the dialog and comes back as a denial (gnome-shell#7548). Wait for
@@ -629,11 +703,15 @@ class AirloomApplication(Adw.Application):
         return int(self.store.data.get("refresh_minutes", 2)) * 60
 
     def _arm_auto_refresh(self) -> None:
+        if self._shutting_down:
+            return
         if self._auto_refresh_id is not None:
             GLib.source_remove(self._auto_refresh_id)
         self._auto_refresh_id = GLib.timeout_add_seconds(self._refresh_seconds(), self._auto_refresh)
 
     def _auto_refresh(self) -> bool:
+        if self._shutting_down:
+            return GLib.SOURCE_REMOVE
         # Refresh whatever the user is currently looking at, not home — a user
         # who panned elsewhere shouldn't watch their markers get replaced by
         # home-area sensors on every refresh tick. Favorites are still folded in so
@@ -693,6 +771,8 @@ class AirloomApplication(Adw.Application):
         self._send("pinch", {"phase": "end"})
 
     def _on_location_fix(self, latitude, longitude, accuracy=None) -> None:
+        if self._shutting_down:
+            return
         if self.store.data.get("home_mode") != "auto":
             # A delayed fix from a locator started under auto mode must not
             # clobber coordinates the user has since pinned in fixed mode.
@@ -762,12 +842,11 @@ class AirloomApplication(Adw.Application):
         self._home_name_generation += 1
         generation = self._home_name_generation
         token = self.requests.begin("home-label", generation)
-        threading.Thread(
-            target=self._reverse_label_worker,
+        self._start_worker(
+            self._reverse_label_worker,
             args=(float(latitude), float(longitude), generation, token),
             name="airloom-revgeo",
-            daemon=True,
-        ).start()
+        )
 
     def _reverse_label_worker(
         self,
@@ -801,7 +880,8 @@ class AirloomApplication(Adw.Application):
         config = self.store.data
         current_home = (config.get("latitude"), config.get("longitude"))
         if (
-            self.requests.is_current(token)
+            not self._shutting_down
+            and self.requests.is_current(token)
             and generation == self._home_name_generation
             and config.get("home_mode") == "auto"
             and current_home == (latitude, longitude)
@@ -815,6 +895,8 @@ class AirloomApplication(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def _on_script_message(self, _manager, value) -> None:
+        if self._shutting_down:
+            return
         try:
             if hasattr(value, "to_json"):
                 raw = value.to_json(0)
@@ -844,7 +926,19 @@ class AirloomApplication(Adw.Application):
         elif action == "favorite":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None and any(sensor.sensor_id == sensor_id for sensor in self.sensors):
-                enabled = self.store.toggle_favorite(sensor_id)
+                try:
+                    enabled = self.store.toggle_favorite(sensor_id)
+                except OSError as exc:
+                    self._send(
+                        "error",
+                        {
+                            "message": (
+                                f"Could not save favorite: {exc}. Check disk space and "
+                                "file permissions, then try again."
+                            )
+                        },
+                    )
+                    return
                 self.controller.set_config(self.store.data)
                 for sensor in self.sensors:
                     if sensor.sensor_id == sensor_id:
@@ -854,23 +948,71 @@ class AirloomApplication(Adw.Application):
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None:
                 if self.store.is_hidden(sensor_id):
-                    self.store.unhide(sensor_id)
+                    try:
+                        self.store.unhide(sensor_id)
+                    except OSError as exc:
+                        self._send(
+                            "error",
+                            {
+                                "message": (
+                                    f"Could not unhide sensor: {exc}. Check disk space "
+                                    "and file permissions, then try again."
+                                )
+                            },
+                        )
+                        return
                     self.controller.set_config(self.store.data)
                     self._send_sensor_state()
                 else:
                     sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
                     if sensor is not None:
-                        self.store.hide(sensor_id, sensor.name)
+                        try:
+                            self.store.hide(sensor_id, sensor.name)
+                        except OSError as exc:
+                            self._send(
+                                "error",
+                                {
+                                    "message": (
+                                        f"Could not hide sensor: {exc}. Check disk space "
+                                        "and file permissions, then try again."
+                                    )
+                                },
+                            )
+                            return
                         self.controller.set_config(self.store.data)
                         self._send_sensor_state()
         elif action == "unhide":
             sensor_id = self._message_sensor_id(message)
             if sensor_id is not None:
-                self.store.unhide(sensor_id)
+                try:
+                    self.store.unhide(sensor_id)
+                except OSError as exc:
+                    self._send(
+                        "error",
+                        {
+                            "message": (
+                                f"Could not unhide sensor: {exc}. Check disk space "
+                                "and file permissions, then try again."
+                            )
+                        },
+                    )
+                    return
                 self.controller.set_config(self.store.data)
                 self._send_sensor_state()
         elif action == "unhide-all":
-            self.store.unhide_all()
+            try:
+                self.store.unhide_all()
+            except OSError as exc:
+                self._send(
+                    "error",
+                    {
+                        "message": (
+                            f"Could not unhide all sensors: {exc}. Check disk space "
+                            "and file permissions, then try again."
+                        )
+                    },
+                )
+                return
             self.controller.set_config(self.store.data)
             self._send_sensor_state()
         elif action == "save-settings":
@@ -893,6 +1035,8 @@ class AirloomApplication(Adw.Application):
             return None
 
     def _on_view_changed(self, message: dict) -> None:
+        if self._shutting_down:
+            return
         try:
             view, center = _view_from_message(message)
         except (KeyError, TypeError, ValueError, OverflowError):
@@ -911,15 +1055,16 @@ class AirloomApplication(Adw.Application):
 
     def _start_view_label(self, latitude: float, longitude: float) -> None:
         """Label the summary chip with the area the user is now looking at."""
+        if self._shutting_down:
+            return
         self._view_name_generation += 1
         generation = self._view_name_generation
         token = self.requests.begin("view-label", generation)
-        threading.Thread(
-            target=self._view_label_worker,
+        self._start_worker(
+            self._view_label_worker,
             args=(latitude, longitude, generation, token),
             name="airloom-viewgeo",
-            daemon=True,
-        ).start()
+        )
 
     def _view_label_worker(
         self,
@@ -947,7 +1092,8 @@ class AirloomApplication(Adw.Application):
     ) -> bool:
         center = self.current_view[1] if self.current_view is not None else None
         if (
-            self.requests.is_current(token)
+            not self._shutting_down
+            and self.requests.is_current(token)
             and generation == self._view_name_generation
             and center == (latitude, longitude)
         ):
@@ -956,6 +1102,8 @@ class AirloomApplication(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def _on_place_search(self, message: dict) -> None:
+        if self._shutting_down:
+            return
         raw_query = str(message.get("query") or "")
         query = raw_query.strip()[:120]
         context = message.get("context", "main")
@@ -990,26 +1138,43 @@ class AirloomApplication(Adw.Application):
             finally:
                 _place_search_admission.is_current = None
 
-        threading.Thread(target=worker, name="airloom-geocode", daemon=True).start()
+        self._start_worker(worker, name="airloom-geocode")
 
     def _send_places(self, payload: dict, token: RequestToken) -> bool:
-        if self.requests.is_current(token):
+        if not self._shutting_down and self.requests.is_current(token):
             self._send("places", payload)
         self.requests.finish(token)
         return GLib.SOURCE_REMOVE
 
     def _set_location_filter(self, message: dict) -> None:
+        if self._shutting_down:
+            return
         value = message.get("value")
         if value not in ("outdoor", "indoor", "both"):
             print(f"Airloom: ignored invalid location filter: {value!r}", file=sys.stderr)
             return
-        self.store.data["location_filter"] = value
-        self.store.save()
+        candidate = deepcopy(self.store.data)
+        candidate["location_filter"] = value
+        try:
+            self.store.apply(candidate)
+        except OSError as exc:
+            self._send(
+                "error",
+                {
+                    "message": (
+                        f"Could not save location filter: {exc}. Check disk space "
+                        "and file permissions, then try again."
+                    )
+                },
+            )
+            return
         self.controller.set_config(self.store.data)
         self._send("config", self.store.public_config())
         self.refresh()
 
     def _save_settings(self, message: dict) -> None:
+        if self._shutting_down:
+            return
         previous_mode = self.store.data.get("home_mode")
         previous_home = (self.store.data.get("latitude"), self.store.data.get("longitude"))
         try:
@@ -1038,16 +1203,40 @@ class AirloomApplication(Adw.Application):
                 updates["longitude"] = longitude
                 updates["location_name"] = str(message.get("location_name") or "Custom location")[:80]
         except (KeyError, TypeError, ValueError) as exc:
-            self._send("error", {"message": f"Could not save preferences: {exc}"})
+            error = f"Could not save preferences: {exc}"
+            self._send("error", {"message": error})
+            self._send(
+                "settings-save-result",
+                {
+                    "request_id": message.get("request_id"),
+                    "status": "error",
+                    "error": error,
+                },
+            )
             return
 
-        self.store.data.update(updates)
+        candidate = deepcopy(self.store.data)
+        candidate.update(updates)
         api_key = str(message.get("api_key") or "").strip()
         if message.get("clear_api_key"):
-            self.store.data["api_key"] = ""
+            candidate["api_key"] = ""
         elif api_key:
-            self.store.data["api_key"] = api_key
-        self.store.save()
+            candidate["api_key"] = api_key
+        try:
+            self.store.apply(candidate)
+        except OSError as exc:
+            self._send(
+                "settings-save-result",
+                {
+                    "request_id": message.get("request_id"),
+                    "status": "error",
+                    "error": (
+                        f"Could not save preferences: {exc}. Check disk space and "
+                        "file permissions, then try again."
+                    ),
+                },
+            )
+            return
         self.controller.set_config(self.store.data)
         if home_mode != "auto":
             self._clear_locator_focus_wait()
@@ -1059,6 +1248,14 @@ class AirloomApplication(Adw.Application):
         if self.title:
             self.title.set_subtitle(self.store.data["location_name"])
         self._send("config", self.store.public_config())
+        self._send(
+            "settings-save-result",
+            {
+                "request_id": message.get("request_id"),
+                "status": "success",
+                "error": None,
+            },
+        )
         if home_mode == "auto" and previous_mode != "auto":
             # The user just clicked Save in our UI, so the window is focused
             # and the permission dialog (if any) can appear immediately.
@@ -1109,10 +1306,14 @@ class AirloomApplication(Adw.Application):
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the current view, falling back to home before one exists."""
+        if self._shutting_down:
+            return
         self._start_fetch(self.controller.begin_refresh(force=force))
 
     def _refresh_home(self, force: bool = False) -> None:
         """Explicit recentering is separate from ordinary Refresh actions."""
+        if self._shutting_down:
+            return
         config = self.store.data
         center = (float(config["latitude"]), float(config["longitude"]))
         bounds = bounds_around(*center, float(config["radius_km"]))
@@ -1130,7 +1331,7 @@ class AirloomApplication(Adw.Application):
         self.refresh(force=force)
 
     def _start_fetch(self, request: RefreshRequest) -> None:
-        if not self.webview:
+        if self._shutting_down or not self.webview:
             return
         if self.refreshing:
             # The descriptor is already registered, so its newer identity also
@@ -1147,9 +1348,11 @@ class AirloomApplication(Adw.Application):
             outcome = _fetch_readings(config, self.cache, request, bounds, ttl)
             GLib.idle_add(self._finish_refresh, outcome)
 
-        threading.Thread(target=worker, name="airloom-refresh", daemon=True).start()
+        self._start_worker(worker, name="airloom-refresh")
 
     def _finish_refresh(self, outcome: RefreshOutcome) -> bool:
+        if self._shutting_down:
+            return GLib.SOURCE_REMOVE
         try:
             decision = self.controller.complete_refresh(
                 outcome.request,
@@ -1215,6 +1418,8 @@ class AirloomApplication(Adw.Application):
         Repeated selection reuses identical in-flight work. A newer reading gets
         a new token, so neither an old request nor an old observation can publish.
         """
+        if self._shutting_down:
+            return
         sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
         reading_last_seen = sensor.last_seen if sensor is not None else None
         inflight = self._trend_inflight.get(sensor_id)
@@ -1284,7 +1489,7 @@ class AirloomApplication(Adw.Application):
                 failed,
             )
 
-        threading.Thread(target=worker, name="airloom-trend", daemon=True).start()
+        self._start_worker(worker, name="airloom-trend")
 
     def _finish_trend(
         self,
@@ -1298,7 +1503,8 @@ class AirloomApplication(Adw.Application):
         sensor = next((s for s in self.sensors if s.sensor_id == sensor_id), None)
         owns_inflight = inflight is not None and inflight[0] == token
         authorized = (
-            owns_inflight
+            not self._shutting_down
+            and owns_inflight
             and self.requests.is_current(token)
             and sensor is not None
             and sensor.last_seen == reading_last_seen
@@ -1402,9 +1608,10 @@ class AirloomApplication(Adw.Application):
             except GLib.Error:
                 pass
         if states != previous:
-            self.store.data["alert_states"] = states
+            candidate = deepcopy(self.store.data)
+            candidate["alert_states"] = states
             try:
-                self.store.save()
+                self.store.apply(candidate)
             except Exception as exc:  # noqa: BLE001 — persistence is nonfatal here
                 self._send(
                     "error",
@@ -1412,7 +1619,7 @@ class AirloomApplication(Adw.Application):
                 )
 
     def _send(self, event: str, payload) -> None:
-        if not self.webview:
+        if self._shutting_down or not self.webview:
             return
         # ensure_ascii keeps U+2028/U+2029 (JS line terminators) out of the
         # evaluated source, since the payload is spliced in as a JS literal.
@@ -1428,6 +1635,10 @@ class AirloomApplication(Adw.Application):
     # below this point may touch GTK/WebKit off that thread.
 
     def _dispatch_debug_command(self, message: dict, reply) -> None:
+        if self._shutting_down:
+            reply({"ok": False, "error": "application is shutting down"})
+            return
+
         def run_on_main_loop() -> bool:
             try:
                 self._handle_debug_command(message, reply)
@@ -1438,6 +1649,9 @@ class AirloomApplication(Adw.Application):
         GLib.idle_add(run_on_main_loop)
 
     def _handle_debug_command(self, message: dict, reply) -> None:
+        if self._shutting_down:
+            reply({"ok": False, "error": "application is shutting down"})
+            return
         cmd = message.get("cmd")
         if not isinstance(cmd, str):
             reply({"ok": False, "error": "debug command must be a string"})
