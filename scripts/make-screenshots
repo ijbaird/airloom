@@ -20,8 +20,9 @@ Usage: scripts/make-screenshots [--output DIR]   (needs mutter and
 dbus-run-session; GTK 4 and WebKitGTK 6.0 as for ./run). Cleanup only ever
 signals this script's own processes: the session's process group, then,
 as a child subreaper, anything still descending from it (including the
-app's own session if the inner runner died first). SIGTERM, SIGHUP, and
-SIGINT unwind through that cleanup too.
+app's own session if the inner runner died first), then stale mounts
+under the private directory. SIGTERM, SIGHUP, and SIGINT cancel; once any
+cleanup has begun, further signals are recorded but cannot interrupt it.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import ctypes
 import http.server
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -122,19 +124,32 @@ class Cancelled(Exception):
     pass
 
 
-def unwind_on_termination() -> None:
-    """Turn SIGTERM/SIGHUP (SIGINT already raises) into an orderly unwind.
+class Termination:
+    """Record the first SIGTERM, SIGHUP, or SIGINT; never interrupt cleanup.
 
-    Later signals are ignored so they cannot interrupt the cleanup that the
-    first one started.
+    With `raising` set, the first signal also raises Cancelled to unwind a
+    long wait. Clearing `raising` (as every cleanup does first) makes all
+    later signals record-only, so nothing can interrupt the cleanup.
     """
-    def handler(signum, _frame):
-        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-            signal.signal(sig, signal.SIG_IGN)
-        raise Cancelled(f"cancelled by {signal.Signals(signum).name}")
 
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, handler)
+    SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+    def __init__(self, raising: bool) -> None:
+        self.signal: int | None = None
+        self.raising = raising
+        for sig in self.SIGNALS:
+            signal.signal(sig, self._handle)
+
+    def _handle(self, signum, _frame) -> None:
+        if self.signal is not None:
+            return
+        self.signal = signum
+        if self.raising:
+            self.raising = False
+            raise self.error()
+
+    def error(self) -> Cancelled:
+        return Cancelled(f"cancelled by {signal.Signals(self.signal).name}")
 
 
 def become_subreaper() -> None:
@@ -204,16 +219,23 @@ def detach_mounts(root: Path) -> None:
     mount would block removal of the private directory.
     """
     try:
-        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+        lines = Path("/proc/self/mountinfo").read_bytes().splitlines()
     except OSError:
         return
-    # Field 5 is the mount point, with spaces and similar escaped as octal.
-    points = [line.split()[4].encode().decode("unicode_escape") for line in lines]
+    points = [mountinfo_path(line.split()[4]) for line in lines if len(line.split()) > 4]
     tool = shutil.which("fusermount3") or shutil.which("fusermount")
     for point in sorted((p for p in points if Path(p).is_relative_to(root)), reverse=True):
         if tool is not None:
             subprocess.run([tool, "-u", "-z", point], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, check=False)
+
+
+def mountinfo_path(field: bytes) -> str:
+    """Decode a mountinfo mount point: the kernel octal-escapes only space,
+    tab, newline, and backslash (\\040 \\011 \\012 \\134); every other
+    byte, including UTF-8, is raw."""
+    raw = re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match.group(1), 8)]), field)
+    return os.fsdecode(raw)
 
 
 # ------------------------------------------------------------ geocoder stub
@@ -343,7 +365,7 @@ def flatten_opaque(path: Path) -> None:
     flat.savev(str(path), "png", ["compression"], ["9"])
 
 
-def shoot(root: Path, output: Path) -> None:
+def shoot(root: Path, output: Path, termination: Termination) -> None:
     workdir = root / "app"
     config_home = Path(os.environ["XDG_CONFIG_HOME"])
     (config_home / "airloom").mkdir(parents=True, exist_ok=True)
@@ -400,6 +422,7 @@ def shoot(root: Path, output: Path) -> None:
                       file=sys.stderr)
                 raise
             finally:
+                termination.raising = False
                 stop_owned(process, sock)
 
 
@@ -412,14 +435,21 @@ def main(argv=None) -> int:
     parser.add_argument("--inside-compositor", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     output = args.output.resolve()
-    unwind_on_termination()
     if args.inside_compositor is not None:
-        shoot(args.inside_compositor, output)
+        # Unwind the runner's long waits on the first signal; its own cleanup
+        # then cannot be interrupted, and the owner sweeps up regardless.
+        termination = Termination(raising=True)
+        shoot(args.inside_compositor, output, termination)
+        if termination.signal is not None:  # arrived during cleanup: not a success
+            raise termination.error()
         # mutter's own exit status does not carry this command's, so the
         # outer process checks for this marker instead.
         (args.inside_compositor / "done").write_text("ok", encoding="utf-8")
         return 0
 
+    # The owner never raises from a signal: it polls for cancellation, so a
+    # signal can never interrupt the cleanup below, whatever started it.
+    termination = Termination(raising=False)
     for tool in ("dbus-run-session", "mutter"):
         if shutil.which(tool) is None:
             raise AssertionError(f"{tool} is required")
@@ -451,19 +481,33 @@ def main(argv=None) -> int:
             sys.executable, str(Path(__file__).resolve()),
             "--inside-compositor", str(root), "--output", str(output),
         ]
+        if termination.signal is not None:
+            raise termination.error()
         log_path = root / "session.log"
         log = open(log_path, "wb")
         session = subprocess.Popen(command, env=env, cwd=str(PROJECT), stdin=subprocess.DEVNULL,
                                    stderr=log, start_new_session=True)
+        failure = None
+        returncode = None
+        deadline = time.monotonic() + TIMEOUT_S
         try:
-            returncode = session.wait(timeout=TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            raise AssertionError(f"screenshot session timed out after {TIMEOUT_S}s")
+            while termination.signal is None:
+                try:
+                    returncode = session.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        failure = AssertionError(f"screenshot session timed out after {TIMEOUT_S}s")
+                        break
         finally:
             stop_owned(session)
             stop_descendants()
             detach_mounts(root)
             log.close()
+        if failure is None and termination.signal is not None:
+            failure = termination.error()
+        if failure is not None:
+            raise failure
         finished = (root / "done").is_file()
         if not finished:
             print(log_path.read_text(errors="replace")[-6000:], file=sys.stderr)

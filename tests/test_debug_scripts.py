@@ -305,7 +305,53 @@ class DebugScriptIsolationTest(unittest.TestCase):
     def test_screenshot_sigint_stops_the_separately_sessioned_app(self):
         self._exercise_screenshot_abort(timeout_s=120, cancel_signal=signal.SIGINT)
 
-    def _exercise_screenshot_abort(self, timeout_s: int, cancel_signal) -> None:
+    def test_screenshot_signal_during_timeout_cleanup_still_sweeps(self):
+        self._exercise_screenshot_abort(
+            timeout_s=3, cancel_signal=None, signal_during_cleanup=signal.SIGTERM
+        )
+
+    def test_screenshot_second_sigint_during_cleanup_is_ignored(self):
+        self._exercise_screenshot_abort(
+            timeout_s=120, cancel_signal=signal.SIGINT, signal_during_cleanup=signal.SIGINT
+        )
+
+    def test_mountinfo_paths_decode_octal_escapes_without_mangling_unicode(self):
+        from importlib.machinery import SourceFileLoader
+        from importlib.util import module_from_spec, spec_from_loader
+        from unittest import mock
+
+        loader = SourceFileLoader("make_screenshots", str(PROJECT / "scripts" / "make-screenshots"))
+        module = module_from_spec(spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        root = Path("/tmp/café/airloom-screenshots-x")
+        mountinfo = (
+            "22 1 0:21 / / rw - ext4 /dev/root rw\n"
+            "40 22 0:50 / /tmp/café/airloom-screenshots-x/runtime/doc rw - fuse.portal portal rw\n"
+            "41 22 0:51 / /tmp/café/airloom-screenshots-x/runtime/a\\040b\\011c\\012d\\134e rw - fuse f rw\n"
+            "42 22 0:52 / /tmp/café/other rw - fuse g rw\n"
+        )
+        original_text, original_bytes = Path.read_text, Path.read_bytes
+
+        def read_text(path, *args, **kwargs):
+            return mountinfo if str(path) == "/proc/self/mountinfo" else original_text(path, *args, **kwargs)
+
+        def read_bytes(path):
+            return mountinfo.encode("utf-8") if str(path) == "/proc/self/mountinfo" else original_bytes(path)
+
+        calls = []
+        with mock.patch.object(Path, "read_text", read_text), \
+                mock.patch.object(Path, "read_bytes", read_bytes), \
+                mock.patch.object(module.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
+                mock.patch.object(module.subprocess, "run",
+                                  lambda command, **_kwargs: calls.append(command[-1])):
+            module.detach_mounts(root)
+
+        self.assertEqual(sorted(calls), sorted([
+            "/tmp/café/airloom-screenshots-x/runtime/doc",
+            "/tmp/café/airloom-screenshots-x/runtime/a b\tc\nd\\e",
+        ]))
+
+    def _exercise_screenshot_abort(self, timeout_s: int, cancel_signal, signal_during_cleanup=None) -> None:
         # A copy of the real script in a fake project whose debug-run never
         # opens a debug socket, so generation stalls until it is aborted.
         project = self.root / "project"
@@ -329,10 +375,36 @@ class DebugScriptIsolationTest(unittest.TestCase):
         fake_bin.mkdir()
         # Stand-ins that just run the wrapped command in place, as the real
         # bus and compositor do, without a display.
-        write_executable(
-            fake_bin / "dbus-run-session",
-            '#!/bin/sh\n[ "$1" = "--" ] && shift\nexec "$@"\n',
-        )
+        forwarded = self.root / "forwarded"
+        if signal_during_cleanup is None:
+            write_executable(
+                fake_bin / "dbus-run-session",
+                '#!/bin/sh\n[ "$1" = "--" ] && shift\nexec "$@"\n',
+            )
+        else:
+            # The runner gets its own session, so only this stand-in receives
+            # the owner's SIGTERM to the session group, which by construction
+            # happens inside the owner's cleanup. It kills the runner outright
+            # (no chance to clean up the app), records the handshake, and
+            # signals the owner mid-cleanup.
+            write_executable(
+                fake_bin / "dbus-run-session",
+                f"#!{sys.executable}\n"
+                "import os, signal, subprocess, sys\n"
+                "args = sys.argv[1:]\n"
+                "if args[:1] == ['--']:\n    args = args[1:]\n"
+                "runner = subprocess.Popen(args, start_new_session=True)\n"
+                "def on_term(_signum, _frame):\n"
+                # Raw calls: Popen.wait() here would deadlock on the lock
+                # held by the interrupted wait() below.
+                "    os.kill(runner.pid, signal.SIGKILL)\n"
+                "    os.waitpid(runner.pid, 0)\n"
+                f"    open({str(forwarded)!r}, 'w').write('sent')\n"
+                f"    os.kill(os.getppid(), {int(signal_during_cleanup)})\n"
+                "    os._exit(0)\n"
+                "signal.signal(signal.SIGTERM, on_term)\n"
+                "sys.exit(runner.wait())\n",
+            )
         write_executable(
             fake_bin / "mutter",
             '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n',
@@ -378,6 +450,8 @@ class DebugScriptIsolationTest(unittest.TestCase):
         output = log_path.read_text(encoding="utf-8", errors="replace")
 
         self.assertNotEqual(outer.returncode, 0, output)
+        if signal_during_cleanup is not None:
+            self.assertTrue(forwarded.exists(), "no signal was delivered during cleanup")
         for role, pid in owned.items():
             self.assertTrue(self._process_is_stopped(pid),
                             f"the owned {role} process {pid} outlived make-screenshots")
