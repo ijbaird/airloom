@@ -211,7 +211,7 @@ class DebugApp:
     """One isolated debug instance with private config/cache directories."""
 
     def __init__(self, root: Path, name: str, geocoder_url: str, *, extra_env=None,
-                 config=None, project=PROJECT, debug_socket=True):
+                 config=None, project=PROJECT, debug_socket=True, private_bus=False):
         self.workdir = root / name
         self.workdir.mkdir()
         self.sock_path = str(self.workdir / "debug.sock")
@@ -238,13 +238,21 @@ class DebugApp:
         }
         self.project = project
         self.debug_socket = debug_socket
+        # Without the debug module the app registers as a unique GApplication;
+        # only a private session bus keeps it from activating another instance.
+        self.private_bus = private_bus
         self.process: subprocess.Popen | None = None
         self.log_path = self.workdir / "app.log"
 
     def start(self):
-        self._log = open(self.log_path, "wb")
         command = ([str(self.project / "scripts" / "debug-run")] if self.debug_socket
                    else [str(self.project / "run")])
+        if self.private_bus:
+            runner = shutil.which("dbus-run-session")
+            if runner is None:
+                raise AssertionError("dbus-run-session is required to isolate a unique (non-debug) launch")
+            command = [runner, "--", *command]
+        self._log = open(self.log_path, "wb")
         self.process = subprocess.Popen(
             command, env=self.env, cwd=str(self.project), stdin=subprocess.DEVNULL,
             stdout=self._log, stderr=subprocess.STDOUT, start_new_session=True,
@@ -636,11 +644,19 @@ def scenario_stripped_debug(root: Path, geocoder: GeocoderStub):
     print("— release-style tree without airloom/debugport.py —")
     stripped = make_stripped_tree(root / "stripped-project")
     check(not (stripped / "airloom" / "debugport.py").exists(), "the copied tree has no debug module")
-    app = DebugApp(root, "stripped", geocoder.url, project=stripped, debug_socket=False)
+    app = DebugApp(root, "stripped", geocoder.url, project=stripped, debug_socket=False, private_bus=True)
     try:
         app.start()
         time.sleep(8)
         check(app.process.poll() is None, "the app keeps running without the debug module")
+        caller_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+        app_pids = [pid for pid in descendants(app.process.pid)
+                    if b"-m\0airloom" in Path(f"/proc/{pid}/cmdline").read_bytes()]
+        check(len(app_pids) == 1, f"exactly one stripped Airloom process runs ({app_pids})")
+        environ = dict(item.split(b"=", 1) for item in
+                       Path(f"/proc/{app_pids[0]}/environ").read_bytes().split(b"\0") if b"=" in item)
+        bus = environ.get(b"DBUS_SESSION_BUS_ADDRESS", b"").decode()
+        check(bool(bus) and bus != caller_bus, "it registers on a private session bus, not the caller's")
         check(not os.path.exists(app.sock_path), "no debug socket is opened")
         log = app.log()
         check("Traceback" not in log, "startup logged no traceback")

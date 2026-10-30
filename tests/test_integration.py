@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -215,6 +216,69 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         self.assertTrue((stripped / "run").exists())
         self.assertTrue((PROJECT / "airloom" / "debugport.py").exists(),
                         "the real tree must keep its debug module")
+
+    def _bus_recording_project(self):
+        project = self.root / "bus-project"
+        project.mkdir()
+        (project / "run").write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, time\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['AIRLOOM_TEST_ENV_RECORD']).write_text(os.environ.get('DBUS_SESSION_BUS_ADDRESS', ''))\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        (project / "run").chmod(0o755)
+        return project
+
+    @unittest.skipUnless(shutil.which("dbus-run-session"), "dbus-run-session is not installed")
+    def test_private_bus_launch_never_shares_the_callers_session_bus(self):
+        record = self.root / "bus.txt"
+        apps_root = self.root / "apps"
+        apps_root.mkdir()
+        app = self.script.DebugApp(
+            apps_root, "stripped", "http://127.0.0.1:1", project=self._bus_recording_project(),
+            debug_socket=False, private_bus=True,
+            extra_env={"AIRLOOM_TEST_ENV_RECORD": str(record),
+                       "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent/caller-bus"},
+        )
+        app.start()
+        try:
+            deadline = time.monotonic() + 10
+            while not (record.exists() and record.read_text()) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        finally:
+            app.stop()
+        address = record.read_text()
+        self.assertTrue(address, "the child had no session bus")
+        self.assertNotEqual(address, "unix:path=/nonexistent/caller-bus")
+        self.assertIsNotNone(app.process.poll())
+
+    def test_private_bus_is_required_rather_than_silently_skipped(self):
+        apps_root = self.root / "apps"
+        apps_root.mkdir()
+        app = self.script.DebugApp(apps_root, "stripped", "http://127.0.0.1:1",
+                                   project=self._bus_recording_project(),
+                                   debug_socket=False, private_bus=True)
+        with mock.patch.object(self.script.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(AssertionError, "dbus-run-session"):
+                app.start()
+        self.assertIsNone(app.process)
+
+    def test_stripped_scenario_launches_on_a_private_bus(self):
+        launched = {}
+
+        class Recorder:
+            def __init__(self, *args, **kwargs):
+                launched.update(kwargs)
+                raise RuntimeError("recorded")
+
+        with mock.patch.object(self.script, "DebugApp", Recorder), \
+                mock.patch.object(self.script, "make_stripped_tree", return_value=self.root):
+            with self.assertRaisesRegex(RuntimeError, "recorded"), redirect_stdout(io.StringIO()):
+                self.script.scenario_stripped_debug(self.root, mock.Mock(url="http://127.0.0.1:1"))
+        self.assertIs(launched.get("private_bus"), True)
+        self.assertIs(launched.get("debug_socket"), False)
 
     def test_caller_snapshot_detects_any_change(self):
         target = self.root / "airloom"
