@@ -12,7 +12,33 @@
   <launchable type="desktop-id">ai.stealthvision.Airloom.desktop</launchable>
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Color-coded sensor readings on the map with the area summary and AQI legend</caption>
+      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.13.0/packaging/screenshots/map.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Sensor details with a rolling-average trend chart and current conditions</caption>
+      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.13.0/packaging/screenshots/sensor-detail.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Preferences for the PurpleAir key, home location, alerts, refresh interval, and interface size</caption>
+      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.13.0/packaging/screenshots/preferences.png</image>
+    </screenshot>
+  </screenshots>
   <releases>
+    <release version="0.13.0" date="2026-10-30">
+      <description>
+        <p>A correctness, reliability, and accessibility release:</p>
+        <ul>
+          <li>AQI uses the EPA's final PurpleAir corrections, and malformed readings show as unavailable instead of Good.</li>
+          <li>Demo, cached, and stale data are clearly labeled; demo data and observations older than two hours never trigger alerts.</li>
+          <li>Refreshes follow the area in view, newer results are never overwritten by slow requests, and cache failures no longer blank readings.</li>
+          <li>The map works across the antimeridian, keyboard focus survives refreshes and dialogs, screen readers get labels and live announcements, and Airloom adds an Interface size preference and honors GNOME's reduce-animations setting.</li>
+          <li>Place search contacts the geocoder only when you press Enter.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.12.3" date="2026-10-29">
       <description><p>No application changes.</p></description>
     </release>

@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Regenerate the AppStream screenshots in packaging/screenshots/.
+
+Everything is private to this run and nothing touches live data services or
+the caller's own Airloom:
+
+* A headless mutter (Wayland only, 1920x1080 virtual monitor) runs on its
+  own `dbus-run-session` bus with private XDG_RUNTIME_DIR, config, cache,
+  data, and state directories and in-memory GSettings, so the caller's
+  desktop, theme, and settings never leak in.
+* Inside it, this script's own non-unique debug child (scripts/debug-run in
+  a new session) shows deterministic demo readings: no API key, a fixed
+  home at the shipped default location (so no GeoClue), and
+  AIRLOOM_NOMINATIM_URL pointed at a loopback stub. Only OpenStreetMap map
+  tiles are fetched from the network, as they are for any user.
+* Images come from the debug port's `screenshot` command, which captures
+  the webview only, so the debug window chrome never appears.
+
+Usage: scripts/make-screenshots [--output DIR]   (needs mutter and
+dbus-run-session; GTK 4 and WebKitGTK 6.0 as for ./run). Cleanup only ever
+signals this script's own process groups.
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.server
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+PROJECT = Path(__file__).resolve().parent.parent
+DEFAULT_OUTPUT = PROJECT / "packaging" / "screenshots"
+# Matches store.DEFAULT_CONFIG, so the screenshots show the shipped default area.
+HOME = {"latitude": 45.5152, "longitude": -122.6784, "name": "Portland, Oregon"}
+VIEW = (1280, 800)
+MONITOR = "1920x1080"  # well above the window, so mutter never maximizes it
+TIMEOUT_S = 240
+
+
+# ------------------------------------------------------------- debug port
+
+def request(sock_path: str, cmd: str, **fields):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(20)
+    try:
+        sock.connect(sock_path)
+        sock.sendall(json.dumps({"id": 1, "cmd": cmd, **fields}).encode("utf-8") + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("connection closed before a full response")
+            buf += chunk
+    finally:
+        sock.close()
+    response = json.loads(buf.split(b"\n", 1)[0])
+    if not response.get("ok"):
+        raise AssertionError(f"debug command {cmd!r} failed: {response}")
+    return response.get("result")
+
+
+def eval_js(sock_path: str, js: str):
+    return request(sock_path, "eval", js=js)
+
+
+def wait_for(probe, timeout_s: float, what: str):
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            value = probe()
+            if value is not None and value is not False:
+                return value
+        except (OSError, ConnectionError, AssertionError) as exc:
+            last_error = exc
+        time.sleep(0.25)
+    raise AssertionError(f"timed out after {timeout_s}s waiting for {what} (last error: {last_error})")
+
+
+def stop_owned(process: subprocess.Popen, sock_path: str | None = None) -> None:
+    """Stop only this script's own child and its process group."""
+    if process.poll() is None and sock_path and os.path.exists(sock_path):
+        try:
+            request(sock_path, "quit")
+            process.wait(timeout=10)
+        except (AssertionError, OSError, ConnectionError, subprocess.TimeoutExpired):
+            pass
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if process.poll() is not None:
+            break
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if process.poll() is None:
+        process.wait(timeout=5)
+
+
+# ------------------------------------------------------------ geocoder stub
+
+class GeocoderStub:
+    """Loopback Nominatim stand-in: labels every place Portland, finds nothing."""
+
+    def __init__(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - http.server API
+                body = {"address": {"city": "Portland"}} if "/reverse" in self.path else []
+                data = json.dumps(body).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+# ------------------------------------------------------------------ scenes
+
+TILES_SETTLED_JS = """
+(() => {
+  const tiles = document.querySelectorAll("#tiles img.tile");
+  return tiles.length > 0
+    && document.querySelectorAll("#tiles img.tile[data-pending]").length === 0
+    && document.querySelectorAll("#tiles img.tile.loaded").length === tiles.length
+    && document.querySelector("#tiles-old").hidden;
+})()
+"""
+
+SUMMARY_READY_JS = """
+(() => document.querySelector("#place-name").textContent !== "Locating…"
+  && document.querySelector("#summary-aqi").textContent !== "—"
+  && !document.body.classList.contains("loading"))()
+"""
+
+OPEN_DETAIL_JS = """
+((name) => {
+  const marker = [...document.querySelectorAll(".map-marker")].find((m) => m.title.startsWith(name + " ·"));
+  if (!marker) return "no-marker";
+  marker.click();
+  document.querySelector("#popup-details").click();
+  return "opened";
+})(%s)
+"""
+
+DETAIL_READY_JS = """
+(() => !document.querySelector("#detail-card").hidden
+  && document.querySelector("#chart").querySelectorAll("svg, canvas, .bar, rect, path").length > 0
+  && document.querySelector("#trend-retry").hidden)()
+"""
+
+CLOSE_DETAIL_JS = """
+(() => { document.querySelector("#close-detail").click(); return "closed"; })()
+"""
+
+OPEN_SETTINGS_JS = """
+(() => { window.Airloom.receive("open-settings"); return document.querySelector("#settings-dialog").open; })()
+"""
+
+
+def settle(sock: str, what: str) -> None:
+    wait_for(lambda: eval_js(sock, SUMMARY_READY_JS), 30, f"{what}: area summary")
+    wait_for(lambda: eval_js(sock, TILES_SETTLED_JS), 60, f"{what}: map tiles")
+    time.sleep(1.0)  # let fades and the zoom glide finish
+
+
+def size_view(sock: str) -> None:
+    width, height = VIEW
+    request(sock, "resize", width=width, height=height)
+    # The resize sets the window, which includes the header bar; grow it
+    # until the captured webview itself is exactly VIEW.
+    for _attempt in range(5):
+        time.sleep(1.0)
+        inner = eval_js(sock, "[innerWidth, innerHeight]")
+        if inner == [width, height]:
+            return
+        request(sock, "resize", width=width + width - inner[0], height=height + height - inner[1])
+    raise AssertionError(f"webview never reached {VIEW}: {inner}")
+
+
+def capture(sock: str, path: Path) -> None:
+    # Opening a panel programmatically focuses its close button; a mouse
+    # user would not see that focus ring.
+    eval_js(sock, "document.activeElement && document.activeElement.blur(), 'ok'")
+    time.sleep(0.3)
+    request(sock, "screenshot", path=str(path))
+    flatten_opaque(path)
+    print(f"  wrote {path} ({path.stat().st_size} bytes)")
+
+
+def flatten_opaque(path: Path) -> None:
+    """Losslessly drop the all-opaque alpha channel and recompress."""
+    import gi
+
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+
+    source = GdkPixbuf.Pixbuf.new_from_file(str(path))
+    width, height = source.get_width(), source.get_height()
+    if source.get_has_alpha():
+        pixels, stride = source.read_pixel_bytes().get_data(), source.get_rowstride()
+        for row in range(height):
+            alpha = pixels[row * stride:row * stride + width * 4][3::4]
+            if alpha.count(255) != width:
+                raise AssertionError(f"{path} has translucent pixels; refusing a lossy flatten")
+    flat = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, width, height)
+    source.composite(flat, 0, 0, width, height, 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
+    flat.savev(str(path), "png", ["compression"], ["9"])
+
+
+def shoot(root: Path, output: Path) -> None:
+    workdir = root / "app"
+    config_home = Path(os.environ["XDG_CONFIG_HOME"])
+    (config_home / "airloom").mkdir(parents=True, exist_ok=True)
+    (config_home / "airloom" / "config.json").write_text(json.dumps({
+        "home_mode": "fixed",
+        "latitude": HOME["latitude"],
+        "longitude": HOME["longitude"],
+        "location_name": HOME["name"],
+    }), encoding="utf-8")
+    workdir.mkdir()
+    sock = str(workdir / "debug.sock")
+    output.mkdir(parents=True, exist_ok=True)
+    with GeocoderStub() as geocoder:
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("AIRLOOM_") and key != "DISPLAY"}
+        env.update(AIRLOOM_DEBUG_SOCKET=sock, AIRLOOM_NOMINATIM_URL=geocoder.url,
+                   GDK_BACKEND="wayland")
+        log_path = workdir / "app.log"
+        with open(log_path, "wb") as log:
+            process = subprocess.Popen(
+                [str(PROJECT / "scripts" / "debug-run")], env=env, cwd=str(PROJECT),
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                wait_for(lambda: process.poll() is None and request(sock, "ping"), 30, "debug socket")
+                wait_for(lambda: request(sock, "state").get("sensorCount", 0) > 0, 30, "demo sensors")
+                size_view(sock)
+                state = request(sock, "state")
+                if "demo" not in state["source"].lower():
+                    raise AssertionError(f"expected demo data, got {state['source']!r}")
+
+                settle(sock, "map")
+                eval_js(sock, "document.querySelector('#legend-chip').click(), 'ok'")
+                if eval_js(sock, "document.querySelector('#legend').hidden") is not False:
+                    raise AssertionError("the AQI legend did not open")
+                capture(sock, output / "map.png")
+                eval_js(sock, "document.querySelector('#legend-chip').click(), 'ok'")
+
+                outcome = eval_js(sock, OPEN_DETAIL_JS % json.dumps("Laurelhurst Park"))
+                if outcome != "opened":
+                    raise AssertionError(f"could not open sensor detail: {outcome}")
+                wait_for(lambda: eval_js(sock, DETAIL_READY_JS), 20, "the detail trend chart")
+                time.sleep(1.0)
+                capture(sock, output / "sensor-detail.png")
+
+                eval_js(sock, CLOSE_DETAIL_JS)
+                if eval_js(sock, OPEN_SETTINGS_JS) is not True:
+                    raise AssertionError("Preferences did not open")
+                time.sleep(1.0)
+                capture(sock, output / "preferences.png")
+            except Exception:
+                print(f"app log ({log_path}):\n{log_path.read_text(errors='replace')[-4000:]}",
+                      file=sys.stderr)
+                raise
+            finally:
+                stop_owned(process, sock)
+
+
+# --------------------------------------------------------------- compositor
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
+                        help=f"directory for the PNGs (default: {DEFAULT_OUTPUT})")
+    parser.add_argument("--inside-compositor", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    output = args.output.resolve()
+    if args.inside_compositor is not None:
+        shoot(args.inside_compositor, output)
+        # mutter's own exit status does not carry this command's, so the
+        # outer process checks for this marker instead.
+        (args.inside_compositor / "done").write_text("ok", encoding="utf-8")
+        return 0
+
+    for tool in ("dbus-run-session", "mutter"):
+        if shutil.which(tool) is None:
+            raise AssertionError(f"{tool} is required")
+    with tempfile.TemporaryDirectory(prefix="airloom-screenshots-") as temporary:
+        root = Path(temporary)
+        private = {}
+        for name in ("runtime", "config", "cache", "data", "state"):
+            path = root / name
+            path.mkdir(mode=0o700)
+            private[name] = str(path)
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS")
+               and not key.startswith("AIRLOOM_")}
+        env.update(
+            XDG_RUNTIME_DIR=private["runtime"], XDG_CONFIG_HOME=private["config"],
+            XDG_CACHE_HOME=private["cache"], XDG_DATA_HOME=private["data"],
+            XDG_STATE_HOME=private["state"], GSETTINGS_BACKEND="memory",
+            GDK_DEBUG="no-portals", NO_AT_BRIDGE="1", WAYLAND_DISPLAY="airloom-screenshots",
+        )
+        command = [
+            "dbus-run-session", "--", "mutter", "--headless", "--wayland", "--no-x11",
+            "--virtual-monitor", MONITOR, "--wayland-display", "airloom-screenshots", "--",
+            sys.executable, str(Path(__file__).resolve()),
+            "--inside-compositor", str(root), "--output", str(output),
+        ]
+        log_path = root / "session.log"
+        log = open(log_path, "wb")
+        session = subprocess.Popen(command, env=env, cwd=str(PROJECT), stdin=subprocess.DEVNULL,
+                                   stderr=log, start_new_session=True)
+        try:
+            returncode = session.wait(timeout=TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"screenshot session timed out after {TIMEOUT_S}s")
+        finally:
+            stop_owned(session)
+            log.close()
+        finished = (root / "done").is_file()
+        if not finished:
+            print(log_path.read_text(errors="replace")[-6000:], file=sys.stderr)
+    if not finished:
+        raise AssertionError(f"screenshot session failed ({returncode})")
+    print(f"PASS: screenshots in {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except AssertionError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        raise SystemExit(1)

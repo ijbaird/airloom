@@ -15,6 +15,9 @@ from airloom import __version__
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+METADATA = ET.parse(
+    PROJECT_ROOT / "packaging" / "ai.stealthvision.Airloom.metainfo.xml"
+)
 
 
 class StagedInstallTest(unittest.TestCase):
@@ -201,18 +204,62 @@ class ReleaseMetadataTest(unittest.TestCase):
 
     def test_current_version_matches_changelog_and_appstream(self):
         changelog = (PROJECT_ROOT / "CHANGELOG.md").read_text()
-        changelog_match = re.search(
-            r"^## (\d+\.\d+\.\d+)\b", changelog, flags=re.MULTILINE
-        )
+        changelog_match = re.search(r"^## (.+)$", changelog, flags=re.MULTILINE)
         self.assertIsNotNone(changelog_match)
-        metadata = ET.parse(
-            PROJECT_ROOT / "packaging" / "ai.stealthvision.Airloom.metainfo.xml"
+        heading = re.fullmatch(
+            r"(\d+\.\d+\.\d+) — (\d{4}-\d{2}-\d{2})", changelog_match.group(1)
         )
-        release = metadata.find("./releases/release")
+        self.assertIsNotNone(
+            heading, f"malformed CHANGELOG heading {changelog_match.group(0)!r}"
+        )
+        release = METADATA.find("./releases/release")
         self.assertIsNotNone(release)
 
-        self.assertEqual(changelog_match.group(1), __version__)
+        self.assertEqual(heading.group(1), __version__)
         self.assertEqual(release.attrib["version"], __version__)
+        self.assertEqual(release.attrib.get("date"), heading.group(2))
+
+    def test_appstream_releases_are_listed_newest_first(self):
+        releases = METADATA.findall("./releases/release")
+        versions = [
+            tuple(int(part) for part in release.attrib["version"].split("."))
+            for release in releases
+        ]
+        dates = [release.attrib["date"] for release in releases]
+
+        self.assertEqual(versions, sorted(versions, reverse=True))
+        self.assertEqual(len(set(versions)), len(versions))
+        self.assertEqual(dates, sorted(dates, reverse=True))
+
+    def test_screenshots_are_pinned_to_the_current_tag_and_shipped(self):
+        screenshots = METADATA.findall("./screenshots/screenshot")
+        self.assertTrue(screenshots, "AppStream metadata has no screenshots")
+        self.assertEqual(screenshots[0].attrib.get("type"), "default")
+        self.assertEqual(
+            [shot.attrib.get("type") for shot in screenshots].count("default"), 1
+        )
+        prefix = f"https://raw.githubusercontent.com/ijbaird/airloom/v{__version__}/"
+        for shot in screenshots:
+            image = shot.find("image")
+            with self.subTest(image=image is not None and image.text):
+                caption = shot.find("caption")
+                self.assertIsNotNone(caption)
+                self.assertTrue((caption.text or "").strip())
+                self.assertIsNotNone(image)
+                self.assertEqual(image.attrib.get("type"), "source")
+                self.assertTrue(image.text.startswith(prefix), image.text)
+                path = PROJECT_ROOT / image.text.removeprefix(prefix)
+                self.assertTrue(path.resolve().is_relative_to(PROJECT_ROOT))
+                self.assertTrue(path.is_file(), f"{path} is missing")
+                header = path.read_bytes()[:24]
+                self.assertEqual(header[:8], b"\x89PNG\r\n\x1a\n")
+                width = int.from_bytes(header[16:20], "big")
+                height = int.from_bytes(header[20:24], "big")
+                self.assertEqual(
+                    (image.attrib.get("width"), image.attrib.get("height")),
+                    (str(width), str(height)),
+                )
+                self.assertGreaterEqual(min(width, height), 760)
 
 
 if __name__ == "__main__":

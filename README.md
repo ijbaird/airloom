@@ -5,6 +5,8 @@
 
 Airloom is a fast, focused air-quality app built for the GNOME desktop, developed and tested on Fedora. It turns hyperlocal PurpleAir readings into an interactive map, clear trends, practical health guidance, and local alerts. The Flatpak runs on any Linux distribution with the GNOME runtime.
 
+![Airloom's map of color-coded PurpleAir sensors around Portland, Oregon, with the area summary and AQI legend](packaging/screenshots/map.png)
+
 Airloom includes:
 
 - an interactive OpenStreetMap view with color-coded sensor markers;

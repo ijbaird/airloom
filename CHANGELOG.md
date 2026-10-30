@@ -2,6 +2,47 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.13.0 — 2026-10-30
+
+- AQI correction now follows the published final EPA equations for
+  PurpleAir CF=1 data, which blend into the high-concentration quadratic
+  between 570 and 611 µg/m³ instead of switching abruptly at 343. Outdoor
+  rolling averages use the EPA's CF=ATM correction; indoor averages keep the
+  CF=1 path. Malformed, non-finite, or overflowing values are shown as
+  unavailable instead of crashing or reading as Good; valid concentrations
+  above the scale still cap at AQI 500. The local sensor
+  cache clears once on upgrade so trends computed the old way don't linger.
+- Demo, cached, and stale cached readings are labeled persistently next to
+  the AQI, and "Limited coverage" appears when the map shows more than
+  Airloom fetched. Demo readings and observations more than two hours old
+  never trigger health alerts. The area summary no longer counts favorites
+  far outside the view, and the Outdoor/Indoor/All filter now applies the same
+  way to live, cached, and offline data.
+- Refreshes fetch the area you're looking at, and a slow or superseded
+  request can no longer overwrite newer results. A failed save keeps
+  Preferences open and explains why. A locked or failing cache no longer
+  deletes data or blanks live readings, trend charts no longer stay
+  "Loading" forever and can be retried, and quitting lets in-flight work
+  finish cleanly.
+- The map works across the ±180° antimeridian, and the heat map and legend
+  use all six EPA AQI colors. Keyboard focus survives refreshes and closing
+  dialogs, sensors and status changes have screen-reader labels and live
+  announcements, and a new Interface size preference offers 100%, 125%, or
+  150%. Airloom honors GNOME's reduce-animations setting, narrow windows no
+  longer clip the search box, popups, or Preferences, and map tiles that fail
+  to load no longer wipe out imagery already on screen.
+- Place search sends a request only when you press Enter; typing filters
+  local sensors without contacting the public Nominatim server. Repeat
+  searches are answered from a short-lived cache, and `AIRLOOM_NOMINATIM_URL`
+  selects a different compatible geocoder.
+- Settings are written atomically with private permissions, even if a stale
+  temporary file or symlink is in the way, and a damaged value in the
+  settings file falls back to its default without resetting the others.
+- Installs with a custom `PREFIX` now work. Release bundles must pass a real
+  signed install and upgrade before publication, and publishing is queued and
+  tied to the exact tagged source, with provenance records and checksums.
+- AppStream metadata now includes screenshots.
+
 ## 0.12.3 — 2026-10-29
 
 - No application changes.

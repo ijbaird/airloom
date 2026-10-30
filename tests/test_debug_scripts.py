@@ -236,6 +236,63 @@ class DebugScriptIsolationTest(unittest.TestCase):
             os.kill(child["pid"], 0)
         self.assertIsNone(unrelated.poll(), "the GUI launcher terminated an unrelated Airloom process")
 
+    def test_screenshot_session_gets_a_private_compositor_bus_and_directories(self):
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        record = self.root / "session.json"
+        write_executable(
+            fake_bin / "dbus-run-session",
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            f"open({str(record)!r}, 'w').write(json.dumps("
+            "{'argv': sys.argv[1:], 'env': dict(os.environ)}))\n",
+        )
+        write_executable(fake_bin / "mutter", "#!/bin/sh\nexit 1\n")
+        sentinel_config = self.root / "real-config"
+        (sentinel_config / "airloom").mkdir(parents=True)
+        (sentinel_config / "airloom" / "config.json").write_bytes(b"real config sentinel")
+        before = tree_snapshot(sentinel_config)
+        tmpdir = self.root / "tmp"
+        tmpdir.mkdir()
+        output = self.root / "shots"
+        env = {
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "TMPDIR": str(tmpdir),
+            "XDG_CONFIG_HOME": str(sentinel_config),
+            "XDG_RUNTIME_DIR": str(self.root / "real-runtime"),
+            "DISPLAY": ":99",
+            "WAYLAND_DISPLAY": "wayland-real",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent/real-bus",
+            "AIRLOOM_DEBUG_FAKE_PURPLEAIR": "/nonexistent/fixture.json",
+        }
+
+        completed = subprocess.run(
+            [sys.executable, str(PROJECT / "scripts" / "make-screenshots"), "--output", str(output)],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+
+        # The fake session never runs the capture, so the script must not
+        # report success or leave images behind.
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertIn("FAIL", completed.stderr)
+        self.assertFalse(output.exists() and any(output.iterdir()))
+        session = json.loads(record.read_text(encoding="utf-8"))
+        argv, child_env = session["argv"], session["env"]
+        self.assertEqual(argv[:2], ["--", "mutter"])
+        for flag in ("--headless", "--wayland", "--no-x11"):
+            self.assertIn(flag, argv)
+        self.assertEqual(child_env["WAYLAND_DISPLAY"], argv[argv.index("--wayland-display") + 1])
+        self.assertNotEqual(child_env["WAYLAND_DISPLAY"], "wayland-real")
+        for variable in ("DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "AIRLOOM_DEBUG_FAKE_PURPLEAIR"):
+            self.assertFalse(variable in child_env, f"{variable} leaked into the session")
+        for variable in ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+                         "XDG_DATA_HOME", "XDG_STATE_HOME"):
+            self.assertTrue(Path(child_env[variable]).is_relative_to(tmpdir), variable)
+        self.assertEqual(child_env["GSETTINGS_BACKEND"], "memory")
+        self.assertEqual(tree_snapshot(sentinel_config), before)
+        self.assertEqual(list(tmpdir.iterdir()), [], "the private session directory was not removed")
+
     def test_owned_process_cleanup_terminates_the_entire_process_group(self):
         record = self.root / "owned-child.pid"
         parent_program = (
