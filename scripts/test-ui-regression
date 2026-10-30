@@ -103,10 +103,15 @@ def ping_running(process: subprocess.Popen, sock_path: str):
     return request(sock_path, "ping") or True
 
 
+# Waits read time through these so offline tests can drive them with a fake clock.
+CLOCK = time.monotonic
+SLEEP = time.sleep
+
+
 def wait_for(probe, timeout_s: float, what: str):
-    deadline = time.monotonic() + timeout_s
+    deadline = CLOCK() + timeout_s
     last_error = None
-    while time.monotonic() < deadline:
+    while CLOCK() < deadline:
         try:
             value = probe()
             if value is not None and value is not False:
@@ -115,7 +120,7 @@ def wait_for(probe, timeout_s: float, what: str):
             raise
         except (OSError, ConnectionError, AssertionError) as exc:
             last_error = exc
-        time.sleep(0.2)
+        SLEEP(0.2)
     raise AssertionError(f"timed out after {timeout_s}s waiting for {what} (last error: {last_error})")
 
 
@@ -611,7 +616,7 @@ RESIZE_PROBE_JS = """
     // The map's resize pass has run for the current size: the marker layer is
     // offset to the viewport the app derives from its center, zoom and panel
     // size (app.js mapViewport/worldPoint). This also positions an open popup.
-    layoutSettled: (() => {
+    ...(() => {
       const s = window.Airloom.debugState();
       const panel = document.querySelector("#map-panel");
       const size = 256 * 2 ** s.zoom;
@@ -619,8 +624,13 @@ RESIZE_PROBE_JS = """
       const sin = Math.sin(lat * Math.PI / 180);
       const x = (s.center.lon + 180) / 360 * size - panel.clientWidth / 2;
       const y = (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size - panel.clientHeight / 2;
-      const offset = /translate\(\s*([-\d.e+]+)px,\s*([-\d.e+]+)px\)/.exec(document.querySelector("#markers").style.transform);
-      return Boolean(offset) && Math.abs(Number(offset[1]) + x) <= 1 && Math.abs(Number(offset[2]) + y) <= 1;
+      const markerLayer = document.querySelector("#markers").style.transform;
+      const offset = /translate\(\s*([-\d.e+]+)px,\s*([-\d.e+]+)px\)/.exec(markerLayer);
+      return {
+        viewport: [innerWidth, innerHeight], panel: [panel.clientWidth, panel.clientHeight],
+        markerLayer, expectedLayer: [-x, -y],
+        layoutSettled: Boolean(offset) && Math.abs(Number(offset[1]) + x) <= 1 && Math.abs(Number(offset[2]) + y) <= 1,
+      };
     })() };
 })()
 """
@@ -650,11 +660,18 @@ def wait_for_width(sock: str, width: int, scale: float = 1.0, frame: int = 0) ->
     """Wait for the viewport width and for the map's layout to catch up with it."""
     expected = viewport_width(width, scale, frame)
 
+    last = {}
+
     def settled():
-        probe = eval_js(sock, RESIZE_PROBE_JS)
+        probe = last["probe"] = eval_js(sock, RESIZE_PROBE_JS)
         return probe if abs(probe["width"] - expected) <= 1 and probe["layoutSettled"] else None
 
-    return wait_for(settled, 15, f"a {width}px window ({expected} CSS px) with the map laid out for it")
+    try:
+        return wait_for(settled, 15, f"a {width}px window ({expected} CSS px) with the map laid out for it")
+    except AssertionError as exc:
+        # Show what the page actually reported: viewport, panel size, the
+        # marker layer's transform and the offset the layout should have.
+        raise AssertionError(f"{exc}; last probe: {json.dumps(last.get('probe'))}") from None
 
 
 def assert_layout_fits(sock: str, label: str):
