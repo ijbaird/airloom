@@ -1342,8 +1342,16 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertLess(self.verify.index("name: Assemble verification repository"), self.verify.index("name: Verify signed client installation and upgrade"))
         development = step_block(self.verify, "Sign disposable development fixtures")
         self.assertIn("needs.release-eligibility.outputs.eligible != 'true'", development)
-        self.assertIn("flatpak build-sign", development)
-        self.assertIn("flatpak build-bundle", development)
+        # Like the production build jobs, every arch's source commit is
+        # signed before assembly; only the matrix arch gets a fixture bundle.
+        self.assertRegex(development, r"(?m)^\s*for repo_arch in x86_64 aarch64; do$")
+        self.assertRegex(
+            development,
+            r'(?m)^\s*flatpak build-sign "repos/airloom-repo-\$\{repo_arch\}" ai\.stealthvision\.Airloom stable \\$',
+        )
+        self.assertIn('--arch="${repo_arch}"', development)
+        self.assertEqual(development.count("flatpak build-sign"), 1)
+        self.assertRegex(development, r'(?m)^\s*flatpak build-bundle "repos/airloom-repo-\$\{arch\}" "dist/Airloom-\$\{arch\}\.flatpak" \\$')
         self.assertIn("FLATPAK_GPG_PUBLIC_KEY", development)
         for step_name in ("Archive update-repo artifact", "Upload update-repo artifact"):
             self.assertNotIn("needs.release-eligibility.outputs.eligible", step_block(self.flatpak, step_name))

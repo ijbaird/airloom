@@ -406,12 +406,15 @@ jobs:
         run: |
           set -euo pipefail
           arch="${{ matrix.arch }}"
-          source_repo="repos/airloom-repo-${arch}"
-          flatpak build-sign "${source_repo}" ai.stealthvision.Airloom stable \
-            --arch="${arch}" \
-            --gpg-sign="${GPG_KEY_ID}" \
-            --gpg-homedir="${GNUPGHOME}"
-          flatpak build-bundle "${source_repo}" "dist/Airloom-${arch}.flatpak" \
+          # Sign every arch's source commit, as the production build jobs
+          # do, so assembly sees the same pre-signed shape as a release.
+          for repo_arch in x86_64 aarch64; do
+            flatpak build-sign "repos/airloom-repo-${repo_arch}" ai.stealthvision.Airloom stable \
+              --arch="${repo_arch}" \
+              --gpg-sign="${GPG_KEY_ID}" \
+              --gpg-homedir="${GNUPGHOME}"
+          done
+          flatpak build-bundle "repos/airloom-repo-${arch}" "dist/Airloom-${arch}.flatpak" \
             ai.stealthvision.Airloom stable \
             --arch="${arch}" \
             --repo-url="https://ijbaird.github.io/airloom/repo" \
