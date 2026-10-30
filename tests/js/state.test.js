@@ -915,6 +915,18 @@ test("narrow layout computes scaled top controls below a full-width search", () 
   }
 });
 
+test("scaled narrow controls shrink inside the viewport instead of overflowing", () => {
+  // Real-layout coverage lives in scripts/test-ui-regression (layouts); this
+  // guards the declarations that let flex/grid children shrink below content.
+  assert.equal(cssDeclaration(".search-pill input", "min-width"), "0");
+  assert.equal(cssDeclaration(".search-pill", "min-width"), "0");
+  assert.equal(cssDeclaration(".search-pill kbd", "flex"), "none");
+  assert.equal(cssDeclaration(".map-popup", "max-width"), "calc(100vw - 24px)");
+  assert.match(cssDeclaration(".corner-buttons", "flex-wrap"), /wrap/);
+  assert.equal(cssDeclaration(".form-grid", "grid-template-columns", { narrow: true }), "minmax(0, 1fr)");
+  assert.equal(cssDeclaration("fieldset", "min-width"), "0");
+});
+
 test("demo and coverage provenance remain visible near AQI", () => {
   const app = loadApp();
   configureMap(app);
