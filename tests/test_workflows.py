@@ -18,9 +18,10 @@ FLATPAK_IMAGE = "ghcr.io/flathub-infra/flatpak-github-actions@sha256:"
 
 SANDBOX_VARIABLE = "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"
 UI_SCRIPT_STEPS = ("Run isolated WebKit UI regressions", "Run cross-layer UI regression")
-# Only these repository-root directories are exempt; nested directories with
-# the same names ship with the app. Bytecode caches mirror scanned sources.
-SANDBOX_EXEMPT_ROOTS = {".git", "tests", "docs"}
+# Only paths strictly inside these repository-root directories are exempt:
+# nested directories and root files with the same names are scanned.
+# Bytecode caches mirror scanned sources.
+SANDBOX_EXEMPT_ROOTS = {"tests", "docs"}
 
 
 def repository_files(root):
@@ -39,7 +40,8 @@ def repository_files(root):
         paths = [Path(top) / name for top, _dirs, names in os.walk(root) for name in names]
     for path in paths:
         relative = path.relative_to(root)
-        if relative.parts[0] in SANDBOX_EXEMPT_ROOTS or "__pycache__" in relative.parts:
+        inside_exempt_root = len(relative.parts) > 1 and relative.parts[0] in SANDBOX_EXEMPT_ROOTS
+        if inside_exempt_root or relative.parts[0] == ".git" or "__pycache__" in relative.parts:
             continue
         if path.is_file():
             yield path
@@ -392,6 +394,11 @@ class WorkflowContractTest(unittest.TestCase):
             "nested action tests/": (".github/actions/tests/action.yaml",
                                      f"runs:\n  using: composite\n  steps:\n    - run: export {SANDBOX_VARIABLE}=1\n      shell: bash\n"),
             "nested scripts tests/": ("scripts/tests/x", f"export {SANDBOX_VARIABLE}=1\n"),
+            # Root regular files with those names are not the exempt directories.
+            "root file tests": ("tests", f"export {SANDBOX_VARIABLE}=1\n"),
+            "root file docs": ("docs", f"export {SANDBOX_VARIABLE}=1\n"),
+            "root file docs.yml": ("docs.yml", f'env:\n  {SANDBOX_VARIABLE}: "1"\n'),
+            "root file tests.sh": ("tests.sh", f"export {SANDBOX_VARIABLE}=1\n"),
         }
         cases = [(name, edit, None) for name, edit in injections.items()]
         cases += [(name, None, added) for name, added in added_files.items()]
