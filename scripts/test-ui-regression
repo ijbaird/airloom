@@ -90,6 +90,19 @@ def eval_js(sock_path: str, js: str):
     return request(sock_path, "eval", js=js)
 
 
+class AppExited(AssertionError):
+    """The app child is gone, so waiting longer cannot help."""
+
+
+def ping_running(process: subprocess.Popen, sock_path: str):
+    """Ping the debug port, failing at once if the app has already exited."""
+    code = process.poll()
+    if code is not None:
+        how = f"killed by signal {-code}" if code < 0 else f"status {code}"
+        raise AppExited(f"the app exited before opening its debug socket ({how})")
+    return request(sock_path, "ping") or True
+
+
 def wait_for(probe, timeout_s: float, what: str):
     deadline = time.monotonic() + timeout_s
     last_error = None
@@ -98,6 +111,8 @@ def wait_for(probe, timeout_s: float, what: str):
             value = probe()
             if value is not None and value is not False:
                 return value
+        except AppExited:
+            raise
         except (OSError, ConnectionError, AssertionError) as exc:
             last_error = exc
         time.sleep(0.2)
@@ -263,8 +278,7 @@ class DebugApp:
         return self
 
     def wait_ready(self):
-        wait_for(lambda: self.process.poll() is None and request(self.sock_path, "ping"),
-                 30, "debug socket")
+        wait_for(lambda: ping_running(self.process, self.sock_path), 30, "debug socket")
         wait_for(lambda: request(self.sock_path, "state").get("sensorCount", 0) > 0,
                  30, "deterministic demo sensors")
 

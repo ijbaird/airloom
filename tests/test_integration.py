@@ -184,6 +184,25 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         self.assertTrue(process_gone(helper), "a helper in the child's session survived cleanup")
         self.assertIsNone(unrelated.poll(), "cleanup touched an unrelated process")
 
+    def test_wait_ready_fails_fast_when_the_child_has_exited(self):
+        project = self.root / "project"
+        (project / "scripts").mkdir(parents=True)
+        (project / "scripts" / "debug-run").write_bytes((PROJECT / "scripts" / "debug-run").read_bytes())
+        (project / "scripts" / "debug-run").chmod(0o755)
+        (project / "run").write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        (project / "run").chmod(0o755)
+        apps_root = self.root / "apps"
+        apps_root.mkdir()
+        app = self.script.DebugApp(apps_root, "dies", "http://127.0.0.1:1", project=project)
+        app.start()
+        try:
+            started = time.monotonic()
+            with self.assertRaisesRegex(AssertionError, r"exited before opening its debug socket \(status 7\)"):
+                app.wait_ready()
+            self.assertLess(time.monotonic() - started, 10)
+        finally:
+            app.stop()
+
     def test_stop_escalates_when_the_child_ignores_quit(self):
         project = self.root / "project"
         (project / "scripts").mkdir(parents=True)

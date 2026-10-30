@@ -153,6 +153,33 @@ class DebugScriptIsolationTest(unittest.TestCase):
     def test_save_refresh_child_is_isolated_and_unrelated_sentinels_survive(self):
         self._exercise_gui_script("test-save-refresh")
 
+    def test_heatmap_fails_fast_when_the_app_exits_before_its_debug_socket(self):
+        self._assert_fails_fast("test-heatmap")
+
+    def test_save_refresh_fails_fast_when_the_app_exits_before_its_debug_socket(self):
+        self._assert_fails_fast("test-save-refresh")
+
+    def _assert_fails_fast(self, script_name: str) -> None:
+        # Like WebKit's fatal g_error under a blocked sandbox: the app dies
+        # before serving its socket. Report that, not a 25 s connect timeout.
+        project = self.root / "project"
+        (project / "scripts").mkdir(parents=True)
+        shutil.copy2(PROJECT / "scripts" / "debug-run", project / "scripts" / "debug-run")
+        shutil.copy2(PROJECT / "scripts" / script_name, project / "scripts" / script_name)
+        write_executable(project / "run", "#!/bin/sh\nkill -TRAP $$\n")
+        tmpdir = self.root / "tmp"
+        tmpdir.mkdir()
+        env = {**os.environ, "TMPDIR": str(tmpdir),
+               "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_CACHE_HOME": str(self.root / "cache")}
+        started = time.monotonic()
+        completed = subprocess.run(
+            [sys.executable, str(project / "scripts" / script_name)], cwd=project, env=env,
+            text=True, capture_output=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("exited before opening its debug socket (killed by signal 5)", completed.stderr)
+        self.assertLess(time.monotonic() - started, 10)
+
     def _exercise_gui_script(self, script_name: str) -> None:
         project = self.root / "project"
         scripts = project / "scripts"
