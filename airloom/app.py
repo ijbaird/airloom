@@ -809,19 +809,24 @@ class AirloomApplication(Adw.Application):
         height = self.webview.get_height() if self.webview else 0
         return width / 2, height / 2
 
+    def _pinch_document_coordinates(self, gesture: Gtk.GestureZoom) -> tuple[float, float]:
+        x, y = self._pinch_centroid(gesture)
+        interface_scale = self._interface_scale()
+        return x / interface_scale, y / interface_scale
+
     def _on_native_pinch_begin(self, gesture: Gtk.GestureZoom, _sequence) -> None:
         if not self.webview:
             return
         # Claiming the sequence here is what denies WebKit's internal
         # page-scale gesture controller the same touch sequence.
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-        x, y = self._pinch_centroid(gesture)
+        x, y = self._pinch_document_coordinates(gesture)
         self._send("pinch", {"phase": "begin", "scale": 1.0, "x": x, "y": y})
 
     def _on_native_pinch_scale(self, gesture: Gtk.GestureZoom, scale: float) -> None:
         if not self.webview:
             return
-        x, y = self._pinch_centroid(gesture)
+        x, y = self._pinch_document_coordinates(gesture)
         self._send("pinch", {"phase": "change", "scale": float(scale), "x": x, "y": y})
 
     def _on_native_pinch_end(self, gesture: Gtk.GestureZoom, _sequence=None) -> None:

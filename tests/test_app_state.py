@@ -759,6 +759,50 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(Store(path).data["interface_scale"], scale)
                 self.assertEqual(app.webview.zoom_level, scale)
 
+    def test_native_pinch_uses_document_coordinates_at_every_interface_scale(self):
+        cases = (
+            (1.0, 40.0, 60.0),
+            (1.25, 32.0, 48.0),
+            (1.5, 26.666666666666668, 40.0),
+        )
+        for interface_scale, expected_x, expected_y in cases:
+            with self.subTest(interface_scale=interface_scale):
+                app = self.make_app(
+                    store=FakeStore(interface_scale=interface_scale)
+                )
+                app.webview = FakeWebView(interface_scale)
+                gesture = FakePinchGesture()
+                sequence_state = SimpleNamespace(CLAIMED=object())
+                with mock.patch.object(
+                    app_module.Gtk, "EventSequenceState", sequence_state, create=True
+                ):
+                    app._on_native_pinch_begin(gesture, None)
+                    app._on_native_pinch_scale(gesture, 1.4)
+
+                self.assertEqual(
+                    app.sent,
+                    [
+                        (
+                            "pinch",
+                            {
+                                "phase": "begin",
+                                "scale": 1.0,
+                                "x": expected_x,
+                                "y": expected_y,
+                            },
+                        ),
+                        (
+                            "pinch",
+                            {
+                                "phase": "change",
+                                "scale": 1.4,
+                                "x": expected_x,
+                                "y": expected_y,
+                            },
+                        ),
+                    ],
+                )
+
     def test_native_map_pinch_never_replaces_the_persisted_interface_scale(self):
         for scale in (1.0, 1.25, 1.5):
             with self.subTest(scale=scale):
