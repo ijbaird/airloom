@@ -124,6 +124,10 @@
 
     <div class="visually-hidden" id="ui-status" role="status" aria-live="polite" aria-atomic="true"></div>
     <div class="toast-stack" id="toast-stack" role="alert" aria-live="assertive" aria-atomic="true"></div>
+    <div class="shell-status" id="shell-status" role="alert" aria-live="assertive" hidden>
+      <span id="shell-status-message"></span>
+      <button type="button" id="reload-shell" class="primary" hidden>Reload</button>
+    </div>
 
     <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-intro">
       <form method="dialog" id="settings-form">
@@ -154,6 +158,11 @@
             <option value="10">Every 10 minutes</option>
             <option value="30">Every 30 minutes</option>
           </select></label>
+          <label><span>Interface size</span><select name="interface_scale">
+            <option value="1">100%</option>
+            <option value="1.25">125%</option>
+            <option value="1.5">150%</option>
+          </select></label>
           <fieldset class="wide"><legend>Temperature</legend><label><input name="temperature_unit" type="radio" value="F"><span>Fahrenheit</span></label><label><input name="temperature_unit" type="radio" value="C"><span>Celsius</span></label></fieldset>
           <label class="checkbox wide"><input name="confidence_filter" type="checkbox"><span>Hide low-confidence sensors</span><small>Below 90% agreement between the sensor's two channels</small></label>
           <fieldset class="wide hidden-fieldset"><legend>Hidden sensors</legend>
@@ -162,6 +171,7 @@
           </fieldset>
         </div>
         <p class="privacy-note">Your key and favorites stay in a private local config file. Location detection uses your system's GeoClue service; place search and labels use OpenStreetMap Nominatim; map tiles load from OpenStreetMap; your coordinates go to PurpleAir only as map bounds when live data is enabled.</p>
+        <p class="settings-error" id="settings-error" role="alert" hidden></p>
         <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
       </form>
     </dialog>

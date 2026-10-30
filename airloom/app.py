@@ -42,10 +42,17 @@ from .controller import ApplicationController, RefreshRequest
 # Release bundles strip airloom/debugport.py (see packaging/*.yml), so debug
 # support degrades to "absent" rather than erroring when the module is gone.
 try:
-    from .debugport import DebugPort, validate_command
+    from .debugport import (
+        CAPTURE_NOTIFICATIONS_ENV,
+        DebugPort,
+        debug_purpleair_factory,
+        validate_command,
+    )
 except ImportError:  # pragma: no cover — only true in stripped release builds
     DebugPort = None
     validate_command = None
+    debug_purpleair_factory = None
+    CAPTURE_NOTIFICATIONS_ENV = None
 from .demo import demo_sensors
 from .geocode import GeocodeError, reverse as reverse_geocode, search as place_search
 from .geography import Bounds, bounds_around, bounds_contains, split_bounds
@@ -236,6 +243,17 @@ def _age_label(seconds: float) -> str:
     return "just now" if seconds < 90 else f"{int(seconds // 60)} min ago"
 
 
+# Debug launches may swap in debugport's fixture client (see
+# _install_debug_fakes); release builds always use the real client.
+_purpleair_client_factory = None
+
+
+def _new_purpleair_client(api_key: str):
+    if _purpleair_client_factory is not None:
+        return _purpleair_client_factory(api_key)
+    return PurpleAirClient(api_key)
+
+
 def _fetch_readings(
     config: dict,
     cache: SensorCache | None,
@@ -258,7 +276,7 @@ def _fetch_readings(
 
     try:
         if config.get("api_key"):
-            client = PurpleAirClient(config["api_key"])
+            client = _new_purpleair_client(config["api_key"])
             try:
                 cached_favorite_ids: set[int] = set()
                 if cache is None:
@@ -435,6 +453,8 @@ class AirloomApplication(Adw.Application):
         # `git describe` once at startup, not per `version` call — see
         # _compute_build_id.
         self._debug_build_id: str | None = self._compute_build_id() if self.debug_mode else None
+        self._captured_notifications: list[dict] | None = None
+        self._install_debug_fakes(os.environ)
         self.store = Store()
         self.controller = ApplicationController(self.store.data)
         self.requests = RequestRegistry()
@@ -454,6 +474,7 @@ class AirloomApplication(Adw.Application):
         self.selected_id: int | None = None
         self._trend_inflight: dict[int, tuple[RequestToken, int | None]] = {}
         self.refreshing = False
+        self.active_fetch: RefreshRequest | None = None
         self.pending_fetch: RefreshRequest | None = None
         self.locator: GeoClueLocator | None = None
         self._locator_focus_handler: int | None = None
@@ -529,6 +550,7 @@ class AirloomApplication(Adw.Application):
             self._shutting_down = True
 
         self.pending_fetch = None
+        self.active_fetch = None
         self.refreshing = False
         self.requests.invalidate()
         # The pure controller has its own refresh registry. Advancing the
@@ -593,6 +615,7 @@ class AirloomApplication(Adw.Application):
         self.webview.connect("notify::zoom-level", self._on_zoom_level_changed)
         self.webview.set_zoom_level(self._interface_scale())
         self.webview.load_uri(BUNDLED_ENTRY_URI)
+        self._watch_motion_preference()
 
         # WebKitGTK's own gesture controller silently claims trackpad pinch
         # as an internal page-scale zoom before the DOM ever sees a
@@ -797,6 +820,23 @@ class AirloomApplication(Adw.Application):
         )
         self.webview.set_zoom_level(self._interface_scale())
         self.webview.load_uri(BUNDLED_ENTRY_URI)
+
+    # WebKitGTK does not derive prefers-reduced-motion from GTK's animation
+    # setting, so the shell forwards it; the page combines it with the query.
+    @staticmethod
+    def _gtk_settings():
+        settings_class = getattr(Gtk, "Settings", None)
+        return settings_class.get_default() if settings_class is not None else None
+
+    def _watch_motion_preference(self) -> None:
+        settings = self._gtk_settings()
+        if settings is not None:
+            settings.connect("notify::gtk-enable-animations", self._send_motion_preference)
+
+    def _send_motion_preference(self, *_args) -> None:
+        settings = self._gtk_settings()
+        reduced = settings is not None and not settings.props.gtk_enable_animations
+        self._send("motion", {"reduced": reduced})
 
     def _interface_scale(self) -> float:
         scale = self.store.data.get("interface_scale", 1.0)
@@ -1016,6 +1056,7 @@ class AirloomApplication(Adw.Application):
             self._reload_shell()
         elif action == "ready":
             self._send("config", self.store.public_config())
+            self._send_motion_preference()
             recovery_notice = getattr(self, "_shell_recovery_notice", None)
             if recovery_notice:
                 self._shell_recovery_notice = None
@@ -1313,10 +1354,14 @@ class AirloomApplication(Adw.Application):
                 "home_mode": home_mode,
                 "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
                 "confidence_filter": bool(message.get("confidence_filter")),
-                "interface_scale": message.get(
-                    "interface_scale", self.store.data.get("interface_scale", 1.0)
-                ),
+                "interface_scale": self.store.data.get("interface_scale", 1.0),
             }
+            if "interface_scale" in message:
+                # The selector's 100% arrives as JSON integer 1.
+                scale = message["interface_scale"]
+                if isinstance(scale, bool) or float(scale) not in (1.0, 1.25, 1.5):
+                    raise ValueError("Interface size must be 100%, 125%, or 150%.")
+                updates["interface_scale"] = float(scale)
             minutes = int(message["refresh_minutes"])
             if minutes not in (2, 5, 10, 30):
                 minutes = 2
@@ -1437,7 +1482,13 @@ class AirloomApplication(Adw.Application):
         """Keep active or queued refresh work authorized after display changes."""
         self.controller.set_config(self.store.data)
         if self.refreshing or self.pending_fetch is not None:
-            self.pending_fetch = self.controller.begin_refresh()
+            # The replacement supersedes both, so it inherits a manual
+            # Refresh's force intent from either of them.
+            force = any(
+                request is not None and request.force
+                for request in (self.active_fetch, self.pending_fetch)
+            )
+            self.pending_fetch = self.controller.begin_refresh(force=force)
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the current view, falling back to home before one exists."""
@@ -1474,6 +1525,7 @@ class AirloomApplication(Adw.Application):
             self.pending_fetch = request
             return
         self.refreshing = True
+        self.active_fetch = request
         bounds = cap_bounds(request.bounds, request.center)
         self._send("loading", {"active": True})
         config = dict(self.store.data)
@@ -1525,6 +1577,7 @@ class AirloomApplication(Adw.Application):
                     self._ensure_trend(self.selected_id)
         finally:
             self.refreshing = False
+            self.active_fetch = None
             self._send("loading", {"active": False})
             if self.pending_fetch is not None:
                 pending, self.pending_fetch = self.pending_fetch, None
@@ -1626,7 +1679,7 @@ class AirloomApplication(Adw.Application):
                     and current_sensor is not None
                     and current_sensor.last_seen == reading_last_seen
                 ):
-                    result = PurpleAirClient(api_key).fetch_rows(
+                    result = _new_purpleair_client(api_key).fetch_rows(
                         show_only=[sensor_id], fields=TREND_FETCH_FIELDS
                     )
                     if result.rows:
@@ -1741,6 +1794,17 @@ class AirloomApplication(Adw.Application):
         }
         self._send("sensors", payload)
 
+    def _install_debug_fakes(self, environ) -> None:
+        """Let debug launches use fixture PurpleAir data and capture alerts."""
+        global _purpleair_client_factory
+        if not self.debug_mode or debug_purpleair_factory is None:
+            return
+        factory = debug_purpleair_factory(environ)
+        if factory is not None:
+            _purpleair_client_factory = factory
+        if environ.get(CAPTURE_NOTIFICATIONS_ENV) == "1":
+            self._captured_notifications = []
+
     def _check_alerts(self) -> None:
         try:
             threshold = int(self.store.data.get("alert_threshold", 101))
@@ -1764,11 +1828,14 @@ class AirloomApplication(Adw.Application):
             origin=self.last_origin,
         )
         for sensor in alerted:
-            notification = Notify.Notification.new(
-                f"Air quality alert · {sensor.name[:80]}",
-                f"AQI is now {sensor.aqi}. Open Airloom for health guidance.",
-                APP_ID,
-            )
+            title = f"Air quality alert · {sensor.name[:80]}"
+            body = f"AQI is now {sensor.aqi}. Open Airloom for health guidance."
+            if self._captured_notifications is not None:
+                self._captured_notifications.append(
+                    {"sensor_id": sensor.sensor_id, "title": title, "body": body}
+                )
+                continue
+            notification = Notify.Notification.new(title, body, APP_ID)
             try:
                 notification.show()
             except GLib.Error:
@@ -1858,6 +1925,20 @@ class AirloomApplication(Adw.Application):
             self._debug_screenshot(params, reply)
         elif cmd == "quit":
             self._debug_quit(reply)
+        elif cmd == "resize":
+            self._debug_resize(params, reply)
+        elif cmd == "notifications":
+            reply({"ok": True, "result": list(self._captured_notifications or [])})
+
+    def _debug_resize(self, params: dict, reply) -> None:
+        if not self.window:
+            reply({"ok": False, "error": "window not available"})
+            return
+        width, height = params["width"], params["height"]
+        # The normal minimum size would keep a probe above the narrow layout.
+        self.window.set_size_request(min(width, 760), min(height, 540))
+        self.window.set_default_size(width, height)
+        reply({"ok": True, "result": {"width": width, "height": height}})
 
     def _debug_pinch(self, message: dict, reply) -> None:
         phase = message.get("phase")

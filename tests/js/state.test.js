@@ -275,7 +275,7 @@ function loadApp({ reducedMotion = false, preview = false } = {}) {
     return element;
   };
   const settingsForm = elements.get("settings-form");
-  for (const name of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes", "home_lat", "home_lon", "location_name"]) {
+  for (const name of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes", "interface_scale", "home_lat", "home_lon", "location_name"]) {
     settingsForm.elements[name] = new FakeElement("input");
   }
   for (const name of ["api_key", "clear_api_key", "confidence_filter"]) {
@@ -560,6 +560,44 @@ test("reduced motion completes flight immediately", () => {
   assertCenter(app, { lat: 10, lon: 20 });
 });
 
+test("system reduced-motion preference from the shell skips flight animation", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.context.Airloom.receive("motion", { reduced: true });
+  assert.equal(app.document.documentElement.classList.contains("reduce-motion"), true);
+  assert.equal(app.context.Airloom.debugState().reducedMotion, true);
+
+  app.context.Airloom.receive("location", { latitude: 10, longitude: 20, name: "Target", source: "fixed" });
+  assertCenter(app, { lat: 10, lon: 20 });
+  app.elements.get("zoom-in").click();
+  assert.equal(app.context.Airloom.debugState().zoom, 13);
+});
+
+test("re-enabled system animations animate again unless the browser asks otherwise", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.context.Airloom.receive("motion", { reduced: true });
+  app.context.Airloom.receive("motion", { reduced: false });
+  assert.equal(app.document.documentElement.classList.contains("reduce-motion"), false);
+  assert.equal(app.context.Airloom.debugState().reducedMotion, false);
+  app.context.Airloom.receive("location", { latitude: 10, longitude: 20, name: "Target", source: "fixed" });
+  assert.notEqual(app.context.Airloom.debugState().center.lat, 10);
+
+  const media = loadApp({ reducedMotion: true });
+  configureMap(media);
+  media.context.Airloom.receive("motion", { reduced: false });
+  assert.equal(media.context.Airloom.debugState().reducedMotion, true, "the media query still applies");
+  assert.equal(media.document.documentElement.classList.contains("reduce-motion"), true);
+});
+
+test("effective reduced motion also stops decorative CSS motion", () => {
+  const css = fs.readFileSync(cssPath, "utf8");
+  const rule = css.match(/\.reduce-motion \*,[^{]*\{([^}]*)\}/);
+  assert.ok(rule, "a .reduce-motion rule must cover every element");
+  assert.match(rule[1], /animation:\s*none\s*!important/);
+  assert.match(rule[1], /transition:\s*none\s*!important/);
+});
+
 test("reduced motion completes button zoom immediately", () => {
   const app = loadApp({ reducedMotion: true });
   configureMap(app);
@@ -794,14 +832,59 @@ test("favorite controls expose synchronized pressed state", () => {
   assert.equal(app.elements.get("popup-favorite").getAttribute("aria-pressed"), "false");
 });
 
-test("interface scale config updates the root scale hook without page zoom", () => {
+test("desktop interface scale is left to WebKit zoom instead of scaling CSS twice", () => {
   const app = loadApp();
   configureMap(app, { interface_scale: 1.5 });
-  assert.equal(app.document.documentElement.style["--interface-scale"], "1.5");
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1");
+  assert.equal(app.document.documentElement.dataset.interfaceScale, "1.5");
 
   receiveSensors(app, [fixtureSensor(1)], { config: { interface_scale: 1.25 } });
-  assert.equal(app.document.documentElement.style["--interface-scale"], "1.25");
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1");
+  assert.equal(app.document.documentElement.dataset.interfaceScale, "1.25");
   assert.equal(app.context.Airloom.debugState().viewportScale, null);
+});
+
+test("browser preview applies interface scale through CSS", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  configureMap(app, { interface_scale: 1.5 });
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1.5");
+  configureMap(app, { interface_scale: 1.25 });
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1.25");
+  configureMap(app, { interface_scale: 3 });
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1");
+});
+
+test("shell recovery status offers a bridged reload and clears when ready", () => {
+  const app = loadApp();
+  const status = app.elements.get("shell-status");
+  const message = app.elements.get("shell-status-message");
+  const reload = app.elements.get("reload-shell");
+  assert.ok(status, "index.html needs a #shell-status region");
+  assert.equal(status.hidden, true);
+
+  app.context.Airloom.receive("shell-status", { status: "loading", message: "Reloading Airloom…", can_reload: false });
+  assert.equal(status.hidden, false);
+  assert.equal(message.textContent, "Reloading Airloom…");
+  assert.equal(reload.hidden, true);
+
+  app.context.Airloom.receive("shell-status", { status: "error", message: "Interface stopped", can_reload: true });
+  assert.equal(status.hidden, false);
+  assert.equal(message.textContent, "Interface stopped");
+  assert.equal(reload.hidden, false);
+  reload.click();
+  assert.deepEqual(app.messages.filter((item) => item.action === "reload-shell"), [{ action: "reload-shell" }]);
+  assert.equal(reload.hidden, true);
+
+  app.context.Airloom.receive("shell-status", { status: "ready", message: "", can_reload: false });
+  assert.equal(status.hidden, true);
+});
+
+test("shell error without reload permission shows no Reload button", () => {
+  const app = loadApp();
+  app.context.Airloom.receive("shell-status", { status: "error", message: "Broken", can_reload: false });
+  assert.equal(app.elements.get("shell-status").hidden, false);
+  assert.equal(app.elements.get("reload-shell").hidden, true);
 });
 
 test("interface scale changes computed sensor, AQI, chart, preference, and control sizes", () => {
@@ -868,6 +951,18 @@ test("narrow layout computes scaled top controls below a full-width search", () 
     assert.equal(computedCssPixels(".summary-chip .summary-score", "height", scale, { narrow: true }), 40 * scale);
     assert.equal(computedCssPixels(".search-pill svg", "width", scale, { narrow: true }), 17 * scale);
   }
+});
+
+test("scaled narrow controls shrink inside the viewport instead of overflowing", () => {
+  // Real-layout coverage lives in scripts/test-ui-regression (layouts); this
+  // guards the declarations that let flex/grid children shrink below content.
+  assert.equal(cssDeclaration(".search-pill input", "min-width"), "0");
+  assert.equal(cssDeclaration(".search-pill", "min-width"), "0");
+  assert.equal(cssDeclaration(".search-pill kbd", "flex"), "none");
+  assert.equal(cssDeclaration(".map-popup", "max-width"), "calc(100vw - 24px)");
+  assert.match(cssDeclaration(".corner-buttons", "flex-wrap"), /wrap/);
+  assert.equal(cssDeclaration(".form-grid", "grid-template-columns", { narrow: true }), "minmax(0, 1fr)");
+  assert.equal(cssDeclaration("fieldset", "min-width"), "0");
 });
 
 test("demo and coverage provenance remain visible near AQI", () => {
@@ -1187,6 +1282,9 @@ test("closing Preferences invalidates pending home search responses", () => {
   home.dispatch("keydown", { key: "Enter" });
   app.elements.get("close-settings").click();
 
+  const cancellations = app.messages.filter((message) => message.action === "cancel-place-search");
+  assert.deepEqual(cancellations.map((message) => message.context), ["home"]);
+
   app.context.Airloom.receive("places", {
     request_id: 2,
     context: "home",
@@ -1320,24 +1418,120 @@ test("preview place submission explains that remote search needs the desktop app
   assert.match(app.elements.get("search-results").innerHTML, /unavailable in browser preview/i);
 });
 
-test("desktop preferences stay open until a config acknowledges persistence", () => {
+test("desktop Save waits for its matching success acknowledgment", () => {
   const app = loadApp();
   configureMap(app);
   openSettings(app);
   const form = app.elements.get("settings-form");
   const dialog = app.elements.get("settings-dialog");
+  const save = app.elements.get("save-settings");
 
-  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
-  assert.equal(app.messages.filter((message) => message.action === "save-settings").length, 1);
+  form.dispatch("submit", { submitter: save });
+  const requests = app.messages.filter((message) => message.action === "save-settings");
+  assert.equal(requests.length, 1);
+  assert.equal(Number.isInteger(requests[0].request_id), true);
   assert.equal(dialog.open, true);
+  assert.equal(save.disabled, true);
 
-  app.context.Airloom.receive("error", { message: "Could not save preferences" });
+  app.context.Airloom.receive("config", { latitude: 0, longitude: 0, location_name: "Unrelated config" });
+  app.context.Airloom.receive("error", { message: "Unrelated error" });
+  app.context.Airloom.receive("settings-save-result", { request_id: requests[0].request_id + 1, status: "success", error: null });
+  app.context.Airloom.receive("settings-save-result", { request_id: requests[0].request_id + 1, status: "error", error: "Other" });
   assert.equal(dialog.open, true);
-  assert.equal(app.elements.get("save-settings").disabled, false);
+  assert.equal(save.disabled, true);
 
-  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
-  app.context.Airloom.receive("config", { latitude: 0, longitude: 0, location_name: "Test area" });
+  app.context.Airloom.receive("settings-save-result", { request_id: requests[0].request_id, status: "success", error: null });
   assert.equal(dialog.open, false);
+  assert.equal(save.disabled, false);
+});
+
+test("matching Save failure keeps Preferences open and a stale success cannot close a retry", () => {
+  const app = loadApp();
+  configureMap(app);
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  const dialog = app.elements.get("settings-dialog");
+  const save = app.elements.get("save-settings");
+  const error = app.elements.get("settings-error");
+  assert.ok(error, "Preferences needs an in-dialog save error region");
+  assert.equal(error.hidden, true);
+
+  form.dispatch("submit", { submitter: save });
+  const firstId = app.messages.filter((message) => message.action === "save-settings")[0].request_id;
+  app.context.Airloom.receive("settings-save-result", { request_id: firstId, status: "error", error: "Disk full; try again" });
+  assert.equal(dialog.open, true);
+  assert.equal(save.disabled, false);
+  assert.equal(error.hidden, false);
+  assert.match(error.textContent, /Disk full; try again/);
+
+  form.dispatch("submit", { submitter: save });
+  const secondId = app.messages.filter((message) => message.action === "save-settings")[1].request_id;
+  assert.notEqual(secondId, firstId);
+  assert.equal(save.disabled, true);
+  assert.equal(error.hidden, true);
+  app.context.Airloom.receive("settings-save-result", { request_id: firstId, status: "success", error: null });
+  assert.equal(dialog.open, true);
+  assert.equal(save.disabled, true);
+
+  app.context.Airloom.receive("settings-save-result", { request_id: secondId, status: "error", error: "Still unwritable" });
+  assert.equal(dialog.open, true);
+  assert.equal(save.disabled, false);
+  assert.match(error.textContent, /Still unwritable/);
+});
+
+test("a Save acknowledgment arriving after Preferences closed is ignored", () => {
+  const app = loadApp();
+  configureMap(app);
+  openSettings(app);
+  app.elements.get("settings-form").dispatch("submit", { submitter: app.elements.get("save-settings") });
+  const requestId = app.messages.find((message) => message.action === "save-settings").request_id;
+  app.elements.get("cancel-settings").click();
+  openSettings(app);
+
+  app.context.Airloom.receive("settings-save-result", { request_id: requestId, status: "success", error: null });
+
+  assert.equal(app.elements.get("settings-dialog").open, true);
+});
+
+test("Preferences offers a labeled Interface size selector with three sizes", () => {
+  const html = fs.readFileSync(indexPath, "utf8");
+  const label = html.match(/<label[^>]*>\s*<span>Interface size<\/span>\s*<select name="interface_scale"[^>]*>([\s\S]*?)<\/select>/);
+  assert.ok(label, "an Interface size label must wrap the interface_scale select");
+  const options = [...label[1].matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g)].map((match) => [match[1], match[2]]);
+  assert.deepEqual(options, [["1", "100%"], ["1.25", "125%"], ["1.5", "150%"]]);
+});
+
+test("desktop Save round-trips the chosen interface size with its request id", () => {
+  const app = loadApp();
+  configureMap(app, { interface_scale: 1.25 });
+  openSettings(app, { interface_scale: 1.25 });
+  const form = app.elements.get("settings-form");
+  assert.equal(form.elements.interface_scale.value, "1.25");
+
+  form.elements.interface_scale.value = "1.5";
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+
+  const request = app.messages.find((message) => message.action === "save-settings");
+  assert.equal(request.interface_scale, 1.5);
+  assert.equal(Number.isInteger(request.request_id), true);
+  app.context.Airloom.receive("config", { interface_scale: 1.5 });
+  app.context.Airloom.receive("settings-save-result", { request_id: request.request_id, status: "success", error: null });
+  assert.equal(app.elements.get("settings-dialog").open, false);
+  assert.equal(app.document.documentElement.dataset.interfaceScale, "1.5");
+});
+
+test("preview Interface size applies through CSS without the bridge", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  assert.equal(form.elements.interface_scale.value, "1");
+  form.elements.interface_scale.value = "1.25";
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1.25");
+  assert.equal(app.elements.get("settings-dialog").open, false);
 });
 
 test("preview demo Now point equals the displayed current AQI", () => {

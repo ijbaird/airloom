@@ -6,7 +6,9 @@ import threading
 import unittest
 from pathlib import Path
 
-from airloom.debugport import DebugPort, validate_command
+from airloom.debugport import DebugPort, FakePurpleAirClient, debug_purpleair_factory, validate_command
+from airloom.geography import Bounds
+from airloom.purpleair import PurpleAirError
 
 
 def _echo_dispatcher(message: dict, reply) -> None:
@@ -296,7 +298,7 @@ class ValidateCommandTest(unittest.TestCase):
     # -- No-parameter commands --------------------------------------------
 
     def test_no_param_commands_normalize_to_empty_dict(self):
-        for cmd in ("ping", "version", "state", "quit"):
+        for cmd in ("ping", "version", "state", "quit", "notifications"):
             with self.subTest(cmd=cmd):
                 normalized, error = validate_command({"id": 1, "cmd": cmd})
                 self.assertIsNone(error)
@@ -306,6 +308,17 @@ class ValidateCommandTest(unittest.TestCase):
         normalized, error = validate_command({"id": 1, "cmd": "ping", "junk": "ignored"})
         self.assertIsNone(error)
         self.assertEqual(normalized, {})
+
+    def test_resize_requires_integral_bounded_dimensions(self):
+        normalized, error = validate_command({"id": 1, "cmd": "resize", "width": 360, "height": 700})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"width": 360, "height": 700})
+        for bad in ({}, {"width": 360}, {"width": "360", "height": 700}, {"width": 360.5, "height": 700},
+                    {"width": 199, "height": 700}, {"width": 360, "height": 4001}, {"width": True, "height": 700}):
+            with self.subTest(bad=bad):
+                normalized, error = validate_command({"id": 1, "cmd": "resize", **bad})
+                self.assertIsNone(normalized)
+                self.assertIn("resize", error)
 
     # -- Unknown / malformed cmd --------------------------------------------
 
@@ -488,6 +501,59 @@ class ProtocolRegressionTest(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 response = client.request({"id": 1, "cmd": cmd})
                 self.assertEqual(response, {"id": 1, "ok": True, "result": {}})
+
+
+class FakePurpleAirClientTest(unittest.TestCase):
+    """Dev-only fixture client; ships only with the debug module."""
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.fixture = Path(self._tempdir.name) / "purpleair.json"
+
+    def write(self, **data):
+        self.fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    def row(self, sensor_id, *, latitude=1.0, longitude=1.0, location_type=0, age_s=0):
+        return {"sensor_index": sensor_id, "name": f"Fixture {sensor_id}", "latitude": latitude,
+                "longitude": longitude, "location_type": location_type, "age_s": age_s,
+                "humidity": 50, "temperature": 70, "pm1.0": 5, "pm2.5_cf_1": 150, "pm10.0": 9,
+                "confidence": 100}
+
+    def test_filters_like_the_api_and_stamps_last_seen_from_age(self):
+        self.write(rows=[self.row(1), self.row(2, location_type=1), self.row(3, latitude=40.0),
+                         self.row(4, age_s=600)])
+        client = FakePurpleAirClient(str(self.fixture), clock=lambda: 10_000)
+        bounds = Bounds(2.0, 0.0, 0.0, 2.0)
+
+        outdoor = client.fetch_rows(bounds=bounds, location_filter="outdoor")
+        indoor = client.fetch_rows(bounds=bounds, location_filter="indoor")
+        both = client.fetch_rows(bounds=bounds, location_filter="both")
+        favorites = client.fetch_rows(show_only=[2, 3])
+
+        self.assertEqual([r["sensor_index"] for r in outdoor.rows], [1, 4])
+        self.assertEqual([r["sensor_index"] for r in indoor.rows], [2])
+        self.assertEqual([r["sensor_index"] for r in both.rows], [1, 2, 4])
+        self.assertEqual([r["sensor_index"] for r in favorites.rows], [2, 3])
+        self.assertEqual(outdoor.rows[1]["last_seen"], 10_000 - 600)
+        self.assertNotIn("age_s", outdoor.rows[0])
+        self.assertEqual(outdoor.time_stamp, 10_000)
+
+    def test_fixture_is_reread_so_a_test_can_switch_to_an_outage(self):
+        self.write(rows=[self.row(1)])
+        client = FakePurpleAirClient(str(self.fixture))
+        self.assertEqual(len(client.fetch_rows(show_only=[1]).rows), 1)
+        self.write(fail=True, rows=[])
+        with self.assertRaisesRegex(PurpleAirError, "Fake PurpleAir outage"):
+            client.fetch_rows(show_only=[1])
+
+    def test_factory_is_inert_unless_the_fixture_variable_is_set(self):
+        self.assertIsNone(debug_purpleair_factory({}))
+        self.write(rows=[])
+        factory = debug_purpleair_factory({"AIRLOOM_DEBUG_FAKE_PURPLEAIR": str(self.fixture)})
+        client = factory("any-key")
+        self.assertIsInstance(client, FakePurpleAirClient)
+        self.assertEqual(client.fetch_rows(show_only=[1]).rows, [])
 
 
 if __name__ == "__main__":

@@ -21,7 +21,13 @@
     placeRequests: { main: null, home: null },
     nextPlaceRequestId: 0,
     trends: new Map(),
-    settingsSavePending: false,
+    // The desktop shell forwards GTK's animation setting, which WebKitGTK
+    // does not expose as prefers-reduced-motion.
+    systemReducedMotion: false,
+    // Save is acknowledged only by the settings-save-result carrying this id;
+    // other config or error publications never complete a pending Save.
+    settingsSaveRequestId: null,
+    nextSettingsRequestId: 0,
     positioned: false,
     // Name of the area currently in view (reverse-geocoded by Python);
     // overrides the configured home name on the summary chip until replaced.
@@ -40,10 +46,11 @@
     favorite(id) { bridge({ action: "favorite", id }); },
     refresh() { bridge({ action: "refresh" }); },
     saveSettings(settings) {
-      if (state.settingsSavePending) return;
-      state.settingsSavePending = true;
+      if (state.settingsSaveRequestId !== null) return;
+      state.settingsSaveRequestId = ++state.nextSettingsRequestId;
       $("#save-settings").disabled = true;
-      bridge({ action: "save-settings", ...settings });
+      showSettingsError("");
+      bridge({ action: "save-settings", request_id: state.settingsSaveRequestId, ...settings });
     },
     placeSearch(query, context, requestId) {
       bridge({ action: "place-search", query, request_id: requestId, context });
@@ -81,10 +88,13 @@
       if (event === "sensors") applySensors(payload);
       if (event === "loading") document.body.classList.toggle("loading", payload.active);
       if (event === "error") handleError(payload);
+      if (event === "settings-save-result") applySettingsSaveResult(payload);
+      if (event === "shell-status") applyShellStatus(payload);
       if (event === "open-settings") openSettings(payload);
       if (event === "location") applyLocation(payload);
       if (event === "view-name" && payload.name) { state.viewName = payload.name; stampPlaceName(); }
       if (event === "pinch") nativePinch(payload);
+      if (event === "motion") { state.systemReducedMotion = payload.reduced === true; applyMotionPreference(); }
       if (event === "trend") applyTrend(payload);
       if (event === "places") applyPlaces(payload);
     },
@@ -105,6 +115,7 @@
       hiddenCount: (state.config.hidden || []).length,
       source: state.source,
       viewportScale: window.visualViewport ? window.visualViewport.scale : null,
+      reducedMotion: prefersReducedMotion(),
     }),
     debugSearch(query) {
       const input = $("#search");
@@ -147,8 +158,17 @@
   function applyInterfaceScale() {
     const requested = Number(state.config.interface_scale);
     const scale = [1, 1.25, 1.5].includes(requested) ? requested : 1;
-    document.documentElement.style.setProperty("--interface-scale", String(scale));
+    // The desktop shell applies the scale as WebKit zoom, so CSS must not
+    // scale a second time; only the browser preview scales through CSS.
+    document.documentElement.style.setProperty("--interface-scale", String(desktopMode ? 1 : scale));
     document.documentElement.dataset.interfaceScale = String(scale);
+  }
+
+  function applyShellStatus(payload) {
+    const visible = payload.status === "loading" || payload.status === "error";
+    $("#shell-status").hidden = !visible;
+    $("#shell-status-message").textContent = visible ? String(payload.message || "") : "";
+    $("#reload-shell").hidden = !(payload.status === "error" && payload.can_reload);
   }
 
   function announce(message) {
@@ -190,11 +210,6 @@
     stampFilterChip();
     applyInterfaceScale();
     renderMap();
-    if (state.settingsSavePending) {
-      state.settingsSavePending = false;
-      $("#save-settings").disabled = false;
-      if ($("#settings-dialog").open) $("#settings-dialog").close();
-    }
   }
 
   function readingVersion(value) {
@@ -918,7 +933,12 @@
   }
 
   const navigation = new AirloomState.NavigationGate();
-  const prefersReducedMotion = () => Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+  const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+  const prefersReducedMotion = () => state.systemReducedMotion || Boolean(window.matchMedia?.(REDUCED_MOTION_QUERY)?.matches);
+  // CSS reads the effective preference from this class (see app.css).
+  function applyMotionPreference() {
+    document.documentElement.classList.toggle("reduce-motion", prefersReducedMotion());
+  }
   let zoomAnim = null;
 
   function cancelZoomAnimation() {
@@ -1080,8 +1100,9 @@
 
   function openSettings(config = state.config) {
     if ($("#settings-dialog").open) return;
-    state.settingsSavePending = false;
+    state.settingsSaveRequestId = null;
     $("#save-settings").disabled = false;
+    showSettingsError("");
     const form = $("#settings-form");
     $("#settings-intro").textContent = desktopMode
       ? "Use demo readings immediately, or add your own PurpleAir read key for live public sensors."
@@ -1095,6 +1116,8 @@
     // no confidence_filter key — matching the Python default of on.
     form.elements.confidence_filter.checked = config.confidence_filter !== false;
     form.elements.temperature_unit.value = config.temperature_unit || "F";
+    const scale = Number(config.interface_scale);
+    form.elements.interface_scale.value = String([1, 1.25, 1.5].includes(scale) ? scale : 1);
     form.elements.home_mode.value = config.home_mode || "auto";
     $("#home-place-row").hidden = form.elements.home_mode.value !== "fixed";
     form.elements.home_lat.value = config.latitude;
@@ -1147,11 +1170,21 @@
   }
 
   function handleError(payload) {
-    if (state.settingsSavePending) {
-      state.settingsSavePending = false;
-      $("#save-settings").disabled = false;
-    }
     toast(payload.message);
+  }
+
+  function showSettingsError(message) {
+    $("#settings-error").textContent = message;
+    $("#settings-error").hidden = !message;
+  }
+
+  function applySettingsSaveResult(payload) {
+    if (state.settingsSaveRequestId === null || payload.request_id !== state.settingsSaveRequestId) return;
+    if (payload.status !== "success" && payload.status !== "error") return;
+    state.settingsSaveRequestId = null;
+    $("#save-settings").disabled = false;
+    if (payload.status === "success") $("#settings-dialog").close();
+    else showSettingsError(payload.error || "Could not save preferences. Try again.");
   }
 
   function toast(message) {
@@ -1319,6 +1352,10 @@
     }
   });
   $("#footer-refresh").addEventListener("click", () => actions.refresh());
+  $("#reload-shell").addEventListener("click", () => {
+    bridge({ action: "reload-shell" });
+    $("#reload-shell").hidden = true;
+  });
   $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) actions.favorite(state.selectedId); });
   $("#trend-retry").addEventListener("click", retryTrend);
   $("#hide-button").addEventListener("click", () => {
@@ -1481,9 +1518,11 @@
   $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#settings-dialog").addEventListener("close", () => {
     invalidatePlaceSearch("home");
+    // Also stop queued home searches before they reach the network.
+    bridge({ action: "cancel-place-search", context: "home" });
     $("#home-place-results").hidden = true;
     $("#home-place-results").innerHTML = "";
-    state.settingsSavePending = false;
+    state.settingsSaveRequestId = null;
     $("#save-settings").disabled = false;
   });
   document.querySelectorAll('input[name="home_mode"]').forEach((radio) => radio.addEventListener("change", () => {
@@ -1509,9 +1548,12 @@
       confidence_filter: form.get("confidence_filter") === "on",
       home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
       radius_km: form.get("radius_km"), heatmap_threshold_km: form.get("heatmap_threshold_km"), alert_threshold: form.get("alert_threshold"), refresh_minutes: form.get("refresh_minutes"), temperature_unit: form.get("temperature_unit"),
+      interface_scale: Number(form.get("interface_scale")),
     });
   });
   new ResizeObserver(() => renderMap()).observe($("#map-panel"));
+  window.matchMedia?.(REDUCED_MOTION_QUERY)?.addEventListener?.("change", applyMotionPreference);
+  applyMotionPreference();
   bridge({ action: "ready" });
   // Makes the interface directly previewable in an ordinary browser while the
   // desktop build continues to receive its state from the Python bridge.

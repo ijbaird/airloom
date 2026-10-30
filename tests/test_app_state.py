@@ -4,6 +4,7 @@ import errno
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from copy import deepcopy
@@ -227,6 +228,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app._monitoring_ids = set()
         app.selected_id = None
         app.refreshing = False
+        app.active_fetch = None
         app.pending_fetch = None
         app.current_view = None
         app.view_bounds = None
@@ -241,6 +243,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app.title = None
         app._cache_error = None
         app._shell_recovery_notice = None
+        app._captured_notifications = None
         app.sent = []
         app.launched = []
         app.trends = []
@@ -653,6 +656,59 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             self.assertEqual(replacement.generation, pending.generation + 1)
             self.assertEqual(app.launched, [(replacement,)])
 
+    def _real_fetch_app(self, store):
+        app = self.make_app(store=store)
+        app.webview = object()
+        app._start_worker = mock.Mock(return_value=True)
+        app._start_fetch = lambda request: AirloomApplication._start_fetch(app, request)
+        app.sensors = [make_sensor(1)]
+        app._area_ids = {1}
+        return app
+
+    def test_favorite_reissue_preserves_active_manual_refresh_force(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.save()
+            app = self._real_fetch_app(store)
+            app._on_script_message(None, ScriptMessage({"action": "refresh"}))
+            self.assertEqual(app._start_worker.call_count, 1)
+
+            app._on_script_message(
+                None, ScriptMessage({"action": "favorite", "id": 1})
+            )
+
+            self.assertIsNotNone(app.pending_fetch)
+            self.assertTrue(app.pending_fetch.force)
+
+    def test_hide_reissue_preserves_queued_manual_refresh_force(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.save()
+            app = self._real_fetch_app(store)
+            app.refresh()
+            app._on_script_message(None, ScriptMessage({"action": "refresh"}))
+            queued = app.pending_fetch
+            self.assertTrue(queued.force)
+
+            app._on_script_message(None, ScriptMessage({"action": "hide", "id": 1}))
+            replacement = app.pending_fetch
+
+            self.assertIsNot(replacement, queued)
+            self.assertGreater(replacement.request_id, queued.request_id)
+            self.assertTrue(replacement.force)
+            self.assertEqual(app._start_worker.call_count, 1)
+
+    def test_reissue_after_unforced_work_stays_unforced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.save()
+            app = self._real_fetch_app(store)
+            app.refresh()
+
+            app._on_script_message(None, ScriptMessage({"action": "hide", "id": 1}))
+
+            self.assertFalse(app.pending_fetch.force)
+
     def test_refresh_ensures_preserved_non_first_selection_trend(self):
         app = self.make_app()
         app.selected_id = 2
@@ -844,6 +900,131 @@ class ShellRecoveryTest(ApplicationAdapterTestCase):
         self.assertTrue(statuses[-1]["can_reload"])
 
 
+class DebugFakeWiringTest(ApplicationAdapterTestCase):
+    def setUp(self):
+        original = app_module._purpleair_client_factory
+        self.addCleanup(setattr, app_module, "_purpleair_client_factory", original)
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.fixture = Path(self._tempdir.name) / "purpleair.json"
+        self.fixture.write_text('{"rows": []}', encoding="utf-8")
+        self.environ = {
+            "AIRLOOM_DEBUG_FAKE_PURPLEAIR": str(self.fixture),
+            "AIRLOOM_DEBUG_CAPTURE_NOTIFICATIONS": "1",
+        }
+
+    def test_fakes_stay_inert_outside_debug_mode(self):
+        app = self.make_app()
+        app.debug_mode = False
+        app._install_debug_fakes(self.environ)
+        self.assertIsNone(app_module._purpleair_client_factory)
+        self.assertIsInstance(app_module._new_purpleair_client("key"), app_module.PurpleAirClient)
+        self.assertIsNone(app._captured_notifications)
+
+    def test_fakes_stay_inert_when_the_debug_module_is_stripped(self):
+        app = self.make_app()
+        app.debug_mode = True
+        with mock.patch.object(app_module, "debug_purpleair_factory", None):
+            app._install_debug_fakes(self.environ)
+        self.assertIsNone(app_module._purpleair_client_factory)
+        self.assertIsInstance(app_module._new_purpleair_client("key"), app_module.PurpleAirClient)
+
+    def test_debug_mode_installs_the_fixture_client_and_notification_capture(self):
+        app = self.make_app()
+        app.debug_mode = True
+        app._install_debug_fakes(self.environ)
+        client = app_module._new_purpleair_client("fake-key")
+        self.assertEqual(type(client).__name__, "FakePurpleAirClient")
+        self.assertEqual(app._captured_notifications, [])
+
+    def test_captured_alerts_never_reach_libnotify(self):
+        app = self.make_app(store=FakeStore(favorites=[1], alert_threshold=101))
+        app._captured_notifications = []
+        app.sensors = [make_sensor(1, aqi=180, last_seen=int(time.time()) - 60)]
+        app._area_ids = {1}
+        notify = SimpleNamespace(Notification=SimpleNamespace(new=mock.Mock(side_effect=AssertionError)))
+        with mock.patch.object(app_module, "Notify", notify):
+            app._check_alerts()
+        self.assertEqual([item["sensor_id"] for item in app._captured_notifications], [1])
+        self.assertIn("AQI is now 180", app._captured_notifications[0]["body"])
+
+    def test_notifications_debug_command_reports_captures(self):
+        app = self.make_app()
+        app._captured_notifications = [{"sensor_id": 1, "title": "t", "body": "b"}]
+        replies = []
+        app._handle_debug_command({"cmd": "notifications"}, replies.append)
+        self.assertEqual(replies, [{"ok": True, "result": [{"sensor_id": 1, "title": "t", "body": "b"}]}])
+
+
+class DebugResizeTest(ApplicationAdapterTestCase):
+    def test_resize_sets_the_window_size_and_lifts_the_minimum_for_narrow_probes(self):
+        app = self.make_app()
+        app.window = mock.Mock()
+        replies = []
+        app._handle_debug_command({"cmd": "resize", "width": 360, "height": 700}, replies.append)
+        self.assertEqual(replies, [{"ok": True, "result": {"width": 360, "height": 700}}])
+        app.window.set_size_request.assert_called_once_with(360, 540)
+        app.window.set_default_size.assert_called_once_with(360, 700)
+
+    def test_resize_never_reaches_the_window_with_invalid_params(self):
+        app = self.make_app()
+        app.window = mock.Mock()
+        replies = []
+        app._handle_debug_command({"cmd": "resize", "width": 50, "height": 700}, replies.append)
+        self.assertFalse(replies[0]["ok"])
+        app.window.set_default_size.assert_not_called()
+
+
+class FakeGtkSettings:
+    def __init__(self, animations):
+        self.props = SimpleNamespace(gtk_enable_animations=animations)
+        self.handlers = []
+
+    def connect(self, signal, handler):
+        self.handlers.append((signal, handler))
+        return len(self.handlers)
+
+
+class MotionPreferenceAdapterTest(ApplicationAdapterTestCase):
+    def _with_settings(self, settings):
+        gtk = SimpleNamespace(Settings=SimpleNamespace(get_default=lambda: settings))
+        return mock.patch.object(app_module, "Gtk", gtk)
+
+    def motion_events(self, app):
+        return [payload for event, payload in app.sent if event == "motion"]
+
+    def test_ready_publishes_disabled_system_animations_as_reduced_motion(self):
+        app = self.make_app()
+        app._paint_cached_home = lambda: None
+        app.refresh = lambda *args, **kwargs: None
+        with self._with_settings(FakeGtkSettings(False)):
+            app._on_script_message(None, ScriptMessage({"action": "ready"}))
+        self.assertEqual(self.motion_events(app), [{"reduced": True}])
+
+    def test_ready_publishes_enabled_animations_and_tolerates_no_settings(self):
+        for settings, expected in ((FakeGtkSettings(True), False), (None, False)):
+            with self.subTest(settings=settings):
+                app = self.make_app()
+                app._paint_cached_home = lambda: None
+                app.refresh = lambda *args, **kwargs: None
+                with self._with_settings(settings):
+                    app._on_script_message(None, ScriptMessage({"action": "ready"}))
+                self.assertEqual(self.motion_events(app), [{"reduced": expected}])
+
+    def test_system_animation_changes_are_republished_live(self):
+        settings = FakeGtkSettings(True)
+        app = self.make_app()
+        with self._with_settings(settings):
+            app._watch_motion_preference()
+            self.assertEqual([signal for signal, _ in settings.handlers],
+                             ["notify::gtk-enable-animations"])
+            settings.props.gtk_enable_animations = False
+            settings.handlers[0][1](settings, None)
+            settings.props.gtk_enable_animations = True
+            settings.handlers[0][1](settings, None)
+        self.assertEqual(self.motion_events(app), [{"reduced": True}, {"reduced": False}])
+
+
 class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
     def test_all_supported_scales_persist_and_apply_to_the_webview(self):
         for scale in (1.0, 1.25, 1.5):
@@ -873,6 +1054,53 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
 
                 self.assertEqual(Store(path).data["interface_scale"], scale)
                 self.assertEqual(app.webview.zoom_level, scale)
+
+    def test_save_accepts_interface_size_numbers_from_the_selector(self):
+        # JSON turns the selector's 100% (Number 1) into a Python int.
+        for sent, expected in ((1, 1.0), (1.25, 1.25), (1.5, 1.5), ("1.25", 1.25)):
+            with self.subTest(sent=sent), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.json"
+                store = Store(path)
+                store.data["interface_scale"] = 1.5 if expected != 1.5 else 1.0
+                store.save()
+                app = self.make_app(store=store)
+                app.webview = FakeWebView(store.data["interface_scale"])
+                app._arm_auto_refresh = lambda: None
+                app.refresh = lambda *args, **kwargs: None
+
+                app._on_script_message(None, ScriptMessage({
+                    "action": "save-settings", "request_id": 4,
+                    "radius_km": 22, "heatmap_threshold_km": 40, "alert_threshold": 101,
+                    "refresh_minutes": 2, "temperature_unit": "F", "home_mode": "auto",
+                    "interface_scale": sent,
+                }))
+
+                results = [p for e, p in app.sent if e == "settings-save-result"]
+                self.assertEqual(results[-1]["status"], "success")
+                self.assertEqual(Store(path).data["interface_scale"], expected)
+                self.assertEqual(app.webview.zoom_level, expected)
+
+    def test_save_rejects_unsupported_interface_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = Store(path)
+            store.data["interface_scale"] = 1.25
+            store.save()
+            app = self.make_app(store=store)
+            app.webview = FakeWebView(1.25)
+            app._arm_auto_refresh = lambda: None
+            app.refresh = lambda *args, **kwargs: None
+
+            app._on_script_message(None, ScriptMessage({
+                "action": "save-settings", "request_id": 5,
+                "radius_km": 22, "heatmap_threshold_km": 40, "alert_threshold": 101,
+                "refresh_minutes": 2, "temperature_unit": "F", "home_mode": "auto",
+                "interface_scale": 3,
+            }))
+
+            results = [p for e, p in app.sent if e == "settings-save-result"]
+            self.assertEqual(results[-1]["status"], "error")
+            self.assertEqual(Store(path).data["interface_scale"], 1.25)
 
     def test_native_pinch_uses_document_coordinates_at_every_interface_scale(self):
         cases = (
