@@ -181,6 +181,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .toast-stack { position: fixed; z-index: 100; left: 50%; bottom: calc(22px * var(--interface-scale)); transform: translateX(-50%); display: flex; flex-direction: column; gap: calc(8px * var(--interface-scale)); pointer-events: none; }
 .toast { max-width: calc(520px * var(--interface-scale)); padding: calc(10px * var(--interface-scale)) calc(14px * var(--interface-scale)); border-radius: calc(11px * var(--interface-scale)); background: #27322c; color: white; box-shadow: var(--shadow); font-size: calc(12px * var(--interface-scale)); animation: toast-in .22s ease-out; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+.shell-status { position: fixed; z-index: 110; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; align-items: center; gap: calc(12px * var(--interface-scale)); width: max-content; max-width: calc(100vw - 32px); padding: calc(16px * var(--interface-scale)); border-radius: calc(12px * var(--interface-scale)); background: var(--panel-solid); color: var(--ink); box-shadow: var(--shadow); }
+.shell-status[hidden], .shell-status button[hidden], .settings-error[hidden] { display: none; }
+.shell-status button { flex: none; padding: calc(8px * var(--interface-scale)) calc(14px * var(--interface-scale)); border: 0; border-radius: calc(8px * var(--interface-scale)); background: var(--accent); color: white; cursor: pointer; font: inherit; font-weight: 700; }
+.settings-error { margin: calc(12px * var(--interface-scale)) 0 0; color: #b3261e; font-weight: 600; }
 
 .settings-dialog { width: min(calc(520px * var(--interface-scale)), calc(100vw - 32px * var(--interface-scale))); max-height: calc(100vh - 42px * var(--interface-scale)); padding: 0; border: 1px solid var(--line); border-radius: calc(18px * var(--interface-scale)); background: var(--panel-solid); color: var(--ink); box-shadow: 0 24px 80px rgba(19,31,24,.26); }
 .settings-dialog::backdrop { background: rgba(15,24,19,.46); backdrop-filter: blur(3px); }

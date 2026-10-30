@@ -124,6 +124,10 @@
 
     <div class="visually-hidden" id="ui-status" role="status" aria-live="polite" aria-atomic="true"></div>
     <div class="toast-stack" id="toast-stack" role="alert" aria-live="assertive" aria-atomic="true"></div>
+    <div class="shell-status" id="shell-status" role="alert" aria-live="assertive" hidden>
+      <span id="shell-status-message"></span>
+      <button type="button" id="reload-shell" class="primary" hidden>Reload</button>
+    </div>
 
     <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-intro">
       <form method="dialog" id="settings-form">
@@ -162,6 +166,7 @@
           </fieldset>
         </div>
         <p class="privacy-note">Your key and favorites stay in a private local config file. Location detection uses your system's GeoClue service; place search and labels use OpenStreetMap Nominatim; map tiles load from OpenStreetMap; your coordinates go to PurpleAir only as map bounds when live data is enabled.</p>
+        <p class="settings-error" id="settings-error" role="alert" hidden></p>
         <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
       </form>
     </dialog>

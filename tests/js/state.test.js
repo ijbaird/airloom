@@ -794,14 +794,59 @@ test("favorite controls expose synchronized pressed state", () => {
   assert.equal(app.elements.get("popup-favorite").getAttribute("aria-pressed"), "false");
 });
 
-test("interface scale config updates the root scale hook without page zoom", () => {
+test("desktop interface scale is left to WebKit zoom instead of scaling CSS twice", () => {
   const app = loadApp();
   configureMap(app, { interface_scale: 1.5 });
-  assert.equal(app.document.documentElement.style["--interface-scale"], "1.5");
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1");
+  assert.equal(app.document.documentElement.dataset.interfaceScale, "1.5");
 
   receiveSensors(app, [fixtureSensor(1)], { config: { interface_scale: 1.25 } });
-  assert.equal(app.document.documentElement.style["--interface-scale"], "1.25");
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1");
+  assert.equal(app.document.documentElement.dataset.interfaceScale, "1.25");
   assert.equal(app.context.Airloom.debugState().viewportScale, null);
+});
+
+test("browser preview applies interface scale through CSS", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  configureMap(app, { interface_scale: 1.5 });
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1.5");
+  configureMap(app, { interface_scale: 1.25 });
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1.25");
+  configureMap(app, { interface_scale: 3 });
+  assert.equal(app.document.documentElement.style["--interface-scale"], "1");
+});
+
+test("shell recovery status offers a bridged reload and clears when ready", () => {
+  const app = loadApp();
+  const status = app.elements.get("shell-status");
+  const message = app.elements.get("shell-status-message");
+  const reload = app.elements.get("reload-shell");
+  assert.ok(status, "index.html needs a #shell-status region");
+  assert.equal(status.hidden, true);
+
+  app.context.Airloom.receive("shell-status", { status: "loading", message: "Reloading Airloom…", can_reload: false });
+  assert.equal(status.hidden, false);
+  assert.equal(message.textContent, "Reloading Airloom…");
+  assert.equal(reload.hidden, true);
+
+  app.context.Airloom.receive("shell-status", { status: "error", message: "Interface stopped", can_reload: true });
+  assert.equal(status.hidden, false);
+  assert.equal(message.textContent, "Interface stopped");
+  assert.equal(reload.hidden, false);
+  reload.click();
+  assert.deepEqual(app.messages.filter((item) => item.action === "reload-shell"), [{ action: "reload-shell" }]);
+  assert.equal(reload.hidden, true);
+
+  app.context.Airloom.receive("shell-status", { status: "ready", message: "", can_reload: false });
+  assert.equal(status.hidden, true);
+});
+
+test("shell error without reload permission shows no Reload button", () => {
+  const app = loadApp();
+  app.context.Airloom.receive("shell-status", { status: "error", message: "Broken", can_reload: false });
+  assert.equal(app.elements.get("shell-status").hidden, false);
+  assert.equal(app.elements.get("reload-shell").hidden, true);
 });
 
 test("interface scale changes computed sensor, AQI, chart, preference, and control sizes", () => {
@@ -1187,6 +1232,9 @@ test("closing Preferences invalidates pending home search responses", () => {
   home.dispatch("keydown", { key: "Enter" });
   app.elements.get("close-settings").click();
 
+  const cancellations = app.messages.filter((message) => message.action === "cancel-place-search");
+  assert.deepEqual(cancellations.map((message) => message.context), ["home"]);
+
   app.context.Airloom.receive("places", {
     request_id: 2,
     context: "home",
@@ -1320,24 +1368,79 @@ test("preview place submission explains that remote search needs the desktop app
   assert.match(app.elements.get("search-results").innerHTML, /unavailable in browser preview/i);
 });
 
-test("desktop preferences stay open until a config acknowledges persistence", () => {
+test("desktop Save waits for its matching success acknowledgment", () => {
   const app = loadApp();
   configureMap(app);
   openSettings(app);
   const form = app.elements.get("settings-form");
   const dialog = app.elements.get("settings-dialog");
+  const save = app.elements.get("save-settings");
 
-  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
-  assert.equal(app.messages.filter((message) => message.action === "save-settings").length, 1);
+  form.dispatch("submit", { submitter: save });
+  const requests = app.messages.filter((message) => message.action === "save-settings");
+  assert.equal(requests.length, 1);
+  assert.equal(Number.isInteger(requests[0].request_id), true);
   assert.equal(dialog.open, true);
+  assert.equal(save.disabled, true);
 
-  app.context.Airloom.receive("error", { message: "Could not save preferences" });
+  app.context.Airloom.receive("config", { latitude: 0, longitude: 0, location_name: "Unrelated config" });
+  app.context.Airloom.receive("error", { message: "Unrelated error" });
+  app.context.Airloom.receive("settings-save-result", { request_id: requests[0].request_id + 1, status: "success", error: null });
+  app.context.Airloom.receive("settings-save-result", { request_id: requests[0].request_id + 1, status: "error", error: "Other" });
   assert.equal(dialog.open, true);
-  assert.equal(app.elements.get("save-settings").disabled, false);
+  assert.equal(save.disabled, true);
 
-  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
-  app.context.Airloom.receive("config", { latitude: 0, longitude: 0, location_name: "Test area" });
+  app.context.Airloom.receive("settings-save-result", { request_id: requests[0].request_id, status: "success", error: null });
   assert.equal(dialog.open, false);
+  assert.equal(save.disabled, false);
+});
+
+test("matching Save failure keeps Preferences open and a stale success cannot close a retry", () => {
+  const app = loadApp();
+  configureMap(app);
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  const dialog = app.elements.get("settings-dialog");
+  const save = app.elements.get("save-settings");
+  const error = app.elements.get("settings-error");
+  assert.ok(error, "Preferences needs an in-dialog save error region");
+  assert.equal(error.hidden, true);
+
+  form.dispatch("submit", { submitter: save });
+  const firstId = app.messages.filter((message) => message.action === "save-settings")[0].request_id;
+  app.context.Airloom.receive("settings-save-result", { request_id: firstId, status: "error", error: "Disk full; try again" });
+  assert.equal(dialog.open, true);
+  assert.equal(save.disabled, false);
+  assert.equal(error.hidden, false);
+  assert.match(error.textContent, /Disk full; try again/);
+
+  form.dispatch("submit", { submitter: save });
+  const secondId = app.messages.filter((message) => message.action === "save-settings")[1].request_id;
+  assert.notEqual(secondId, firstId);
+  assert.equal(save.disabled, true);
+  assert.equal(error.hidden, true);
+  app.context.Airloom.receive("settings-save-result", { request_id: firstId, status: "success", error: null });
+  assert.equal(dialog.open, true);
+  assert.equal(save.disabled, true);
+
+  app.context.Airloom.receive("settings-save-result", { request_id: secondId, status: "error", error: "Still unwritable" });
+  assert.equal(dialog.open, true);
+  assert.equal(save.disabled, false);
+  assert.match(error.textContent, /Still unwritable/);
+});
+
+test("a Save acknowledgment arriving after Preferences closed is ignored", () => {
+  const app = loadApp();
+  configureMap(app);
+  openSettings(app);
+  app.elements.get("settings-form").dispatch("submit", { submitter: app.elements.get("save-settings") });
+  const requestId = app.messages.find((message) => message.action === "save-settings").request_id;
+  app.elements.get("cancel-settings").click();
+  openSettings(app);
+
+  app.context.Airloom.receive("settings-save-result", { request_id: requestId, status: "success", error: null });
+
+  assert.equal(app.elements.get("settings-dialog").open, true);
 });
 
 test("preview demo Now point equals the displayed current AQI", () => {
