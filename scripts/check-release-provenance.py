@@ -101,15 +101,22 @@ def validate(args: argparse.Namespace) -> None:
                 f"repository tar name must end in .tar: {repository_tar}"
             )
         matches = [
-            record["repository_checksums"][repository_tar.name]
-            for record in records.values()
+            (path, record["repository_checksums"][repository_tar.name])
+            for path, record in records.items()
             if repository_tar.name in record.get("repository_checksums", {})
         ]
+        tar_name = re.fullmatch(r"airloom-repo-([A-Za-z0-9_]+)\.tar", repository_tar.name)
+        if tar_name:
+            adjacent = repository_tar.with_name(
+                f"Airloom-{tar_name.group(1)}.provenance.json"
+            ).resolve()
+            if adjacent in records:
+                matches = [match for match in matches if match[0] == adjacent]
         if len(matches) != 1:
             raise ProvenanceError(
                 f"missing or ambiguous matching --provenance for repository tar: {repository_tar}"
             )
-        expected = matches[0]
+        expected = matches[0][1]
         actual = bundle_digest(repository_tar)
         if expected != actual:
             raise ProvenanceError(

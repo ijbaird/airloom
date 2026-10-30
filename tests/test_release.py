@@ -524,6 +524,64 @@ class RepositoryTarProvenanceValidationTest(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_complete_client_arguments_accept_identical_adjacent_provenance_copy(self):
+        client = self.root / "client"
+        dist = client / "dist"
+        dist.mkdir(parents=True)
+        repository_dirs = {}
+        for arch in ("x86_64", "aarch64"):
+            repository_dir = client / "repos" / f"airloom-repo-{arch}"
+            repository_dir.mkdir(parents=True)
+            repository_dirs[arch] = repository_dir
+            bundle = repository_dir / f"Airloom-{arch}.flatpak"
+            bundle.write_bytes(f"{arch} client bundle\n".encode())
+            repository_tar = repository_dir / f"airloom-repo-{arch}.tar"
+            repository_tar.write_bytes(f"{arch} repository payload\n".encode())
+            provenance = repository_dir / f"Airloom-{arch}.provenance.json"
+            result = subprocess.run(
+                provenance_command(
+                    provenance, bundle, repository_tar=repository_tar
+                ),
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        shutil.copyfile(
+            repository_dirs["x86_64"] / "Airloom-x86_64.flatpak",
+            dist / "Airloom-x86_64.flatpak",
+        )
+        shutil.copyfile(
+            repository_dirs["x86_64"] / "Airloom-x86_64.provenance.json",
+            dist / "Airloom-x86_64.provenance.json",
+        )
+        command = [
+            sys.executable,
+            str(CHECK_PROVENANCE),
+            "--source-sha",
+            SOURCE_SHA,
+            "--provenance",
+            str(dist / "Airloom-x86_64.provenance.json"),
+            "--bundle",
+            str(dist / "Airloom-x86_64.flatpak"),
+        ]
+        for arch in ("x86_64", "aarch64"):
+            repository_dir = repository_dirs[arch]
+            command.extend(
+                (
+                    "--provenance",
+                    str(repository_dir / f"Airloom-{arch}.provenance.json"),
+                    "--repository-tar",
+                    str(repository_dir / f"airloom-repo-{arch}.tar"),
+                )
+            )
+
+        result = subprocess.run(
+            command, cwd=PROJECT_ROOT, capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_replaced_repository_tar_is_rejected_before_it_can_be_used(self):
         self.repository_tar.write_bytes(b"replacement repository tar payload\n")
         result = self.check()
@@ -549,6 +607,46 @@ class RepositoryTarProvenanceValidationTest(unittest.TestCase):
         result = self.check(provenance=other_provenance)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("repository tar checksum mismatch", result.stderr)
+
+    def test_genuinely_ambiguous_repository_provenance_is_rejected(self):
+        other = self.root / "ambiguous"
+        other.mkdir()
+        other_tar = other / self.repository_tar.name
+        other_tar.write_bytes(b"conflicting repository tar payload\n")
+        other_provenance = other / self.provenance.name
+        result = subprocess.run(
+            provenance_command(
+                other_provenance, self.bundle, repository_tar=other_tar
+            ),
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        isolated = self.root / "isolated"
+        isolated.mkdir()
+        isolated_tar = isolated / self.repository_tar.name
+        shutil.copyfile(self.repository_tar, isolated_tar)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECK_PROVENANCE),
+                "--source-sha",
+                SOURCE_SHA,
+                "--provenance",
+                str(self.provenance),
+                "--provenance",
+                str(other_provenance),
+                "--repository-tar",
+                str(isolated_tar),
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("missing or ambiguous", result.stderr)
 
     def test_repository_tar_provenance_is_bound_to_the_source_commit(self):
         result = self.check(source_sha="e" * 40)
