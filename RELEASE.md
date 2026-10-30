@@ -4,11 +4,22 @@ GitHub Actions builds Flatpak bundles for x86_64 and aarch64 on every push and p
 
 To publish a release:
 
-1. Update `airloom/__init__.py`, `CHANGELOG.md`, and the AppStream release entry to the same semantic version.
-2. Run `make check`. The required `webkit-ui` job, an ancestor of both publication channels, runs `scripts/test-heatmap`, `scripts/test-save-refresh`, and the cross-layer `scripts/test-ui-regression` (including its stripped-debug, search, focus, and alert scenarios) in a `fedora:44` container under Xvfb, the last as an unprivileged user on a private session bus (its save-failure checks refuse to run as root), so any failing UI scenario blocks publication. When the validators are installed, also run `desktop-file-validate packaging/ai.stealthvision.Airloom.desktop` and `appstreamcli validate --no-net packaging/ai.stealthvision.Airloom.metainfo.xml`.
-3. Commit the release so the intended version and source are present in `HEAD`.
-4. Where possible, run `./scripts/build-flatpak.sh`. The script tests and builds a pristine export of committed `HEAD`; uncommitted files and edits are excluded, and the bundle filename takes its version from that export rather than the dirty checkout.
-5. Push a signed or annotated tag named `vX.Y.Z`. The workflow fetches the complete tag history and denies malformed tags, unknown tags, branch/manual dispatch, and any mismatch between the tag and the three version files before a signing key is imported or a stable repository is archived.
+1. Update `airloom/__init__.py`, `CHANGELOG.md`, and the AppStream release entry to the same semantic version and date. Point every AppStream screenshot URL at the new tag (`https://raw.githubusercontent.com/ijbaird/airloom/vX.Y.Z/packaging/screenshots/...`); if the interface changed, regenerate the images first with `python3 scripts/make-screenshots`, which runs its own private headless mutter and session bus and shows deterministic demo data.
+2. Run `make check`. When the validators are installed, also run `desktop-file-validate packaging/ai.stealthvision.Airloom.desktop` and `appstreamcli validate --no-net packaging/ai.stealthvision.Airloom.metainfo.xml`.
+3. Commit the release so the intended version and source are present in `HEAD`. Where possible, run `./scripts/build-flatpak.sh`; it tests and builds a pristine export of committed `HEAD`, so uncommitted files and edits are excluded, and the bundle filename takes its version from that export rather than the dirty checkout.
+4. Open a pull request (or push to `main`) and wait for the full `Flatpak` workflow to pass: `test`, `webkit-ui`, both `flatpak` architectures, and the `verify-client` signed-install checks. The required `webkit-ui` job runs `scripts/test-heatmap`, `scripts/test-save-refresh`, and the cross-layer `scripts/test-ui-regression` (including its stripped-debug, search, focus, and alert scenarios) in a `fedora:44` container under Xvfb, the last as an unprivileged user on a private session bus (its save-failure checks refuse to run as root), so any failing UI scenario blocks publication.
+5. Merge, then wait for the `Flatpak` run on `main` to go green for the merge commit.
+6. Create an annotated (or signed) tag named `vX.Y.Z` on that exact commit and push only the tag:
+
+   ```bash
+   git fetch origin main
+   git tag -a vX.Y.Z -m "Airloom X.Y.Z" <green-main-commit-sha>
+   git push origin vX.Y.Z
+   ```
+
+   The workflow fetches the complete tag history and denies malformed tags, unknown tags, branch/manual dispatch, and any mismatch between the tag and the three version files before a signing key is imported or a stable repository is archived.
+
+Publication is queued: the tag's run waits behind any earlier `Flatpak` publication still in progress rather than cancelling it, and when its turn comes it revalidates release eligibility and the captured tag/source commit before publishing anything.
 
 The `Flatpak` workflow downloads both architecture artifacts, generates `SHA256SUMS`, creates the GitHub release with generated notes, and attaches the bundles, checksums, and per-architecture `*.provenance.json` files. Ordinary branch pushes and pull requests still produce unsigned development artifacts, but cannot sign or publish stable releases.
 

@@ -9,10 +9,12 @@ Airloom includes:
 
 - an interactive OpenStreetMap view with color-coded sensor markers;
 - a sensor browser, search, favorites, responsive detail view, and rolling-average chart;
-- US EPA 2024 PM2.5 AQI breakpoints and PurpleAir's EPA correction;
+- US EPA 2024 PM2.5 AQI breakpoints and the EPA's corrections for PurpleAir data (see [AQI and alerts](#aqi-and-alerts));
+- demo, cached, and stale readings labeled next to the AQI, and a "Limited coverage" note when the view extends past fetched data;
 - temperature, humidity, PM2.5, and PM10 readings;
 - local desktop notifications when a favorite crosses a chosen AQI threshold;
 - a no-account demo mode and live mode with your own PurpleAir read key;
+- keyboard navigation, screen-reader labels and announcements, an Interface size preference (100%, 125%, or 150%), and reduced motion when GNOME's animations are turned off;
 - light/dark GNOME styling and desktop/Flatpak metadata.
 
 ## Run on Fedora
@@ -24,7 +26,7 @@ sudo dnf install python3-gobject gtk4 libadwaita webkitgtk6.0 libnotify
 ./run
 ```
 
-It launches in demo mode. Open Preferences, enter your [PurpleAir API read key](https://develop.purpleair.com/), and set the map center coordinates to load live public outdoor sensors.
+It launches in demo mode. Open Preferences, enter your [PurpleAir API read key](https://develop.purpleair.com/), and choose automatic location or a fixed home place to load live public sensors. Place searches (in Preferences and the map's search box) are sent only when you press Enter.
 
 ## Test
 
