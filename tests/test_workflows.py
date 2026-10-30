@@ -8,6 +8,7 @@ WORKFLOWS = PROJECT / ".github" / "workflows"
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 DEPLOY_PAGES_SHA = "368f82528645a54fb793d4d04e342629a3f51346"
 FLATPAK_BUILDER_SHA = "79327416609af08178ad73b352877e51450790b3"
+TURNSTYLE_SHA = "3805450be63b8c80577dc253e8c17e9132036df4"
 
 
 def workflow(name):
@@ -186,6 +187,10 @@ class WorkflowContractTest(unittest.TestCase):
             f"flatpak/flatpak-github-actions/flatpak-builder@{FLATPAK_BUILDER_SHA}",
             source,
         )
+
+    def test_publication_queue_uses_the_reviewed_turnstyle_sha(self):
+        source = workflow("publish.yml")
+        self.assertIn(f"softprops/turnstyle@{TURNSTYLE_SHA}", source)
 
 
 if __name__ == "__main__":

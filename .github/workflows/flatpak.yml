@@ -173,6 +173,8 @@ jobs:
             --repo-url="https://ijbaird.github.io/airloom/repo" \
             --runtime-repo="https://dl.flathub.org/repo/flathub.flatpakrepo" \
             "${gpg_args[@]}"
+      - name: Archive update-repo artifact
+        run: tar -cf "airloom-repo-${{ matrix.arch }}.tar" repo
       - name: Record release provenance
         shell: bash
         env:
@@ -198,7 +200,8 @@ jobs:
             --tool-ref "actions/checkout=3d3c42e5aac5ba805825da76410c181273ba90b1" \
             --tool-ref "flatpak/flatpak-github-actions/flatpak-builder=79327416609af08178ad73b352877e51450790b3" \
             --tool-ref "actions/upload-artifact=043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" \
-            --bundle "Airloom-${arch}.flatpak"
+            --bundle "Airloom-${arch}.flatpak" \
+            --repository-tar "airloom-repo-${arch}.tar"
       - name: Upload workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -208,8 +211,6 @@ jobs:
             Airloom-${{ matrix.arch }}.provenance.json
           if-no-files-found: error
           retention-days: 30
-      - name: Archive update-repo artifact
-        run: tar -cf "airloom-repo-${{ matrix.arch }}.tar" repo
       - name: Upload update-repo artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -267,7 +268,10 @@ jobs:
             --bundle "dist/Airloom-${arch}.flatpak"
           )
           for repo_arch in x86_64 aarch64; do
-            args+=(--provenance "repos/airloom-repo-${repo_arch}/Airloom-${repo_arch}.provenance.json")
+            args+=(
+              --provenance "repos/airloom-repo-${repo_arch}/Airloom-${repo_arch}.provenance.json"
+              --repository-tar "repos/airloom-repo-${repo_arch}/airloom-repo-${repo_arch}.tar"
+            )
           done
           python3 scripts/check-release-provenance.py \
             --source-sha "${EXPECTED_SOURCE_SHA}" "${args[@]}"
@@ -390,14 +394,12 @@ jobs:
     name: Coordinate stable publication
     if: needs.release-eligibility.outputs.eligible == 'true'
     needs: [flatpak, verify-client, release-eligibility, webkit-ui]
-    # A reusable-workflow call remains running until both channels finish, so
-    # this is the only stable-publication contender for the entire run.
-    concurrency:
-      group: stable-publication
-      cancel-in-progress: false
+    # The reusable call remains active until both channels finish. Turnstyle
+    # at the start of publish.yml queues whole runs without cancelling waiters.
     # This step-less call sets only the maximum permissions available to the
     # reusable workflow; each called job opts into its own narrower set.
     permissions:
+      actions: read
       contents: write
       pages: write
       id-token: write

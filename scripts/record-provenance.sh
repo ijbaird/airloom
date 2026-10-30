@@ -81,6 +81,7 @@ def record(args: argparse.Namespace) -> None:
         "tool_versions": keyed_values(args.tool_version, "--tool-version"),
         "tool_refs": tool_refs,
         "checksums": checksums(args.bundle),
+        "repository_checksums": checksums(args.repository_tar),
     }
 
     output = Path(args.output)
@@ -112,6 +113,7 @@ def main() -> int:
     parser.add_argument("--tool-version", action="append", required=True)
     parser.add_argument("--tool-ref", action="append", required=True)
     parser.add_argument("--bundle", action="append", required=True)
+    parser.add_argument("--repository-tar", action="append", default=[])
     try:
         record(parser.parse_args())
     except (ProvenanceError, OSError) as error:
