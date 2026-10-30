@@ -343,6 +343,66 @@ class UiRegressionScriptContractTest(unittest.TestCase):
                 self.script.scenario_layouts(self.root)
         self.assertEqual(launched["env"].get("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"), "1")
 
+    def _fake_page(self, marker_polls, popup_opens=True, settled_after=0):
+        """A scripted page for the resize helpers: each JS probe is answered by
+        identity, so the tests pin which conditions the helpers wait on."""
+        page = {"marker_polls": list(marker_polls), "clicked": [], "probes": 0, "settled_after": settled_after}
+        script = self.script
+
+        def eval_js(_sock, js):
+            if js == script.FIND_POPUP_MARKER_JS:
+                return page["marker_polls"].pop(0) if page["marker_polls"] else None
+            if js.startswith(script.CLICK_MARKER_JS_PREFIX):
+                page["clicked"].append(js)
+                return "clicked"
+            if js == script.POPUP_OPEN_JS:
+                return page["clicked"][-1].split('"')[1] if page["clicked"] and popup_opens else None
+            if js == script.POPUP_DIAGNOSTICS_JS:
+                return {"markers": [], "map": [0, 0, 313, 469], "viewport": [313, 469], "popupHidden": True,
+                        "selectedId": 900000, "loading": False}
+            if js == script.RESIZE_PROBE_JS:
+                page["probes"] += 1
+                return {"width": 313, "layoutSettled": page["probes"] > page["settled_after"]}
+            raise AssertionError(f"unexpected probe: {js[:80]}")
+
+        return page, eval_js
+
+    def test_popup_helper_waits_for_a_qualifying_marker_then_for_the_popup(self):
+        # The first probes see no marker inside the safe area yet (layout still
+        # catching up after a resize); the helper must keep waiting.
+        page, eval_js = self._fake_page([None, None, "900004"])
+        with mock.patch.object(self.script, "eval_js", eval_js), redirect_stdout(io.StringIO()):
+            self.assertEqual(self.script.open_visible_popup("sock", timeout_s=5), "900004")
+        self.assertEqual(len(page["clicked"]), 1)
+        self.assertIn('"900004"', page["clicked"][0])
+
+    def test_popup_helper_times_out_with_diagnostics_when_no_marker_qualifies(self):
+        _page, eval_js = self._fake_page([])
+        output = io.StringIO()
+        with mock.patch.object(self.script, "eval_js", eval_js), redirect_stdout(output):
+            self.assertIsNone(self.script.open_visible_popup("sock", timeout_s=0.5))
+        self.assertIn("no marker popup", output.getvalue())
+        for field in ('"markers"', '"map"', '"viewport"', '"selectedId"', '"loading"'):
+            self.assertIn(field, output.getvalue())
+
+    def test_popup_helper_requires_the_clicked_markers_popup_to_open(self):
+        page, eval_js = self._fake_page(["900004"], popup_opens=False)
+        output = io.StringIO()
+        with mock.patch.object(self.script, "eval_js", eval_js), redirect_stdout(output):
+            self.assertIsNone(self.script.open_visible_popup("sock", timeout_s=0.5))
+        self.assertEqual(len(page["clicked"]), 1)
+        self.assertIn("no marker popup", output.getvalue())
+
+    def test_width_wait_returns_only_after_the_map_layout_matches_the_viewport(self):
+        page, eval_js = self._fake_page([], settled_after=3)
+        with mock.patch.object(self.script, "eval_js", eval_js), \
+                mock.patch.object(self.script.time, "sleep") as sleep:
+            probe = self.script.wait_for_width("sock", 480, 1.5, 10)
+        self.assertTrue(probe["layoutSettled"])
+        self.assertGreater(page["probes"], 3)
+        # Polling interval only: no fixed settle delay.
+        self.assertTrue(all(call.args[0] <= 0.2 for call in sleep.call_args_list), sleep.call_args_list)
+
     def test_viewport_width_excludes_the_window_frame_before_scaling(self):
         # Under a compositor (mutter) the webview spans the whole window; under
         # Xvfb GTK draws a solid CSD frame inside the requested size.

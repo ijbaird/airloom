@@ -607,7 +607,21 @@ RESIZE_PROBE_JS = """
   return { width: innerWidth, mapWidth: map.width, searchWidth: search.width, searchRight: search.right,
     popupHidden: popup.hidden, popupLeft: popup.getBoundingClientRect().left,
     popupRight: popup.getBoundingClientRect().right,
-    narrow: matchMedia("(max-width: 640px)").matches };
+    narrow: matchMedia("(max-width: 640px)").matches,
+    // The map's resize pass has run for the current size: the marker layer is
+    // offset to the viewport the app derives from its center, zoom and panel
+    // size (app.js mapViewport/worldPoint). This also positions an open popup.
+    layoutSettled: (() => {
+      const s = window.Airloom.debugState();
+      const panel = document.querySelector("#map-panel");
+      const size = 256 * 2 ** s.zoom;
+      const lat = Math.max(-85.0511, Math.min(85.0511, s.center.lat));
+      const sin = Math.sin(lat * Math.PI / 180);
+      const x = (s.center.lon + 180) / 360 * size - panel.clientWidth / 2;
+      const y = (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size - panel.clientHeight / 2;
+      const offset = /translate\(\s*([-\d.e+]+)px,\s*([-\d.e+]+)px\)/.exec(document.querySelector("#markers").style.transform);
+      return Boolean(offset) && Math.abs(Number(offset[1]) + x) <= 1 && Math.abs(Number(offset[2]) + y) <= 1;
+    })() };
 })()
 """
 
@@ -633,12 +647,14 @@ def measure_window_frame(sock: str) -> int:
 
 
 def wait_for_width(sock: str, width: int, scale: float = 1.0, frame: int = 0) -> dict:
-    """Wait for the viewport, then for the map's resize frame to settle."""
+    """Wait for the viewport width and for the map's layout to catch up with it."""
     expected = viewport_width(width, scale, frame)
-    wait_for(lambda: abs(eval_js(sock, RESIZE_PROBE_JS)["width"] - expected) <= 1,
-             15, f"a {width}px window ({expected} CSS px)")
-    time.sleep(0.5)
-    return eval_js(sock, RESIZE_PROBE_JS)
+
+    def settled():
+        probe = eval_js(sock, RESIZE_PROBE_JS)
+        return probe if abs(probe["width"] - expected) <= 1 and probe["layoutSettled"] else None
+
+    return wait_for(settled, 15, f"a {width}px window ({expected} CSS px) with the map laid out for it")
 
 
 def assert_layout_fits(sock: str, label: str):
@@ -648,17 +664,64 @@ def assert_layout_fits(sock: str, label: str):
     check(row["scrollWidth"] <= row["viewport"] + 1, f"{label}: the document fits ({row['scrollWidth']}px)")
 
 
-def open_visible_popup(sock: str):
-    return eval_js(sock, """(() => {
-      const map = document.querySelector("#map-panel").getBoundingClientRect();
-      const marker = [...document.querySelectorAll(".map-marker")].find((m) => {
-        const r = m.getBoundingClientRect();
-        return r.left > map.left + 20 && r.right < map.right - 20 && r.top > map.top + 150 && r.bottom < map.bottom - 20;
-      });
-      if (!marker) return null;
-      marker.click();
-      return marker.dataset.id;
-    })()""")
+FIND_POPUP_MARKER_JS = """(() => {
+  const map = document.querySelector("#map-panel").getBoundingClientRect();
+  const marker = [...document.querySelectorAll(".map-marker")].find((m) => {
+    const r = m.getBoundingClientRect();
+    return r.left > map.left + 20 && r.right < map.right - 20 && r.top > map.top + 150 && r.bottom < map.bottom - 20;
+  });
+  return marker ? marker.dataset.id : null;
+})()"""
+
+CLICK_MARKER_JS_PREFIX = "/* click marker */ "
+
+
+def click_marker_js(marker_id: str) -> str:
+    return CLICK_MARKER_JS_PREFIX + """(() => {
+  const marker = document.querySelector('.map-marker[data-id=%s]');
+  if (!marker) return null;
+  marker.click();
+  return "clicked";
+})()""" % json.dumps(marker_id)
+
+
+POPUP_OPEN_JS = """(() => {
+  const state = window.Airloom.debugState();
+  return state.popupHidden === false && state.popupId !== null ? String(state.popupId) : null;
+})()"""
+
+POPUP_DIAGNOSTICS_JS = """(() => {
+  const rect = (r) => [r.left, r.top, r.right, r.bottom].map(Math.round);
+  const state = window.Airloom.debugState();
+  const popup = document.querySelector("#map-popup");
+  return {
+    viewport: [innerWidth, innerHeight],
+    map: rect(document.querySelector("#map-panel").getBoundingClientRect()),
+    markerCount: document.querySelectorAll(".map-marker").length,
+    markers: [...document.querySelectorAll(".map-marker")].map((m) => [m.dataset.id, ...rect(m.getBoundingClientRect())]),
+    markerLayer: document.querySelector("#markers").style.transform,
+    popupHidden: popup.hidden, popup: rect(popup.getBoundingClientRect()),
+    selectedId: state.selectedId, popupId: state.popupId,
+    loading: document.body.classList.contains("loading"),
+    state,
+  };
+})()"""
+
+
+def open_visible_popup(sock: str, timeout_s: float = 10.0):
+    """Click a marker inside the popup-safe area of the map and wait until its
+    popup is open; None, with diagnostics printed, if that never happens."""
+    try:
+        marker_id = wait_for(lambda: eval_js(sock, FIND_POPUP_MARKER_JS), timeout_s,
+                             "a marker inside the map's popup-safe area")
+        eval_js(sock, click_marker_js(marker_id))
+        wait_for(lambda: eval_js(sock, POPUP_OPEN_JS) == marker_id, timeout_s,
+                 f"marker {marker_id}'s popup to open")
+    except AssertionError as exc:
+        print(f"  no marker popup: {exc}")
+        print(f"  diagnostics: {json.dumps(eval_js(sock, POPUP_DIAGNOSTICS_JS))}")
+        return None
+    return marker_id
 
 
 def scenario_resize(app: DebugApp):
@@ -713,7 +776,6 @@ def scenario_resize(app: DebugApp):
         scaled = wait_for_width(sock, 480, 1.5, frame)
         check(scaled["narrow"], f"480px at 150% is a {scaled['width']} CSS px narrow layout")
         check(open_visible_popup(sock) is not None, "a marker popup opens at 150%")
-        time.sleep(0.3)
         assert_layout_fits(sock, "480px window at 150%")
         check(request(sock, "state")["viewportScale"] == 1, "WebKit page scale stays at one at 150%")
         request(sock, "key", key="Escape")
