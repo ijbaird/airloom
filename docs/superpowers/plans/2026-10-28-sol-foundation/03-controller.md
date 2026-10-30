@@ -75,8 +75,8 @@ Slow A before B, config changes during fetch, failed persistence during pending 
 
 **Files:** Modify `airloom/app.py`, `tests/test_app_state.py`; update `index.html` only for reload/status hooks if frontend has landed, otherwise define the contract for integration.
 
-- [ ] Add failing policy/lifecycle tests for unrelated `file://` rejection, bundled document allowance, approved external links, load failure, web-process termination recovery, persistent interface scale, and map-pinch independence.
-- [ ] Run focused tests; confirm unrestricted file navigation/missing recovery.
-- [ ] Restrict navigation, add explicit error/reload handling, and replace forced zoom 1.0 with persisted interface-scale handling that does not interfere with native map pinch.
-- [ ] Run `make check`; expect PASS.
-- [ ] Commit `fix: harden WebKit navigation and recovery`; request Sol controller-workstream review.
+- [x] Add failing policy/lifecycle tests for unrelated `file://` rejection, bundled document allowance, approved external links, load failure, web-process termination recovery, persistent interface scale, and map-pinch independence.
+- [x] Run focused tests; confirm unrestricted file navigation/missing recovery.
+- [x] Restrict navigation, add explicit error/reload handling, and replace forced zoom 1.0 with persisted interface-scale handling that does not interfere with native map pinch.
+- [x] Run `make check`; expect PASS.
+- [x] Commit `fix: harden WebKit navigation and recovery`; request Sol controller-workstream review.
