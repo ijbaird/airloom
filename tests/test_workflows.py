@@ -9,6 +9,7 @@ CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 DEPLOY_PAGES_SHA = "368f82528645a54fb793d4d04e342629a3f51346"
 FLATPAK_BUILDER_SHA = "79327416609af08178ad73b352877e51450790b3"
 TURNSTYLE_SHA = "3805450be63b8c80577dc253e8c17e9132036df4"
+FLATPAK_IMAGE = "ghcr.io/flathub-infra/flatpak-github-actions@sha256:"
 
 
 def workflow(name):
@@ -168,6 +169,28 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertRegex(command.group("env"), r"\bXDG_RUNTIME_DIR=\S+ ")
         self.assertRegex(ui_job, rf"(?m)^\s*useradd\b[^\n]*\s{re.escape(user)}$")
         self.assertRegex(ui_job, rf"(?m)^\s*chown -R {re.escape(user)}:{re.escape(user)} \S+$")
+
+    def test_bare_distro_containers_install_git_before_a_verified_checkout(self):
+        # Without git in the container, actions/checkout falls back to a REST
+        # tarball with no .git, and `git rev-parse HEAD` cannot verify it.
+        for path in WORKFLOWS.glob("*.yml"):
+            source = path.read_text(encoding="utf-8")
+            for job_name in re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", source):
+                block = job_block(source, job_name)
+                image = re.search(r"(?m)^    container:\n(?:      [^\n]*\n)*?      image: (\S+)", block)
+                if not image or image.group(1).startswith(FLATPAK_IMAGE):
+                    continue
+                if "git rev-parse" not in block:
+                    continue
+                with self.subTest(workflow=path.name, job=job_name, image=image.group(1)):
+                    checkout = re.search(r"(?m)^\s*(?:- )?uses: actions/checkout@", block)
+                    self.assertTrue(checkout, "a verified job needs a checkout")
+                    install = re.search(
+                        r"(?m)^\s*run: (?:dnf|microdnf|apt-get|apk) (?:install|add)\b[^\n]*\sgit(?:-core)?(?:\s|$)",
+                        block,
+                    )
+                    self.assertTrue(install, "git must be installed in the container")
+                    self.assertLess(install.start(), checkout.start(), "git must be installed before checkout")
 
     def test_publication_queue_retries_transient_github_api_errors(self):
         publish = workflow("publish.yml")
