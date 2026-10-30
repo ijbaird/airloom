@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -16,6 +17,7 @@ PROJECT = Path(__file__).resolve().parent.parent
 FAKE_APP = r'''#!/usr/bin/env python3
 import json
 import os
+import re
 import socket
 from pathlib import Path
 
@@ -110,6 +112,7 @@ server.close()
 
 FAKE_PKILL = r'''#!/usr/bin/env python3
 import os
+import re
 import signal
 import sys
 
@@ -291,6 +294,94 @@ class DebugScriptIsolationTest(unittest.TestCase):
             self.assertTrue(Path(child_env[variable]).is_relative_to(tmpdir), variable)
         self.assertEqual(child_env["GSETTINGS_BACKEND"], "memory")
         self.assertEqual(tree_snapshot(sentinel_config), before)
+        self.assertEqual(list(tmpdir.iterdir()), [], "the private session directory was not removed")
+
+    def test_screenshot_timeout_stops_the_separately_sessioned_app(self):
+        self._exercise_screenshot_abort(timeout_s=3, cancel_signal=None)
+
+    def test_screenshot_sigterm_stops_the_separately_sessioned_app(self):
+        self._exercise_screenshot_abort(timeout_s=120, cancel_signal=signal.SIGTERM)
+
+    def test_screenshot_sigint_stops_the_separately_sessioned_app(self):
+        self._exercise_screenshot_abort(timeout_s=120, cancel_signal=signal.SIGINT)
+
+    def _exercise_screenshot_abort(self, timeout_s: int, cancel_signal) -> None:
+        # A copy of the real script in a fake project whose debug-run never
+        # opens a debug socket, so generation stalls until it is aborted.
+        project = self.root / "project"
+        (project / "scripts").mkdir(parents=True)
+        script = (PROJECT / "scripts" / "make-screenshots").read_text(encoding="utf-8")
+        shortened = re.sub(r"^TIMEOUT_S = \d+$", f"TIMEOUT_S = {timeout_s}", script, flags=re.MULTILINE)
+        self.assertNotEqual(shortened, script, "make-screenshots has no TIMEOUT_S constant to shorten")
+        write_executable(project / "scripts" / "make-screenshots", shortened)
+        record = self.root / "fake-app.json"
+        write_executable(
+            project / "scripts" / "debug-run",
+            f"#!{sys.executable}\n"
+            "import json, os, subprocess, sys, time\n"
+            "helper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+            f"open({str(record) + '.tmp'!r}, 'w').write(json.dumps("
+            "{'app': os.getpid(), 'helper': helper.pid, 'runner': os.getppid()}))\n"
+            f"os.replace({str(record) + '.tmp'!r}, {str(record)!r})\n"
+            "time.sleep(300)\n",
+        )
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        # Stand-ins that just run the wrapped command in place, as the real
+        # bus and compositor do, without a display.
+        write_executable(
+            fake_bin / "dbus-run-session",
+            '#!/bin/sh\n[ "$1" = "--" ] && shift\nexec "$@"\n',
+        )
+        write_executable(
+            fake_bin / "mutter",
+            '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n',
+        )
+        sentinel_project = self.root / "unrelated-app"
+        (sentinel_project / "airloom").mkdir(parents=True)
+        (sentinel_project / "airloom" / "__init__.py").write_text("", encoding="utf-8")
+        (sentinel_project / "airloom" / "__main__.py").write_text(
+            "import time\nwhile True:\n    time.sleep(1)\n", encoding="utf-8"
+        )
+        sentinel = self._launch_owned_process(
+            [sys.executable, "-m", "airloom"], cwd=sentinel_project,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        tmpdir = self.root / "tmp"
+        tmpdir.mkdir()
+        env = {
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "TMPDIR": str(tmpdir),
+        }
+
+        # A file, not a pipe: descendants inheriting a pipe would make
+        # waiting for EOF also wait for them.
+        log_path = self.root / "make-screenshots.log"
+        log = open(log_path, "wb")
+        self.addCleanup(log.close)
+        outer = self._launch_owned_process(
+            [sys.executable, str(project / "scripts" / "make-screenshots"),
+             "--output", str(self.root / "shots")],
+            env=env, stdout=log, stderr=subprocess.STDOUT,
+        )
+        deadline = time.monotonic() + 20
+        while not record.exists() and outer.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(record.exists(), "the fake app never started")
+        owned = json.loads(record.read_text(encoding="utf-8"))
+        for pid in owned.values():
+            self.addCleanup(self._kill_owned_pid, pid)
+        if cancel_signal is not None:
+            outer.send_signal(cancel_signal)
+        outer.wait(timeout=timeout_s + 30)
+        output = log_path.read_text(encoding="utf-8", errors="replace")
+
+        self.assertNotEqual(outer.returncode, 0, output)
+        for role, pid in owned.items():
+            self.assertTrue(self._process_is_stopped(pid),
+                            f"the owned {role} process {pid} outlived make-screenshots")
+        self.assertIsNone(sentinel.poll(), "make-screenshots terminated an unrelated Airloom process")
         self.assertEqual(list(tmpdir.iterdir()), [], "the private session directory was not removed")
 
     def test_owned_process_cleanup_terminates_the_entire_process_group(self):

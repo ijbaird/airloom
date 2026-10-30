@@ -18,12 +18,16 @@ the caller's own Airloom:
 
 Usage: scripts/make-screenshots [--output DIR]   (needs mutter and
 dbus-run-session; GTK 4 and WebKitGTK 6.0 as for ./run). Cleanup only ever
-signals this script's own process groups.
+signals this script's own processes: the session's process group, then,
+as a child subreaper, anything still descending from it (including the
+app's own session if the inner runner died first). SIGTERM, SIGHUP, and
+SIGINT unwind through that cleanup too.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import http.server
 import json
 import os
@@ -44,6 +48,7 @@ HOME = {"latitude": 45.5152, "longitude": -122.6784, "name": "Portland, Oregon"}
 VIEW = (1280, 800)
 MONITOR = "1920x1080"  # well above the window, so mutter never maximizes it
 TIMEOUT_S = 240
+PR_SET_CHILD_SUBREAPER = 36
 
 
 # ------------------------------------------------------------- debug port
@@ -111,6 +116,104 @@ def stop_owned(process: subprocess.Popen, sock_path: str | None = None) -> None:
         pass
     if process.poll() is None:
         process.wait(timeout=5)
+
+
+class Cancelled(Exception):
+    pass
+
+
+def unwind_on_termination() -> None:
+    """Turn SIGTERM/SIGHUP (SIGINT already raises) into an orderly unwind.
+
+    Later signals are ignored so they cannot interrupt the cleanup that the
+    first one started.
+    """
+    def handler(signum, _frame):
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(sig, signal.SIG_IGN)
+        raise Cancelled(f"cancelled by {signal.Signals(signum).name}")
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
+
+
+def become_subreaper() -> None:
+    """Inherit every orphaned descendant, such as the separately sessioned app."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise AssertionError(f"could not become a child subreaper: {os.strerror(ctypes.get_errno())}")
+
+
+def descendants(pid: int) -> list[int]:
+    found, frontier = [], [pid]
+    while frontier:
+        parent = frontier.pop()
+        try:
+            tasks = os.listdir(f"/proc/{parent}/task")
+        except OSError:
+            continue
+        for task in tasks:
+            try:
+                children = Path(f"/proc/{parent}/task/{task}/children").read_text().split()
+            except OSError:
+                continue
+            for child in map(int, children):
+                found.append(child)
+                frontier.append(child)
+    return found
+
+
+def reap_children() -> None:
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def stop_descendants() -> None:
+    """Stop and reap everything still descending from this process.
+
+    As a child subreaper this process inherits whatever its children
+    orphan, so ancestry alone identifies what it owns; nothing is matched
+    by name, and unrelated processes are never in this tree.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        remaining = descendants(os.getpid())
+        for pid in remaining:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 5
+        while remaining and time.monotonic() < deadline:
+            reap_children()
+            time.sleep(0.05)
+            remaining = descendants(os.getpid())
+        if not remaining:
+            return
+    reap_children()
+
+
+def detach_mounts(root: Path) -> None:
+    """Lazily unmount FUSE mounts (e.g. the document portal's) left under root.
+
+    A session daemon stopped by SIGKILL cannot unmount itself, and its stale
+    mount would block removal of the private directory.
+    """
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return
+    # Field 5 is the mount point, with spaces and similar escaped as octal.
+    points = [line.split()[4].encode().decode("unicode_escape") for line in lines]
+    tool = shutil.which("fusermount3") or shutil.which("fusermount")
+    for point in sorted((p for p in points if Path(p).is_relative_to(root)), reverse=True):
+        if tool is not None:
+            subprocess.run([tool, "-u", "-z", point], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
 
 
 # ------------------------------------------------------------ geocoder stub
@@ -309,6 +412,7 @@ def main(argv=None) -> int:
     parser.add_argument("--inside-compositor", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     output = args.output.resolve()
+    unwind_on_termination()
     if args.inside_compositor is not None:
         shoot(args.inside_compositor, output)
         # mutter's own exit status does not carry this command's, so the
@@ -319,6 +423,9 @@ def main(argv=None) -> int:
     for tool in ("dbus-run-session", "mutter"):
         if shutil.which(tool) is None:
             raise AssertionError(f"{tool} is required")
+    # The app runs in its own session below the inner runner; if that runner
+    # is killed before its own cleanup, the app is orphaned to this process.
+    become_subreaper()
     with tempfile.TemporaryDirectory(prefix="airloom-screenshots-") as temporary:
         root = Path(temporary)
         private = {}
@@ -334,6 +441,9 @@ def main(argv=None) -> int:
             XDG_CACHE_HOME=private["cache"], XDG_DATA_HOME=private["data"],
             XDG_STATE_HOME=private["state"], GSETTINGS_BACKEND="memory",
             GDK_DEBUG="no-portals", NO_AT_BRIDGE="1", WAYLAND_DISPLAY="airloom-screenshots",
+            # No gvfs: a killed gvfsd-fuse would strand a FUSE mount in the
+            # private runtime directory and block its removal.
+            GIO_USE_VFS="local", GVFS_DISABLE_FUSE="1",
         )
         command = [
             "dbus-run-session", "--", "mutter", "--headless", "--wayland", "--no-x11",
@@ -351,6 +461,8 @@ def main(argv=None) -> int:
             raise AssertionError(f"screenshot session timed out after {TIMEOUT_S}s")
         finally:
             stop_owned(session)
+            stop_descendants()
+            detach_mounts(root)
             log.close()
         finished = (root / "done").is_file()
         if not finished:
@@ -364,6 +476,6 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except AssertionError as exc:
-        print(f"FAIL: {exc}", file=sys.stderr)
+    except (AssertionError, Cancelled, KeyboardInterrupt) as exc:
+        print(f"FAIL: {exc or type(exc).__name__}", file=sys.stderr)
         raise SystemExit(1)
