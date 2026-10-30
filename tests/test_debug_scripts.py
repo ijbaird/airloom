@@ -448,6 +448,180 @@ class DebugScriptIsolationTest(unittest.TestCase):
         (root,) = list(tmpdir.iterdir())
         self.assertEqual(sorted(path.name for path in root.iterdir()), ["runtime", "state"])
 
+    # -- private-root removal must fail closed ------------------------------
+    # These run the real owner `main()` in a driver subprocess. The session
+    # stand-in "succeeds" and leaves model files in the private root;
+    # mountinfo and lstat are modeled, so nothing real is ever mounted.
+
+    OWNER_DRIVER = (
+        "import gc, glob, json, os, sys\n"
+        "from importlib.machinery import SourceFileLoader\n"
+        "from importlib.util import module_from_spec, spec_from_loader\n"
+        "from pathlib import Path\n"
+        "script, tmpdir, output, mode, foreign = sys.argv[1:6]\n"
+        "loader = SourceFileLoader('make_screenshots', script)\n"
+        "module = module_from_spec(spec_from_loader(loader.name, loader))\n"
+        "loader.exec_module(module)\n"
+        "module.UNMOUNT_TIMEOUT_S = 1\n"
+        "def roots():\n"
+        "    return [os.path.realpath(r) for r in glob.glob(os.path.join(tmpdir, 'airloom-screenshots-*'))]\n"
+        "original_read = Path.read_bytes\n"
+        "def read_bytes(path):\n"
+        "    if str(path) != '/proc/self/mountinfo':\n"
+        "        return original_read(path)\n"
+        "    if mode == 'fail':\n"
+        "        raise PermissionError(13, 'Permission denied', '/proc/self/mountinfo')\n"
+        "    real = original_read(path)\n"
+        "    if mode in ('real', 'launch-fail'):\n"
+        "        return real\n"
+        "    # The kernel reports the canonical path, never a symlinked alias.\n"
+        "    return real + ''.join(f'90 1 0:90 / {r}/state rw - fuse.fake fake rw\\n' for r in roots()).encode()\n"
+        "Path.read_bytes = read_bytes\n"
+        "if foreign:\n"
+        "    original_lstat = os.lstat\n"
+        "    def lstat(path, *args, **kwargs):\n"
+        "        result = original_lstat(path, *args, **kwargs)\n"
+        "        name = os.fspath(path)\n"
+        "        # No realpath here: it calls lstat itself.\n"
+        "        if os.path.basename(name) == foreign and os.path.basename(\n"
+        "                os.path.dirname(name)).startswith('airloom-screenshots-'):\n"
+        "            values = list(result)\n"
+        "            values[2] += 1  # st_dev: another filesystem\n"
+        "            return os.stat_result(values)\n"
+        "        return result\n"
+        "    os.lstat = lstat\n"
+        "if mode == 'launch-fail':\n"
+        "    original_popen = module.subprocess.Popen\n"
+        "    def popen(args, *rest, **kwargs):\n"
+        "        if args and args[0] == 'dbus-run-session':\n"
+        "            raise FileNotFoundError(2, 'No such file or directory', 'dbus-run-session')\n"
+        "        return original_popen(args, *rest, **kwargs)\n"
+        "    module.subprocess.Popen = popen\n"
+        "try:\n"
+        "    module.main(['--output', output])\n"
+        "    outcome = {'result': 'success', 'message': ''}\n"
+        "except BaseException as exc:\n"
+        "    outcome = {'result': type(exc).__name__, 'message': str(exc)}\n"
+        "gc.collect()\n"
+        "print('OUTCOME ' + json.dumps(outcome))\n"
+    )
+
+    def _run_owner(self, *, mode="real", foreign="", symlinked_tmpdir=False, python_flags=()):
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        write_executable(fake_bin / "dbus-run-session",
+                         '#!/bin/sh\n[ "$1" = "--" ] && shift\nexec "$@"\n')
+        write_executable(
+            fake_bin / "mutter",
+            '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--inside-compositor" ]; do shift; done\n'
+            'root="$2"\n'
+            'echo mounted > "$root/state/mounted-file"\n'
+            'echo foreign > "$root/cache/foreign-file"\n'
+            'echo plain > "$root/config/plain-file"\n'
+            'ln -s /nonexistent "$root/data/dangling-link"\n'
+            'echo ok > "$root/done"\n',
+        )
+        for name in ("fusermount3", "fusermount"):
+            write_executable(fake_bin / name, "#!/bin/sh\nexit 0\n")
+        real_tmp = self.root / "real-tmp"
+        real_tmp.mkdir()
+        tmpdir = real_tmp
+        if symlinked_tmpdir:
+            tmpdir = self.root / "tmp-link"
+            tmpdir.symlink_to(real_tmp, target_is_directory=True)
+        driver = self.root / "owner-driver.py"
+        driver.write_text(self.OWNER_DRIVER, encoding="utf-8")
+        env = {**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+               "TMPDIR": str(tmpdir)}
+        process = self._launch_owned_process(
+            [sys.executable, *python_flags, str(driver), str(PROJECT / "scripts" / "make-screenshots"),
+             str(tmpdir), str(self.root / "shots"), mode, foreign],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            self._stop_owned_process(process)
+            self.fail("the owner did not finish within the 60s guard")
+        lines = [line for line in stdout.splitlines() if line.startswith("OUTCOME ")]
+        self.assertTrue(lines, stdout + stderr)
+        roots = list(real_tmp.iterdir())
+        return json.loads(lines[0][len("OUTCOME "):]), stderr, roots
+
+    @staticmethod
+    def _tree(root: Path) -> list[str]:
+        return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+
+    def test_symlinked_tmpdir_still_protects_the_canonical_mount(self):
+        outcome, stderr, roots = self._run_owner(mode="fake-state-mount", symlinked_tmpdir=True)
+        self.assertEqual(outcome["result"], "AssertionError", stderr)
+        self.assertIn("still mounted", outcome["message"] + stderr)
+        (root,) = roots
+        self.assertEqual((root / "state" / "mounted-file").read_text(), "mounted\n",
+                         "removal entered a mount reached through the symlinked TMPDIR")
+        self.assertFalse((root / "config").exists(), "the rest of the private root was not removed")
+
+    def test_unreadable_mountinfo_removes_nothing_and_fails(self):
+        outcome, stderr, roots = self._run_owner(mode="fail")
+        self.assertEqual(outcome["result"], "AssertionError", stderr)
+        self.assertIn("mountinfo", outcome["message"] + stderr)
+        (root,) = roots
+        self.assertEqual(self._tree(root), [
+            "cache", "cache/foreign-file", "config", "config/plain-file", "data",
+            "data/dangling-link", "done", "runtime", "session.log", "state", "state/mounted-file",
+        ])
+
+    def test_removal_does_not_cross_into_another_filesystem(self):
+        outcome, stderr, roots = self._run_owner(foreign="cache")
+        self.assertEqual(outcome["result"], "AssertionError", stderr)
+        self.assertIn("filesystem", outcome["message"] + stderr)
+        (root,) = roots
+        self.assertEqual(self._tree(root), ["cache", "cache/foreign-file"])
+
+    def test_clean_run_through_symlinked_tmpdir_removes_everything(self):
+        outcome, stderr, roots = self._run_owner(symlinked_tmpdir=True)
+        self.assertEqual(outcome, {"result": "success", "message": ""}, stderr)
+        self.assertNotIn("warning", stderr.lower())
+        self.assertEqual(roots, [])
+
+    def test_failed_session_launch_closes_its_log_and_cleans_up(self):
+        outcome, stderr, roots = self._run_owner(
+            mode="launch-fail", python_flags=("-W", "error::ResourceWarning"))
+        self.assertEqual(outcome["result"], "FileNotFoundError", stderr)
+        self.assertNotIn("ResourceWarning", stderr)
+        self.assertEqual(roots, [])
+
+    def test_blocked_removal_is_bounded_killed_and_reaped(self):
+        # Stands in for removal blocked on a hung FUSE server.
+        program = (
+            "import json, os, sys, time\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "from importlib.util import module_from_spec, spec_from_loader\n"
+            "loader = SourceFileLoader('make_screenshots', sys.argv[1])\n"
+            "module = module_from_spec(spec_from_loader(loader.name, loader))\n"
+            "loader.exec_module(module)\n"
+            "start = time.monotonic()\n"
+            "blocked = module.call_bounded(lambda: time.sleep(60), 0.5, 'removing the private directory')\n"
+            "fine = module.call_bounded(lambda: ['reported'], 5, 'removing the private directory')\n"
+            "try:\n"
+            "    os.waitpid(-1, os.WNOHANG)\n"
+            "    leftover = True\n"
+            "except ChildProcessError:\n"
+            "    leftover = False\n"
+            "print(json.dumps({'blocked': blocked, 'fine': fine, 'leftover': leftover,\n"
+            "                  'elapsed': time.monotonic() - start}))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-W", "error", "-c", program, str(PROJECT / "scripts" / "make-screenshots")],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["blocked"], ["removing the private directory timed out after 0.5s; killed"])
+        self.assertEqual(result["fine"], ["reported"])
+        self.assertFalse(result["leftover"], "the timed-out child was not reaped")
+        self.assertLess(result["elapsed"], 5)
+
     def _kill_recorded_unmounts(self, record: Path) -> None:
         if record.exists():
             for line in record.read_text(encoding="utf-8").splitlines():

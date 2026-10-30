@@ -34,6 +34,7 @@ import http.server
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -54,6 +55,7 @@ MONITOR = "1920x1080"  # well above the window, so mutter never maximizes it
 TIMEOUT_S = 240
 UNMOUNT_TIMEOUT_S = 10  # per mount; a stuck unmount is killed after this
 KILL_GRACE_S = 5  # how long a SIGKILLed helper gets to exit before it is reported
+REMOVE_TIMEOUT_S = 30  # removal runs in a child that is killed after this
 PR_SET_CHILD_SUBREAPER = 36
 
 
@@ -240,11 +242,12 @@ def run_bounded(command: list[str], timeout_s: float, what: str) -> str | None:
 
 
 def mounts_under(root: Path) -> list[str]:
-    """Mount points under root, deepest first."""
-    try:
-        lines = Path("/proc/self/mountinfo").read_bytes().splitlines()
-    except OSError:
-        return []
+    """Mount points under the canonical root, deepest first.
+
+    Raises OSError if mountinfo cannot be read: callers must then treat the
+    whole root as possibly mounted, never as mount-free.
+    """
+    lines = Path("/proc/self/mountinfo").read_bytes().splitlines()
     points = [mountinfo_path(line.split()[4]) for line in lines if len(line.split()) > 4]
     return sorted((p for p in points if Path(p).is_relative_to(root)), reverse=True)
 
@@ -257,8 +260,12 @@ def detach_mounts(root: Path) -> list[str]:
     bounded; a failure is reported and the remaining mounts are still tried.
     """
     problems = []
+    try:
+        points = mounts_under(root)
+    except OSError as exc:
+        return [f"cannot read /proc/self/mountinfo to unmount under {root}: {exc}"]
     tool = shutil.which("fusermount3") or shutil.which("fusermount")
-    for point in mounts_under(root):
+    for point in points:
         if tool is None:
             problems.append(f"cannot unmount {point}: no fusermount3 or fusermount")
             continue
@@ -269,32 +276,122 @@ def detach_mounts(root: Path) -> list[str]:
 
 
 def remove_private_root(root: Path) -> list[str]:
-    """Remove root without ever descending into a mount that is still there.
+    """Remove the canonical root, failing closed around anything mounted.
 
-    A live or stuck FUSE mount could block a traversal indefinitely, so any
-    remaining mount point is left in place and reported instead.
+    Nothing is removed if mounts cannot be enumerated. Known mount points
+    are left in place, and, like `rm --one-file-system`, no directory on
+    another filesystem is entered, whatever mountinfo says. An entry that
+    cannot be inspected (e.g. ENOTCONN from a stale FUSE mount point) is
+    not entered either. Symlinks are unlinked, never followed. Every
+    problem is reported.
     """
-    mounted = {Path(point) for point in mounts_under(root)}
+    try:
+        mounted = {Path(point) for point in mounts_under(root)}
+    except OSError as exc:
+        return [f"cannot read /proc/self/mountinfo ({exc}); removed nothing under {root}"]
     problems = [f"{point} is still mounted; left in place" for point in sorted(mounted)]
+    try:
+        root_device = os.lstat(root).st_dev
+    except OSError as exc:
+        return problems + [f"cannot inspect {root} ({exc}); removed nothing"]
 
     def remove(path: Path) -> None:
         if path in mounted:
             return
-        is_dir = False
         try:
-            is_dir = stat.S_ISDIR(os.lstat(path).st_mode)
-            if is_dir:
-                for child in os.listdir(path):
-                    remove(path / child)
-                os.rmdir(path)
-            else:
-                os.unlink(path)
+            status = os.lstat(path)
         except OSError as exc:
-            if not (is_dir and exc.errno == errno.ENOTEMPTY and mounted):
+            problems.append(f"cannot inspect {path} ({exc}); not entered")
+            return
+        if not stat.S_ISDIR(status.st_mode):
+            try:
+                os.unlink(path)
+            except OSError as exc:
+                problems.append(f"could not remove {path}: {exc}")
+            return
+        if status.st_dev != root_device:
+            problems.append(f"{path} is on a different filesystem; not entered")
+            return
+        reported = len(problems)
+        try:
+            children = os.listdir(path)
+        except OSError as exc:
+            problems.append(f"cannot list {path} ({exc}); not entered")
+            return
+        for child in children:
+            remove(path / child)
+        try:
+            os.rmdir(path)
+        except OSError as exc:
+            # Something inside was deliberately left and already reported.
+            if not (exc.errno == errno.ENOTEMPTY and len(problems) > reported):
                 problems.append(f"could not remove {path}: {exc}")
 
     remove(root)
     return problems
+
+
+def call_bounded(action, timeout_s: float, what: str) -> list[str]:
+    """Run `action() -> list[str]` in a forked child, killed after timeout_s.
+
+    Filesystem calls under the private root can block on a hung FUSE
+    server; FUSE waits are killable, so a child bounds them.
+    """
+    read_end, write_end = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child: never return into the caller's stack
+        status = 0
+        try:
+            os.close(read_end)
+            try:
+                payload = json.dumps(action() or [])
+            except BaseException as exc:  # noqa: BLE001
+                payload = json.dumps([f"{what}: {exc}"])
+            data = payload.encode("utf-8")
+            while data:
+                data = data[os.write(write_end, data):]
+        except BaseException:  # noqa: BLE001
+            status = 1
+        finally:
+            os._exit(status)
+    os.close(write_end)
+    chunks, timed_out = [], False
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select([read_end], [], [], remaining)
+            if ready:
+                chunk = os.read(read_end, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+    finally:
+        os.close(read_end)
+    if timed_out:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    reap_deadline = time.monotonic() + KILL_GRACE_S
+    while True:
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                break
+        except ChildProcessError:
+            break
+        if time.monotonic() >= reap_deadline:
+            return [f"{what} did not exit after SIGKILL (pid {pid})"]
+        time.sleep(0.05)
+    if timed_out:
+        return [f"{what} timed out after {timeout_s}s; killed"]
+    try:
+        return list(json.loads(b"".join(chunks) or b"[]"))
+    except ValueError:
+        return [f"{what} ended without a report"]
 
 
 def mountinfo_path(field: bytes) -> str:
@@ -523,7 +620,8 @@ def main(argv=None) -> int:
     # The app runs in its own session below the inner runner; if that runner
     # is killed before its own cleanup, the app is orphaned to this process.
     become_subreaper()
-    root = Path(tempfile.mkdtemp(prefix="airloom-screenshots-"))
+    # Canonical once: mountinfo reports real paths, never a symlinked TMPDIR.
+    root = Path(os.path.realpath(tempfile.mkdtemp(prefix="airloom-screenshots-")))
     # Cleanup problems (a stuck unmount, an unremovable leftover) never stop
     # the remaining cleanup steps; they are reported at the end.
     problems: list[str] = []
@@ -563,8 +661,12 @@ def main(argv=None) -> int:
             raise termination.error()
         log_path = root / "session.log"
         log = open(log_path, "wb")
-        session = subprocess.Popen(command, env=env, cwd=str(PROJECT), stdin=subprocess.DEVNULL,
-                                   stderr=log, start_new_session=True)
+        try:
+            session = subprocess.Popen(command, env=env, cwd=str(PROJECT), stdin=subprocess.DEVNULL,
+                                       stderr=log, start_new_session=True)
+        except BaseException:
+            log.close()
+            raise
         returncode = None
         deadline = time.monotonic() + TIMEOUT_S
         try:
@@ -590,7 +692,8 @@ def main(argv=None) -> int:
     except (AssertionError, Cancelled) as exc:
         failure = exc
     finally:
-        attempt("removing the private directory", lambda: remove_private_root(root))
+        attempt("removing the private directory", lambda: call_bounded(
+            lambda: remove_private_root(root), REMOVE_TIMEOUT_S, "removing the private directory"))
         for problem in problems:
             print(f"warning: {problem}", file=sys.stderr)
     if failure is None and termination.signal is not None:
