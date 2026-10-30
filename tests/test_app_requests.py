@@ -751,6 +751,85 @@ class TransactionalActionTest(ApplicationRequestTestCase):
                 self.assertIn(str(failure), results[0]["error"])
                 self.assertIn("try again", results[0]["error"].lower())
 
+    def test_automatic_coordinate_save_failures_are_transactional(self):
+        failures = (
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        )
+        for failure in failures:
+            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                app = self.make_real_store_app(directory)
+                previous = deepcopy(app.store.data)
+                threads = ThreadQueue()
+                with (
+                    mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                    mock.patch.object(app.store, "_write", side_effect=failure),
+                ):
+                    caught = self.capture_os_error(
+                        lambda: app._on_location_fix(10.0, 20.0, 50.0)
+                    )
+
+                self.assertIsNone(caught)
+                self.assertEqual(app.store.data, previous)
+                self.assertEqual(Store(app.store.path).data, previous)
+                self.assertEqual(threads.threads, [])
+                self.assertEqual(app.refreshed_homes, [])
+                self.assertEqual(
+                    [
+                        payload
+                        for event, payload in app.sent
+                        if event in ("location", "config")
+                    ],
+                    [],
+                )
+                errors = [
+                    payload["message"]
+                    for event, payload in app.sent
+                    if event == "error"
+                ]
+                self.assertEqual(len(errors), 1)
+                self.assertIn("location", errors[0].lower())
+                self.assertIn(str(failure), errors[0])
+
+    def test_automatic_label_save_failures_are_transactional_and_settle_token(self):
+        failures = (
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.ENOSPC, "No space left on device"),
+        )
+        for failure in failures:
+            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                app = self.make_real_store_app(directory)
+                app.store.data.update({"latitude": 10.0, "longitude": 20.0})
+                app.store.save()
+                previous = deepcopy(app.store.data)
+                app._home_name_generation = 1
+                token = app.requests.begin("home-label", 1)
+                app.title = mock.Mock()
+                with mock.patch.object(app.store, "_write", side_effect=failure):
+                    caught = self.capture_os_error(
+                        lambda: app._apply_location_name(
+                            "Detected home", 10.0, 20.0, 1, token
+                        )
+                    )
+
+                self.assertIsNone(caught)
+                self.assertEqual(app.store.data, previous)
+                self.assertEqual(Store(app.store.path).data, previous)
+                self.assertFalse(app.requests.is_current(token))
+                app.title.set_subtitle.assert_not_called()
+                self.assertEqual(
+                    [payload for event, payload in app.sent if event == "config"],
+                    [],
+                )
+                errors = [
+                    payload["message"]
+                    for event, payload in app.sent
+                    if event == "error"
+                ]
+                self.assertEqual(len(errors), 1)
+                self.assertIn("location", errors[0].lower())
+                self.assertIn(str(failure), errors[0])
+
     def test_successful_settings_save_publishes_config_and_matching_success(self):
         with tempfile.TemporaryDirectory() as directory:
             app = self.make_real_store_app(directory)

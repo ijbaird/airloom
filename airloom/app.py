@@ -891,8 +891,21 @@ class AirloomApplication(Adw.Application):
                 },
             )
             return
-        self.store.data.update({"latitude": float(latitude), "longitude": float(longitude)})
-        self.store.save()
+        candidate = deepcopy(self.store.data)
+        candidate.update({"latitude": float(latitude), "longitude": float(longitude)})
+        try:
+            self.store.apply(candidate)
+        except OSError as exc:
+            self._send(
+                "error",
+                {
+                    "message": (
+                        f"Could not save detected location: {exc}. Check disk space "
+                        "and file permissions, then try again."
+                    )
+                },
+            )
+            return
         self.controller.set_config(self.store.data)
         self._send(
             "location",
@@ -944,19 +957,34 @@ class AirloomApplication(Adw.Application):
     ) -> bool:
         config = self.store.data
         current_home = (config.get("latitude"), config.get("longitude"))
-        if (
-            not self._shutting_down
-            and self.requests.is_current(token)
-            and generation == self._home_name_generation
-            and config.get("home_mode") == "auto"
-            and current_home == (latitude, longitude)
-        ):
-            config["location_name"] = name[:80]
-            self.store.save()
-            if self.title:
-                self.title.set_subtitle(name[:80])
-            self._send("config", self.store.public_config())
-        self.requests.finish(token)
+        try:
+            if (
+                not self._shutting_down
+                and self.requests.is_current(token)
+                and generation == self._home_name_generation
+                and config.get("home_mode") == "auto"
+                and current_home == (latitude, longitude)
+            ):
+                candidate = deepcopy(config)
+                candidate["location_name"] = name[:80]
+                try:
+                    self.store.apply(candidate)
+                except OSError as exc:
+                    self._send(
+                        "error",
+                        {
+                            "message": (
+                                f"Could not save detected location name: {exc}. "
+                                "Check disk space and file permissions, then try again."
+                            )
+                        },
+                    )
+                else:
+                    if self.title:
+                        self.title.set_subtitle(name[:80])
+                    self._send("config", self.store.public_config())
+        finally:
+            self.requests.finish(token)
         return GLib.SOURCE_REMOVE
 
     def _on_script_message(self, _manager, value) -> None:
