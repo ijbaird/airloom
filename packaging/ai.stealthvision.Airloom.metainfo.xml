@@ -13,6 +13,9 @@
   <provides><binary>airloom</binary></provides>
   <requires><display_length compare="ge">760</display_length></requires>
   <releases>
+    <release version="0.12.3" date="2026-10-29">
+      <description><p>No application changes.</p></description>
+    </release>
     <release version="0.12.2" date="2026-08-10">
       <description><p>Fixed: downloaded Flatpak bundles failed to install with a GPG verification error — release bundles are now properly signed.</p></description>
     </release>

@@ -2,6 +2,10 @@
 
 All notable changes to Airloom are documented here. The project follows semantic versioning.
 
+## 0.12.3 — 2026-10-29
+
+- No application changes.
+
 ## 0.12.2 — 2026-08-10
 
 - Fixed: released Flatpak bundles failed to install with "GPG verification
