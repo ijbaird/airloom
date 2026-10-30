@@ -458,6 +458,59 @@ test("markers and popups project sensors into the center's nearest world", () =>
   assert.equal(app.elements.get("map-popup").hidden, false);
 });
 
+function pythonDemoItems(latitude, longitude) {
+  // Real backend demo generation, so the frontend sees exactly what Python publishes.
+  const script = "import json, sys; from airloom.demo import demo_sensors; "
+    + "print(json.dumps([s.to_dict() for s in demo_sensors(float(sys.argv[1]), float(sys.argv[2]))]))";
+  const output = require("node:child_process").execFileSync(
+    "python3",
+    ["-c", script, String(latitude), String(longitude)],
+    { cwd: path.resolve(__dirname, "../.."), encoding: "utf8" },
+  );
+  return JSON.parse(output);
+}
+
+test("Python demo publications near antimeridian and polar limits render completely", () => {
+  for (const [latitude, longitude] of [[0, 179.99], [0, -179.99], [89.99, 0], [-89.99, 0]]) {
+    for (const heatmap of [false, true]) {
+      const app = loadApp();
+      configureMap(app, longitude, { latitude, heatmap_threshold_km: heatmap ? 1 : 100000 });
+      app.context.Airloom.debugZoomTo(12);
+      const items = pythonDemoItems(latitude, longitude);
+      const selected = items.at(-1);
+      app.context.Airloom.receive("sensors", { items, selected_id: selected.id, source: "Demo data" });
+      assert.equal(app.elements.get("sensor-name").textContent, selected.name, `${latitude},${longitude} detail`);
+      if (!heatmap) {
+        assert.equal(app.elements.get("markers").querySelectorAll(".map-marker").length, items.length, `${latitude},${longitude} markers`);
+      }
+    }
+  }
+});
+
+test("one sensor with invalid coordinates does not abort rendering the rest", () => {
+  for (const heatmap of [false, true]) {
+    const app = loadApp();
+    configureMap(app, 0, { heatmap_threshold_km: heatmap ? 1 : 100000 });
+    app.context.Airloom.debugZoomTo(8);
+    const items = [
+      fixtureSensor(1, 180.0143, 40),
+      fixtureSensor(2, 0.01, 60, { latitude: 91 }),
+      fixtureSensor(3, 0.01, 80),
+    ];
+    app.context.Airloom.receive("sensors", { items, selected_id: 3, source: "PurpleAir live" });
+    assert.equal(app.elements.get("sensor-name").textContent, "Sensor 3");
+    if (heatmap) {
+      assert.ok(app.elements.get("heatmap").lastImage, "the valid sensor still produces a heat image");
+    } else {
+      const markers = app.elements.get("markers").querySelectorAll(".map-marker");
+      assert.deepEqual(markers.map((marker) => marker.dataset.id), ["3"]);
+      // Selecting an unmappable sensor still shows its detail without a popup crash.
+      app.context.Airloom.receive("sensors", { items, selected_id: 1, source: "PurpleAir live" });
+      assert.equal(app.elements.get("sensor-name").textContent, "Sensor 1");
+    }
+  }
+});
+
 function heatColors(app, aqi, longitude) {
   app.context.Airloom.receive("sensors", {
     items: [fixtureSensor(1, longitude, aqi)],

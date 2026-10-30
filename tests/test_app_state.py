@@ -1172,6 +1172,31 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(app.webview.zoom_level, scale)
 
 
+class DemoPublicationTest(ApplicationAdapterTestCase):
+    CENTERS = ((0.0, 179.99), (0.0, -179.99), (89.99, 0.0), (-89.99, 0.0), (90.0, 180.0))
+
+    def test_demo_publication_near_geographic_limits_has_canonical_coordinates(self):
+        for latitude, longitude in self.CENTERS:
+            with self.subTest(center=(latitude, longitude)):
+                store = FakeStore(
+                    api_key="", latitude=latitude, longitude=longitude,
+                    location_filter="both",
+                )
+                app = self.make_app(store=store)
+                request = app.controller.begin_refresh()
+
+                outcome = app_module._fetch_readings(
+                    app.store.data, None, request, request.bounds, 120
+                )
+                app._finish_refresh(outcome)
+
+                payload = self.sensor_payloads(app)[-1]
+                self.assertEqual(len(payload["items"]), 18)
+                for item in payload["items"]:
+                    self.assertTrue(-90.0 <= item["latitude"] <= 90.0, item)
+                    self.assertTrue(-180.0 <= item["longitude"] <= 180.0, item)
+
+
 class AlertAdapterTest(ApplicationAdapterTestCase):
     def test_only_fresh_real_crossing_alerts_once(self):
         cases = (

@@ -453,6 +453,7 @@
     if (!view.width || !view.height) return;
     const popup = $("#map-popup");
     const point = sensorWorldPoint(sensor);
+    if (!point) return;
     const margin = 12, gap = 30;
     const width = popup.clientWidth || 232;
     const height = popup.clientHeight || 140;
@@ -619,9 +620,13 @@
     return { x: (lon + 180) / 360 * size, y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size };
   }
 
+  // Null for a sensor without canonical coordinates: one bad reading must
+  // stay off the map without aborting the rest of the render.
   function sensorWorldPoint(sensor) {
-    const longitude = AirloomCore.nearestLongitude(sensor.longitude, state.center.lon);
-    return worldPoint(sensor.latitude, longitude, state.zoom);
+    const { latitude, longitude } = sensor;
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) return null;
+    if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) return null;
+    return worldPoint(latitude, AirloomCore.nearestLongitude(longitude, state.center.lon), state.zoom);
   }
 
   function inverseWorld(x, y, zoom) {
@@ -694,6 +699,7 @@
     for (const sensor of visibleSensors()) {
       if (!Number.isFinite(sensor.aqi)) continue;
       const point = sensorWorldPoint(sensor);
+      if (!point) continue;
       const x = point.x - view.left, y = point.y - view.top;
       if (x < -pad || x > view.width + pad || y < -pad || y > view.height + pad) continue;
       points.push({ x, y, aqi: sensor.aqi });
@@ -891,8 +897,8 @@
     const byId = new Map(state.sensors.map((sensor) => [sensor.id, sensor]));
     markers.querySelectorAll(".map-marker").forEach((element) => {
       const sensor = byId.get(Number(element.dataset.id));
-      if (!sensor) return;
-      const point = sensorWorldPoint(sensor);
+      const point = sensor && sensorWorldPoint(sensor);
+      if (!point) return;
       element.style.left = `${point.x}px`;
       element.style.top = `${point.y}px`;
     });
@@ -1031,7 +1037,7 @@
     const pad = MARKER_CULL_PAD;
     const markers = visibleSensors().filter((sensor) => {
       const point = sensorWorldPoint(sensor);
-      return point.x >= view.left - pad && point.x <= view.left + view.width + pad &&
+      return point && point.x >= view.left - pad && point.x <= view.left + view.width + pad &&
         point.y >= view.top - pad && point.y <= view.top + view.height + pad;
     });
     const result = AirloomState.reconcileKeyed(container, markers, (sensor) => sensor.id, createMapMarker, updateMapMarker);

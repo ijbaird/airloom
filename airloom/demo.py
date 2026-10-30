@@ -37,8 +37,10 @@ def demo_sensors(center_lat: float, center_lon: float) -> list[Sensor]:
     for index, name in enumerate(NAMES):
         ring = 0.018 + (index % 4) * 0.012
         angle = index * 2.399963
-        lat = center_lat + math.sin(angle) * ring
-        lon = center_lon + math.cos(angle) * ring * 1.35
+        # Offsets near a pole or the antimeridian must stay canonical, or the
+        # renderer and geographic helpers reject the published coordinates.
+        lat = max(-90.0, min(90.0, center_lat + math.sin(angle) * ring))
+        lon = (center_lon + math.cos(angle) * ring * 1.35 + 180.0) % 360.0 - 180.0
         pm = max(1.5, 4.8 + (index * 4.7) % 33 + math.sin(index) * 4.0)
         aqi = aqi_from_pm25(pm)
         trend = []
