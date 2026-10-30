@@ -956,6 +956,25 @@ class DebugFakeWiringTest(ApplicationAdapterTestCase):
         self.assertEqual(replies, [{"ok": True, "result": [{"sensor_id": 1, "title": "t", "body": "b"}]}])
 
 
+class DebugResizeTest(ApplicationAdapterTestCase):
+    def test_resize_sets_the_window_size_and_lifts_the_minimum_for_narrow_probes(self):
+        app = self.make_app()
+        app.window = mock.Mock()
+        replies = []
+        app._handle_debug_command({"cmd": "resize", "width": 360, "height": 700}, replies.append)
+        self.assertEqual(replies, [{"ok": True, "result": {"width": 360, "height": 700}}])
+        app.window.set_size_request.assert_called_once_with(360, 540)
+        app.window.set_default_size.assert_called_once_with(360, 700)
+
+    def test_resize_never_reaches_the_window_with_invalid_params(self):
+        app = self.make_app()
+        app.window = mock.Mock()
+        replies = []
+        app._handle_debug_command({"cmd": "resize", "width": 50, "height": 700}, replies.append)
+        self.assertFalse(replies[0]["ok"])
+        app.window.set_default_size.assert_not_called()
+
+
 class FakeGtkSettings:
     def __init__(self, animations):
         self.props = SimpleNamespace(gtk_enable_animations=animations)

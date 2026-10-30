@@ -322,6 +322,14 @@ def _validate_screenshot(command: dict) -> tuple[dict | None, str | None]:
     return {"path": path}, None
 
 
+def _validate_resize(command: dict) -> tuple[dict | None, str | None]:
+    width, height = command.get("width"), command.get("height")
+    for value in (width, height):
+        if isinstance(value, bool) or not isinstance(value, int) or not 200 <= value <= 4000:
+            return None, "resize requires integer 'width' and 'height' between 200 and 4000"
+    return {"width": width, "height": height}, None
+
+
 # Commands whose handlers are implemented directly in app.py's dispatcher
 # using their own pre-existing validation (`eval`, `pinch`) are deliberately
 # absent from this table — app.py routes those before consulting it. Every
@@ -333,6 +341,7 @@ _VALIDATORS: dict[str, Callable[[dict], "tuple[dict | None, str | None]"]] = {
     "state": _validate_no_params,
     "quit": _validate_no_params,
     "notifications": _validate_no_params,
+    "resize": _validate_resize,
     "tap": _validate_tap,
     "search": _validate_search,
     "key": _validate_key,

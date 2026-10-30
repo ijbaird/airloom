@@ -1925,8 +1925,20 @@ class AirloomApplication(Adw.Application):
             self._debug_screenshot(params, reply)
         elif cmd == "quit":
             self._debug_quit(reply)
+        elif cmd == "resize":
+            self._debug_resize(params, reply)
         elif cmd == "notifications":
             reply({"ok": True, "result": list(self._captured_notifications or [])})
+
+    def _debug_resize(self, params: dict, reply) -> None:
+        if not self.window:
+            reply({"ok": False, "error": "window not available"})
+            return
+        width, height = params["width"], params["height"]
+        # The normal minimum size would keep a probe above the narrow layout.
+        self.window.set_size_request(min(width, 760), min(height, 540))
+        self.window.set_default_size(width, height)
+        reply({"ok": True, "result": {"width": width, "height": height}})
 
     def _debug_pinch(self, message: dict, reply) -> None:
         phase = message.get("phase")

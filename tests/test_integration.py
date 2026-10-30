@@ -50,6 +50,7 @@ REQUIRED_COVERAGE = {
     "filtered cached fallback with provenance": "cache-fallback",
     "popup/search/narrow layouts at all scales and preview actions": "layouts",
     "stripped debug module on a private bus": "stripped-debug",
+    "live window resize across the narrow breakpoint": "resize",
 }
 REQUIRED_SCENARIOS = set(REQUIRED_COVERAGE.values())
 

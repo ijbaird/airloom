@@ -581,6 +581,109 @@ def scenario_trend_retry(app: DebugApp):
     eval_js(sock, "document.querySelector('#close-detail').click()")
 
 
+RESIZE_PROBE_JS = """
+(() => {
+  const popup = document.querySelector("#map-popup");
+  const search = document.querySelector(".search-overlay").getBoundingClientRect();
+  const map = document.querySelector("#map-panel").getBoundingClientRect();
+  return { width: innerWidth, mapWidth: map.width, searchWidth: search.width, searchRight: search.right,
+    popupHidden: popup.hidden, popupLeft: popup.getBoundingClientRect().left,
+    popupRight: popup.getBoundingClientRect().right,
+    narrow: matchMedia("(max-width: 640px)").matches };
+})()
+"""
+
+
+def wait_for_width(sock: str, width: int, scale: float = 1.0) -> dict:
+    """Wait for the viewport, then for the map's resize frame to settle."""
+    expected = int(width / scale)
+    wait_for(lambda: abs(eval_js(sock, RESIZE_PROBE_JS)["width"] - expected) <= 1,
+             15, f"a {width}px window ({expected} CSS px)")
+    time.sleep(0.5)
+    return eval_js(sock, RESIZE_PROBE_JS)
+
+
+def assert_layout_fits(sock: str, label: str):
+    row = json.loads(eval_js(sock, LAYOUT_MEASURE_JS))
+    check(not row["overflow"], f"{label}: nothing extends past the {row['viewport']}px viewport {row['overflow']}")
+    check(not row["clipped"], f"{label}: no clipped overlay content {row['clipped']}")
+    check(row["scrollWidth"] <= row["viewport"] + 1, f"{label}: the document fits ({row['scrollWidth']}px)")
+
+
+def open_visible_popup(sock: str):
+    return eval_js(sock, """(() => {
+      const map = document.querySelector("#map-panel").getBoundingClientRect();
+      const marker = [...document.querySelectorAll(".map-marker")].find((m) => {
+        const r = m.getBoundingClientRect();
+        return r.left > map.left + 20 && r.right < map.right - 20 && r.top > map.top + 150 && r.bottom < map.bottom - 20;
+      });
+      if (!marker) return null;
+      marker.click();
+      return marker.dataset.id;
+    })()""")
+
+
+def scenario_resize(app: DebugApp):
+    print("— resizing the live window across the narrow breakpoint —")
+    sock = app.sock_path
+    wide = wait_for_width(sock, 1240)
+    check(not wide["narrow"], f"the default window uses the wide layout ({wide['width']}px)")
+    check(open_visible_popup(sock) is not None, "a marker popup is open before resizing")
+    shown = eval_js(sock, """(() => {
+      const input = document.querySelector("#search");
+      input.value = "a";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return !document.querySelector("#search-results").hidden;
+    })()""")
+    check(shown, "sensor search results are open before resizing")
+    before_km = request(sock, "state")["viewportKm"]
+
+    request(sock, "resize", width=360, height=700)
+    narrow = wait_for_width(sock, 360)
+    check(narrow["narrow"], "the narrow layout takes over after shrinking the window")
+    check(abs(narrow["mapWidth"] - narrow["width"]) <= 1, "the map panel follows the new width")
+    check(request(sock, "state")["viewportKm"] < before_km, "the map reconciles its visible extent")
+    check(narrow["searchRight"] <= narrow["width"], "search stays inside the narrow window")
+    check(narrow["popupHidden"] or (narrow["popupLeft"] >= -0.5 and narrow["popupRight"] <= narrow["width"] + 0.5),
+          "the open popup is repositioned inside the narrow window or dismissed")
+    assert_layout_fits(sock, "360px window with search results and popup")
+
+    request(sock, "resize", width=1240, height=780)
+    wide = wait_for_width(sock, 1240)
+    check(not wide["narrow"] and abs(wide["mapWidth"] - wide["width"]) <= 1, "widening restores the wide layout")
+    assert_layout_fits(sock, "1240px window after the round trip")
+    eval_js(sock, CLEAR_SEARCH_JS)
+    request(sock, "key", key="Escape")
+
+    print("— resizing at 150% interface size —")
+    set_scale = """(() => {
+      window.Airloom.receive("open-settings");
+      const form = document.querySelector("#settings-form");
+      form.elements.interface_scale.value = "%s";
+      form.requestSubmit(document.querySelector("#save-settings"));
+      return "submitted";
+    })()"""
+    eval_js(sock, set_scale % "1.5")
+    wait_for(lambda: not eval_js(sock, SETTINGS_STATE_JS)["open"], 15, "the 150% save to finish")
+    saved = json.loads((app.config_dir / "config.json").read_text(encoding="utf-8"))
+    check(saved["interface_scale"] == 1.5, "the Interface size selector persisted 150%")
+    try:
+        wait_for_width(sock, 1240, 1.5)
+        request(sock, "resize", width=480, height=760)
+        scaled = wait_for_width(sock, 480, 1.5)
+        check(scaled["narrow"], f"480px at 150% is a {scaled['width']} CSS px narrow layout")
+        check(open_visible_popup(sock) is not None, "a marker popup opens at 150%")
+        time.sleep(0.3)
+        assert_layout_fits(sock, "480px window at 150%")
+        check(request(sock, "state")["viewportScale"] == 1, "WebKit page scale stays at one at 150%")
+        request(sock, "key", key="Escape")
+    finally:
+        request(sock, "resize", width=1240, height=780)
+        eval_js(sock, set_scale % "1")
+        wait_for(lambda: not eval_js(sock, SETTINGS_STATE_JS)["open"], 15, "the 100% save to finish")
+        wait_for_width(sock, 1240)
+
+
 def scenario_shell_recovery(app: DebugApp):
     print("— renderer crash recovery and Reload —")
     sock = app.sock_path
@@ -1125,6 +1228,7 @@ APP_SCENARIOS = {
     "focus": scenario_keyboard_focus,
     "filters": scenario_filters,
     "trend-retry": scenario_trend_retry,
+    "resize": scenario_resize,
     "shell-recovery": scenario_shell_recovery,  # reloads the page; keep last
 }
 STANDALONE_SCENARIOS = {

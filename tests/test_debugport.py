@@ -309,6 +309,17 @@ class ValidateCommandTest(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(normalized, {})
 
+    def test_resize_requires_integral_bounded_dimensions(self):
+        normalized, error = validate_command({"id": 1, "cmd": "resize", "width": 360, "height": 700})
+        self.assertIsNone(error)
+        self.assertEqual(normalized, {"width": 360, "height": 700})
+        for bad in ({}, {"width": 360}, {"width": "360", "height": 700}, {"width": 360.5, "height": 700},
+                    {"width": 199, "height": 700}, {"width": 360, "height": 4001}, {"width": True, "height": 700}):
+            with self.subTest(bad=bad):
+                normalized, error = validate_command({"id": 1, "cmd": "resize", **bad})
+                self.assertIsNone(normalized)
+                self.assertIn("resize", error)
+
     # -- Unknown / malformed cmd --------------------------------------------
 
     def test_unknown_cmd_is_an_error(self):
