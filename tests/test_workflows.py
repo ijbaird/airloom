@@ -228,6 +228,24 @@ class WorkflowContractTest(unittest.TestCase):
                                     f"workspace must be trusted before {first_use.group(0)!r}")
         self.assertEqual(sorted(checked), ["flatpak", "publish-repo", "verify-client", "webkit-ui"])
 
+    def test_pr_ci_exercises_the_publication_tag_fetch(self):
+        # publish-repo only runs after a tag push; verify-client runs the
+        # identical fetch in the same image and setup on every PR.
+        fetch = re.compile(r"(?m)^\s*(?:run: )?git fetch --force --tags origin$")
+        trust = re.compile(r'(?m)^\s*run: git config --global --add safe\.directory "\$\{GITHUB_WORKSPACE\}"$')
+        for name, job_name, before in (
+            ("flatpak.yml", "verify-client", "- name: Select previous supported release"),
+            ("publish.yml", "publish-repo", None),
+        ):
+            with self.subTest(job=job_name):
+                block = job_block(workflow(name), job_name)
+                fetched, trusted = fetch.search(block), trust.search(block)
+                self.assertTrue(fetched, "the job must run `git fetch --force --tags origin`")
+                self.assertTrue(trusted)
+                self.assertLess(trusted.start(), fetched.start(), "fetch only after trusting the workspace")
+                if before:
+                    self.assertLess(fetched.start(), block.index(before), "refresh tags before selecting by tag")
+
     def test_publication_queue_retries_transient_github_api_errors(self):
         publish = workflow("publish.yml")
         step = re.search(

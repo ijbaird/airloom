@@ -332,6 +332,10 @@ jobs:
           AIRLOOM_EPHEMERAL_SIGNING_KEY: "1"
           AIRLOOM_REQUIRE_PRODUCTION_KEY: "0"
         run: scripts/import-signing-key.sh
+      # Refresh release tags so the selection below sees every published tag.
+      # This mirrors publish-repo's fetch, so PR runs exercise that path too.
+      - name: Refresh release tags
+        run: git fetch --force --tags origin
       - name: Select previous supported release
         shell: bash
         env:
