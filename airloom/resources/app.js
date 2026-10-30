@@ -4,9 +4,13 @@
   const $ = (selector) => document.querySelector(selector);
   const state = {
     sensors: [],
+    areaSensors: [],
+    favoriteSensors: null,
+    coverage: null,
+    fetchedBounds: null,
     selectedId: null,
     previewHidden: [],
-    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", hidden: [] },
+    config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", interface_scale: 1, hidden: [] },
     source: "Starting Airloom",
     center: { lat: 45.5152, lon: -122.6784 },
     home: { lat: 45.5152, lon: -122.6784 },
@@ -14,35 +18,75 @@
     drag: null,
     query: "",
     placeResults: [],
-    homeSearchActive: false,
+    placeRequests: { main: null, home: null },
+    nextPlaceRequestId: 0,
+    trends: new Map(),
+    settingsSavePending: false,
     positioned: false,
     // Name of the area currently in view (reverse-geocoded by Python);
     // overrides the configured home name on the summary chip until replaced.
     viewName: null,
     popupId: null,
+    popupReturnFocus: null,
+    detailReturnFocus: null,
   };
 
+  const desktopMode = Boolean(window.webkit?.messageHandlers?.airloom);
   const bridge = (message) => {
-    if (window.webkit?.messageHandlers?.airloom) {
-      window.webkit.messageHandlers.airloom.postMessage(JSON.stringify(message));
-    }
+    if (desktopMode) window.webkit.messageHandlers.airloom.postMessage(JSON.stringify(message));
   };
+
+  const desktopAdapter = {
+    favorite(id) { bridge({ action: "favorite", id }); },
+    refresh() { bridge({ action: "refresh" }); },
+    saveSettings(settings) {
+      if (state.settingsSavePending) return;
+      state.settingsSavePending = true;
+      $("#save-settings").disabled = true;
+      bridge({ action: "save-settings", ...settings });
+    },
+    placeSearch(query, context, requestId) {
+      bridge({ action: "place-search", query, request_id: requestId, context });
+    },
+  };
+  const previewAdapter = {
+    favorite(id) { togglePreviewFavorite(id); },
+    refresh() { refreshPreview(); },
+    saveSettings(settings) {
+      const { api_key, clear_api_key, ...supported } = settings;
+      const config = { ...supported };
+      if (config.home_mode === "fixed") {
+        config.latitude = Number(config.home_lat);
+        config.longitude = Number(config.home_lon);
+      }
+      delete config.home_lat;
+      delete config.home_lon;
+      applyConfig(config);
+      renderAll();
+      $("#settings-dialog").close();
+      announce("Preferences applied to this browser preview only; they are not saved on disk.");
+    },
+    placeSearch(query, context) {
+      const message = "Remote place search is unavailable in browser preview; use the Airloom desktop app.";
+      announce("Remote place search requires the Airloom desktop app.");
+      if (context === "home") renderHomePlaceResults([], message);
+      else renderSearchResults([], message);
+    },
+  };
+  const actions = desktopMode ? desktopAdapter : previewAdapter;
 
   window.Airloom = {
     receive(event, payload) {
       if (event === "config") applyConfig(payload);
       if (event === "sensors") applySensors(payload);
       if (event === "loading") document.body.classList.toggle("loading", payload.active);
-      if (event === "error") toast(payload.message);
+      if (event === "error") handleError(payload);
       if (event === "open-settings") openSettings(payload);
       if (event === "location") applyLocation(payload);
       if (event === "view-name" && payload.name) { state.viewName = payload.name; stampPlaceName(); }
       if (event === "pinch") nativePinch(payload);
-      if (event === "places") {
-        if (state.homeSearchActive) {
-          if (payload.query === $("#home-place-input").value.trim()) renderHomePlaceResults(payload.results || [], payload.error);
-        } else if (payload.query === state.query.trim()) renderSearchResults(payload.results || [], payload.error);
-      }
+      if (event === "trend") applyTrend(payload);
+      if (event === "places") applyPlaces(payload);
     },
     // Small, legitimate debug accessors used by the debug port (see
     // airloom/debugport.py and app.py's _debug_* handlers) to read and
@@ -88,7 +132,7 @@
       return { tag: el.tagName, id: el.id || null, className: el.className || null };
     },
     debugZoomTo(zoom) {
-      cancelZoomAnimation();
+      beginDirectManipulation();
       applyZoom(Number(zoom), centerAnchor());
       renderMapMarkers();
       scheduleViewChanged();
@@ -98,6 +142,18 @@
 
   function stampPlaceName() {
     $("#place-name").textContent = state.viewName || state.config.location_name;
+  }
+
+  function applyInterfaceScale() {
+    const requested = Number(state.config.interface_scale);
+    const scale = [1, 1.25, 1.5].includes(requested) ? requested : 1;
+    document.documentElement.style.setProperty("--interface-scale", String(scale));
+    document.documentElement.dataset.interfaceScale = String(scale);
+  }
+
+  function announce(message) {
+    const region = $("#ui-status");
+    if (region.textContent !== message) region.textContent = message;
   }
 
   const FILTER_LABELS = { outdoor: "Outdoor", indoor: "Indoor", both: "All sensors" };
@@ -132,15 +188,75 @@
     }
     stampPlaceName();
     stampFilterChip();
+    applyInterfaceScale();
     renderMap();
+    if (state.settingsSavePending) {
+      state.settingsSavePending = false;
+      $("#save-settings").disabled = false;
+      if ($("#settings-dialog").open) $("#settings-dialog").close();
+    }
+  }
+
+  function readingVersion(value) {
+    const timestamp = Number(value);
+    return Number.isFinite(timestamp) ? timestamp : 0;
+  }
+
+  function syncTrendWithSensor(sensor) {
+    const previous = state.trends.get(sensor.id);
+    const readingLastSeen = readingVersion(sensor.last_seen);
+    // An explicit event is authoritative for its reading. Only a genuinely
+    // newer sensor publication may replace it with inline data or idle state.
+    if (previous && readingLastSeen <= previous.readingLastSeen) {
+      if (previous.source === "event" || readingLastSeen < previous.readingLastSeen) return;
+    }
+    const inlineSuccess = Array.isArray(sensor.trend) && sensor.trend.some((point) => Number.isFinite(point.aqi));
+    if (inlineSuccess) {
+      state.trends.set(sensor.id, { status: "loaded", trend: sensor.trend, retries: 0, readingLastSeen, requestId: 0, source: "inline" });
+    } else if (!previous || readingLastSeen > previous.readingLastSeen) {
+      state.trends.set(sensor.id, { status: "idle", trend: [], retries: previous?.retries ?? 0, readingLastSeen, requestId: 0, source: "publication" });
+    }
+  }
+
+  function publicationBounds(payload) {
+    const candidates = [payload.coverage?.bounds, payload.fetch_bounds, payload.bounds, payload.coverage];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== "object") continue;
+      const bounds = {
+        north: candidate.north, west: candidate.west,
+        south: candidate.south, east: candidate.east,
+      };
+      try {
+        AirloomCore.splitBounds(bounds);
+        return bounds;
+      } catch {
+        // A payload without geographic coverage cannot supersede the last
+        // successfully fetched region.
+      }
+    }
+    return null;
   }
 
   function applySensors(payload) {
-    state.sensors = payload.items || [];
+    const area = Array.isArray(payload.area) ? payload.area : (payload.items || []);
+    const favorites = Array.isArray(payload.favorites) ? payload.favorites : [];
+    const merged = new Map(area.map((sensor) => [sensor.id, sensor]));
+    for (const favorite of favorites) {
+      const local = merged.get(favorite.id);
+      merged.set(favorite.id, local ? { ...local, favorite: local.favorite || favorite.favorite } : { ...favorite, remote_favorite: true });
+    }
+    state.sensors = [...merged.values()];
+    state.areaSensors = Array.isArray(payload.area) ? area : state.sensors;
+    state.favoriteSensors = Array.isArray(payload.favorites) ? favorites : null;
+    state.coverage = payload.coverage || null;
+    state.fetchedBounds = publicationBounds(payload) || state.fetchedBounds;
     state.selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
     state.source = payload.source || "Demo data";
+    state.stale = payload.stale;
     state.config = { ...state.config, ...(payload.config || {}) };
+    for (const sensor of state.sensors) syncTrendWithSensor(sensor);
     stampPlaceName();
+    applyInterfaceScale();
     $("#data-source").textContent = state.source;
     renderAll();
     reconcilePopup();
@@ -154,22 +270,66 @@
     renderDetail();
   }
 
-  function renderSummary() {
-    const valid = locationFiltered(state.sensors).filter((s) => Number.isFinite(s.aqi)).sort((a, b) => a.aqi - b.aqi);
+  function hasLimitedCoverage(view = mapViewport()) {
+    if (state.coverage?.capped === true || state.coverage?.complete === false) return true;
+    if (!state.fetchedBounds || !view.width) return false;
+    return !AirloomCore.boundsContain(state.fetchedBounds, geographicBounds(view));
+  }
+
+  function summaryTitle(base) {
+    return hasLimitedCoverage() ? `${base} · Limited coverage` : base;
+  }
+
+  function stampProvenance(id, label) {
+    const element = $(`#${id}`);
+    element.hidden = !label;
+    element.textContent = label;
+  }
+
+  function summaryProvenanceLabel() {
+    const source = (state.source || "").toLowerCase();
+    const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
+    if (source.includes("demo") || state.areaSensors.some((sensor) => sensor.origin === "demo")) return "Demo data";
+    if (state.stale === true || legacyStale) return "Stale cached data";
+    if (source.includes("cached") || state.areaSensors.some((sensor) => sensor.delivery === "cache")) return "Cached data";
+    return "";
+  }
+
+  function detailProvenanceLabel(sensor) {
+    if (!sensor) return "";
+    if (sensor.origin === "demo") return "Demo data";
+    if (sensor.stale === true) return "Stale cached data";
+    if (sensor.remote_favorite === true) return sensor.delivery === "cache" ? "Cached data" : "";
+
+    const source = (state.source || "").toLowerCase();
+    const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
+    if (source.includes("demo")) return "Demo data";
+    if (state.stale === true || legacyStale) return "Stale cached data";
+    if (sensor.delivery === "cache" || source.includes("cached")) return "Cached data";
+    return "";
+  }
+
+  function renderSummary(view = mapViewport()) {
+    stampProvenance("summary-provenance", summaryProvenanceLabel());
+    const limited = hasLimitedCoverage();
+    $("#coverage-status").hidden = !limited;
+    $("#coverage-status").textContent = limited ? "Limited coverage" : "";
+    const valid = view.width ? AirloomCore.summarySensors(locationFiltered(state.areaSensors), geographicBounds(view)) : [];
     const sensor = valid[Math.floor(valid.length / 2)];
     if (!sensor) {
       $("#summary-aqi").textContent = "—";
       $("#summary-aqi").style.background = "";
       $("#summary-aqi").style.color = "";
       $("#summary-label").textContent = "No readings";
-      $("#summary-chip").title = "No sensors reporting in range";
+      $("#summary-chip").title = summaryTitle("No sensors reporting in range");
       return;
     }
+    const band = AirloomCore.bandForAQI(sensor.aqi);
     $("#summary-aqi").textContent = sensor.aqi;
-    $("#summary-aqi").style.background = sensor.color;
-    $("#summary-aqi").style.color = sensor.foreground;
-    $("#summary-label").textContent = sensor.category;
-    $("#summary-chip").title = `${valid.length} sensors reporting`;
+    $("#summary-aqi").style.background = band.color;
+    $("#summary-aqi").style.color = band.foreground;
+    $("#summary-label").textContent = band.label;
+    $("#summary-chip").title = summaryTitle(`${valid.length} sensors reporting`);
   }
 
   // Preview mode filters sensors locally by indoor/outdoor; app mode leaves
@@ -183,10 +343,10 @@
     return sensors;
   }
 
-  function visibleSensors() {
-    const sensors = locationFiltered(state.sensors);
+  function visibleSensors(sensors = state.sensors) {
+    const eligible = locationFiltered(sensors);
     const query = state.query.trim().toLowerCase();
-    return query ? sensors.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : sensors;
+    return query ? eligible.filter((s) => s.name.toLowerCase().includes(query) || String(s.aqi).includes(query)) : eligible;
   }
 
   // A sensor filtered out by the location filter or search query must not
@@ -197,67 +357,148 @@
     open ? showPopup(open) : hidePopup();
   }
 
+  function restoreRemovedFocus(metadata) {
+    if (!metadata) return;
+    if ((metadata.surface === "sensor-list" || metadata.surface === "favorites-list") && !$("#sensors-panel").hidden) {
+      const preferred = $(`#${metadata.surface}`).querySelector(".sensor-row");
+      const fallback = preferred || $("#sensor-list").querySelector(".sensor-row") || $("#favorites-list").querySelector(".sensor-row");
+      if (fallback) { fallback.focus(); return; }
+    }
+    $("#sensors-button").focus();
+  }
+
+  function restoreLogicalFocus(origin) {
+    if (origin?.surface === "search") { $("#search").focus(); return; }
+    if (origin && (origin.surface === "sensor-list" || origin.surface === "favorites-list" || origin.surface === "markers")) {
+      const panelHidden = origin.surface !== "markers" && $("#sensors-panel").hidden;
+      const container = $(`#${origin.surface}`);
+      const target = [...container.children].find((node) => node.dataset.id === String(origin.key));
+      if (!panelHidden && target) { target.focus(); return; }
+    }
+    $("#sensors-button").focus();
+  }
+
+  function renderKeyedCollection(container, items, emptyMarkup) {
+    const result = AirloomState.reconcileKeyed(container, items, (sensor) => sensor.id, createSensorRow, updateSensorRow);
+    if (!items.length) container.innerHTML = emptyMarkup;
+    restoreRemovedFocus(result.removedFocus);
+  }
+
   function renderLists() {
     const visible = visibleSensors();
-    const favorites = visible.filter((sensor) => sensor.favorite);
-    $("#sensor-count").textContent = visible.length;
+    const separateFavorites = state.favoriteSensors !== null;
+    const favorites = separateFavorites ? visibleSensors(state.favoriteSensors) : visible.filter((sensor) => sensor.favorite);
+    const nearby = separateFavorites ? visibleSensors(state.areaSensors) : visible;
+    $("#sensor-count").textContent = nearby.length;
     $("#favorite-count").textContent = favorites.length;
-    $("#favorites-list").innerHTML = favorites.length ? favorites.map(sensorRow).join("") : '<div class="empty-state small">Star a sensor to keep it close.</div>';
-    $("#sensor-list").innerHTML = visible.length ? visible.map(sensorRow).join("") : '<div class="empty-state">No sensors match that search.</div>';
-    document.querySelectorAll(".sensor-row").forEach((row) => row.addEventListener("click", () => selectSensor(Number(row.dataset.id), true)));
+    renderKeyedCollection($("#favorites-list"), favorites, '<div class="empty-state small">Star a sensor to keep it close.</div>');
+    renderKeyedCollection($("#sensor-list"), nearby, '<div class="empty-state">No sensors match that search.</div>');
   }
 
-  function sensorRow(sensor) {
-    const selected = sensor.id === state.selectedId ? " selected" : "";
+  function createSensorRow() {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.addEventListener("click", () => selectSensor(Number(row.dataset.id), true, { key: row.dataset.id, surface: row.parentNode.id }));
+    return row;
+  }
+
+  function updateSensorRow(row, sensor) {
+    row.className = `sensor-row${sensor.id === state.selectedId ? " selected" : ""}`;
+    row.dataset.id = String(sensor.id);
+    row.style.setProperty("--sensor", sensor.color || "");
+    row.style.setProperty("--sensor-fg", sensor.foreground || "");
+    row.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}${sensor.favorite ? ", favorite" : ""}`);
     const meta = [formatTemperature(sensor.temperature_f), formatHumidity(sensor.humidity)].filter(Boolean).join(" · ");
-    return `<button class="sensor-row${selected}" data-id="${sensor.id}" style="--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">
-      <span class="sensor-badge">${sensor.aqi ?? "—"}</span>
+    row.innerHTML = `<span class="sensor-badge">${sensor.aqi ?? "—"}</span>
       <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small></span>
-      ${sensor.favorite ? '<span class="row-star"><svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg></span>' : ""}
-    </button>`;
+      ${sensor.favorite ? '<span class="row-star"><svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg></span>' : ""}`;
   }
 
-  function selectSensor(id, revealDetail = false) {
+  function selectSensor(id, revealDetail = false, origin = null) {
     state.selectedId = id;
     bridge({ action: "select", id });
     renderLists();
     renderMapMarkers();
     renderDetail();
-    if (revealDetail) { hidePopup(); $("#detail-card").hidden = false; }
+    if (revealDetail) {
+      hidePopup(false);
+      state.detailReturnFocus = origin || { surface: "search" };
+      $("#detail-card").hidden = false;
+      $("#close-detail").focus();
+    }
+    const sensor = selectedSensor();
+    if (sensor) announce(`${sensor.name}. AQI ${sensor.aqi ?? "unavailable"}.`);
   }
 
   function selectedSensor() {
     return state.sensors.find((sensor) => sensor.id === state.selectedId);
   }
 
-  function showPopup(sensor) {
-    const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+  function positionPopup(sensor, view = mapViewport()) {
+    if (!view.width || !view.height) return;
     const popup = $("#map-popup");
-    popup.style.left = `${point.x}px`;
+    const point = sensorWorldPoint(sensor);
+    const margin = 12, gap = 30;
+    const width = popup.clientWidth || 232;
+    const height = popup.clientHeight || 140;
+    const screenX = point.x - view.left;
+    const screenY = point.y - view.top;
+    const halfWidth = width / 2;
+    const x = view.width <= width + margin * 2
+      ? view.width / 2
+      : Math.max(margin + halfWidth, Math.min(view.width - margin - halfWidth, screenX));
+    const aboveSpace = screenY - gap - margin;
+    const belowSpace = view.height - screenY - gap - margin;
+    const below = aboveSpace < height && belowSpace > aboveSpace;
+    popup.classList.toggle("below", below);
+    popup.dataset.placement = below ? "below" : "above";
+    popup.style.left = `${view.left + x}px`;
     popup.style.top = `${point.y}px`;
+  }
+
+  function showPopup(sensor, { origin = null, focus = false } = {}) {
+    const popup = $("#map-popup");
+    if (origin) state.popupReturnFocus = origin;
+    else if (state.popupId !== sensor.id) state.popupReturnFocus = { key: String(sensor.id), surface: "markers" };
     $("#popup-aqi").textContent = sensor.aqi ?? "—";
     $("#popup-aqi").style.background = sensor.color || "";
     $("#popup-aqi").style.color = sensor.foreground || "";
     $("#popup-name").textContent = sensor.name;
     $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
     $("#popup-favorite").classList.toggle("active", Boolean(sensor.favorite));
-    const demo = (state.source || "").includes("Demo");
+    $("#popup-favorite").setAttribute("aria-pressed", String(Boolean(sensor.favorite)));
+    const demo = (state.source || "").toLowerCase().includes("demo") || sensor.origin === "demo";
     const link = $("#popup-purpleair");
     link.hidden = demo; // demo sensor ids do not exist on the public map
     if (!demo) link.href = `https://map.purpleair.com/1/mAQI/a10/p604800/cC0?select=${sensor.id}#14/${sensor.latitude}/${sensor.longitude}`;
     popup.hidden = false;
     state.popupId = sensor.id;
+    positionPopup(sensor);
+    if (focus) $("#popup-details").focus();
   }
 
-  function hidePopup() {
-    $("#map-popup").hidden = true;
+  function hidePopup(restoreFocus) {
+    const popup = $("#map-popup");
+    const shouldRestore = restoreFocus ?? (state.popupId !== null && popup.contains(document.activeElement));
+    const origin = state.popupReturnFocus;
+    popup.hidden = true;
     state.popupId = null;
+    state.popupReturnFocus = null;
+    if (shouldRestore && origin) restoreLogicalFocus(origin);
+  }
+
+  function hideDetail(restoreFocus = true) {
+    const origin = state.detailReturnFocus;
+    $("#detail-card").hidden = true;
+    state.detailReturnFocus = null;
+    if (restoreFocus && origin) restoreLogicalFocus(origin);
   }
 
   function renderDetail() {
     const sensor = selectedSensor();
+    stampProvenance("detail-provenance", detailProvenanceLabel(sensor));
     if (!sensor) {
-      $("#detail-card").hidden = true;
+      hideDetail();
       return;
     }
     $("#sensor-name").textContent = sensor.name;
@@ -272,14 +513,59 @@
     $("#guidance").textContent = sensor.guidance;
     $("#guidance-card").style.setProperty("--guidance-color", sensor.color);
     $("#favorite-button").classList.toggle("active", sensor.favorite);
+    $("#favorite-button").setAttribute("aria-pressed", String(Boolean(sensor.favorite)));
     $("#updated-time").textContent = relativeTime(sensor.last_seen);
     renderChart(sensor);
   }
 
+  function applyTrend(payload) {
+    const sensorId = Number(payload.sensor_id);
+    const requestId = Number(payload.request_id);
+    if (!Number.isInteger(sensorId) || !Number.isInteger(requestId) || payload.reading_last_seen === undefined || !["idle", "loading", "loaded", "unavailable", "error"].includes(payload.status)) return;
+    const sensor = state.sensors.find((item) => item.id === sensorId);
+    if (!sensor) return;
+    const readingLastSeen = readingVersion(payload.reading_last_seen);
+    if (readingLastSeen !== readingVersion(sensor.last_seen)) return;
+    const previous = state.trends.get(sensorId);
+    if (previous) {
+      if (readingLastSeen < previous.readingLastSeen) return;
+      if (readingLastSeen === previous.readingLastSeen && previous.source === "event" && requestId < previous.requestId) return;
+    }
+    let status = payload.status;
+    const trend = Array.isArray(payload.trend) ? payload.trend : [];
+    if (status === "loaded" && !trend.some((point) => Number.isFinite(point.aqi))) status = "unavailable";
+    const retries = status === "loaded" ? 0 : (previous?.retries ?? 0);
+    state.trends.set(sensorId, { status, trend, retries, readingLastSeen, requestId, source: "event" });
+    if (status === "loaded") sensor.trend = trend;
+    if (sensorId === state.selectedId) renderDetail();
+  }
+
+  function retryTrend() {
+    const sensorId = state.selectedId;
+    const trend = state.trends.get(sensorId);
+    if (!trend || trend.status !== "error" || trend.retries >= 3) return;
+    trend.retries++;
+    trend.requestId++;
+    trend.status = "loading";
+    if (desktopMode) bridge({ action: "select", id: sensorId });
+    renderDetail();
+  }
+
   function renderChart(sensor) {
-    const points = (sensor.trend || []).filter((point) => Number.isFinite(point.aqi));
+    const trendState = state.trends.get(sensor.id);
+    const status = trendState?.status || (state.config.has_api_key ? "loading" : "unavailable");
+    const retries = trendState?.retries || 0;
+    const retry = $("#trend-retry");
+    retry.hidden = status !== "error";
+    retry.disabled = status === "error" && retries >= 3;
+    retry.textContent = retries >= 3 ? "Retry limit reached" : "Retry";
+    $("#chart-period").textContent = "Rolling averages";
+    const points = (status === "loaded" ? (trendState?.trend || sensor.trend || []) : []).filter((point) => Number.isFinite(point.aqi));
     if (!points.length) {
-      const message = state.config.has_api_key ? "Loading trend…" : "No trend available";
+      let message = "Trend unavailable";
+      if (status === "loading") message = "Loading trend…";
+      else if (status === "idle") message = "Trend not loaded";
+      else if (status === "error" && retries >= 3) message = "Trend unavailable after 3 retries";
       $("#chart").innerHTML = `<div class="empty-state">${message}</div>`;
       $("#trend-direction").textContent = "—";
       return;
@@ -293,12 +579,16 @@
     }));
     const line = coordinates.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
     const area = `${line} L${coordinates.at(-1).x},${height - padBottom} L${coordinates[0].x},${height - padBottom} Z`;
-    const labels = coordinates.map((point) => `<text x="${point.x}" y="${height - 4}" text-anchor="middle">${point.label}</text>`).join("");
+    const labels = coordinates.map((point) => `<text x="${point.x}" y="${height - 4}" text-anchor="middle">${escapeHtml(point.label)}</text>`).join("");
     const dots = coordinates.map((point) => `<circle class="dot" cx="${point.x}" cy="${point.y}" r="3.5" fill="${sensor.color}"/>`).join("");
     $("#chart").innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
       <line class="grid" x1="0" y1="${height - padBottom}" x2="${width}" y2="${height - padBottom}"/>
       <path class="area" d="${area}" fill="${sensor.color}"/><path class="line" d="${line}" stroke="${sensor.color}"/>${dots}${labels}
     </svg>`;
+    const comparisonLabels = { "1w": "1-week average", "1d": "1-day average", "6h": "6-hour average", "1h": "1-hour average", "30m": "30-minute average", "10m": "10-minute average" };
+    if (points.at(-1).label === "Now" && comparisonLabels[points[0].label]) {
+      $("#chart-period").textContent = `Current vs ${comparisonLabels[points[0].label]}`;
+    }
     const delta = points.at(-1).aqi - points[0].aqi;
     $("#trend-direction").textContent = Math.abs(delta) < 4 ? "Holding steady" : delta > 0 ? `Up ${delta} points` : `Down ${Math.abs(delta)} points`;
   }
@@ -311,15 +601,27 @@
   function worldPoint(lat, lon, zoom) {
     const size = 256 * 2 ** zoom;
     const sin = Math.sin(clampLat(lat) * Math.PI / 180);
-    return { x: (wrapLon(lon) + 180) / 360 * size, y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size };
+    return { x: (lon + 180) / 360 * size, y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * size };
+  }
+
+  function sensorWorldPoint(sensor) {
+    const longitude = AirloomCore.nearestLongitude(sensor.longitude, state.center.lon);
+    return worldPoint(sensor.latitude, longitude, state.zoom);
   }
 
   function inverseWorld(x, y, zoom) {
     const size = 256 * 2 ** zoom;
-    const lon = wrapLon(x / size * 360 - 180);
+    const lon = x / size * 360 - 180;
     const n = Math.PI - 2 * Math.PI * y / size;
     const lat = clampLat(180 / Math.PI * Math.atan(Math.sinh(n)));
     return { lat, lon };
+  }
+
+  function geographicBounds(view) {
+    const nw = inverseWorld(view.left, view.top, state.zoom);
+    const se = inverseWorld(view.left + view.width, view.top + view.height, state.zoom);
+    if (se.lon - nw.lon >= 360) return { north: nw.lat, west: -180, south: se.lat, east: 180 };
+    return { north: nw.lat, west: wrapLon(nw.lon), south: se.lat, east: wrapLon(se.lon) };
   }
 
   // --- Heat map mode (spec: docs/superpowers/specs/2026-08-07-heatmap-mode-design.md) ---
@@ -340,13 +642,11 @@
     return viewportWidthKm() > Number(state.config.heatmap_threshold_km || 40);
   }
 
-  // Same buckets as the legend and demo.py; interpolated AQI values take the
-  // color of the bucket they land in, so every on-screen color is in the legend.
+  // Interpolated AQI values take the color of their shared core band, so
+  // every on-screen color has a matching legend entry.
   function aqiBucketColor(aqi) {
-    if (aqi <= 50) return [53, 183, 121];   // #35b779 Good
-    if (aqi <= 100) return [246, 201, 69];  // #f6c945 Moderate
-    if (aqi <= 150) return [243, 156, 61];  // #f39c3d Sensitive
-    return [230, 91, 101];                  // #e65b65 Unhealthy
+    const color = AirloomCore.bandForAQI(aqi).color;
+    return [1, 3, 5].map((offset) => Number.parseInt(color.slice(offset, offset + 2), 16));
   }
 
   // Re-render markers exactly once per threshold crossing; a marker popup
@@ -378,7 +678,7 @@
     const points = [];
     for (const sensor of visibleSensors()) {
       if (!Number.isFinite(sensor.aqi)) continue;
-      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+      const point = sensorWorldPoint(sensor);
       const x = point.x - view.left, y = point.y - view.top;
       if (x < -pad || x > view.width + pad || y < -pad || y > view.height + pad) continue;
       points.push({ x, y, aqi: sensor.aqi });
@@ -487,9 +787,18 @@
     old.hidden = true;
   }
 
+  function clearRetiredTilesWhenCovered(owner) {
+    if (owner !== tileLayer || owner.pending > 0) return;
+    // Settlement is not coverage: only a completely successful current layer
+    // can replace the last usable imagery.
+    const tiles = [...owner.tiles.values()];
+    if (tiles.length && tiles.every((img) => img.classList.contains("loaded"))) clearRetiredTiles();
+  }
+
   function renderFrame() {
     const view = mapViewport();
     if (!view.width || !view.height) return;
+    renderSummary(view);
     const tz = tileZoomLevel();
     if (tileLayer.zoom !== tz) {
       if (tileLayer.zoom !== null) retireTiles();
@@ -519,11 +828,16 @@
           // whatever layer happens to be current when it fires.
           const owner = tileLayer;
           owner.pending++;
-          img.onload = img.onerror = () => {
-            img.classList.add("loaded");
+          img.dataset.pending = "true";
+          const settle = (loaded) => {
+            if (loaded) img.classList.add("loaded");
+            delete img.dataset.pending;
             img.onload = img.onerror = null;
-            if (--owner.pending <= 0 && owner === tileLayer) clearRetiredTiles();
+            owner.pending--;
+            clearRetiredTilesWhenCovered(owner);
           };
+          img.onload = () => settle(true);
+          img.onerror = () => settle(false);
           img.src = `https://tile.openstreetmap.org/${tz}/${wrappedX}/${ty}.png`;
           img.style.left = `${tx * 256}px`;
           img.style.top = `${ty * 256}px`;
@@ -534,13 +848,16 @@
     }
     for (const [key, img] of tileLayer.tiles) {
       if (!needed.has(key)) {
-        if (!img.classList.contains("loaded")) tileLayer.pending--;
+        if (img.dataset.pending === "true") {
+          tileLayer.pending--;
+          delete img.dataset.pending;
+        }
         img.onload = img.onerror = null;
         img.remove();
         tileLayer.tiles.delete(key);
       }
     }
-    if (tileLayer.pending <= 0) clearRetiredTiles();
+    clearRetiredTilesWhenCovered(tileLayer);
     layer.style.transform = `translate(${-view.left}px, ${-view.top}px) scale(${scale})`;
     const old = $("#tiles-old");
     if (!old.hidden) {
@@ -560,7 +877,7 @@
     markers.querySelectorAll(".map-marker").forEach((element) => {
       const sensor = byId.get(Number(element.dataset.id));
       if (!sensor) return;
-      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
+      const point = sensorWorldPoint(sensor);
       element.style.left = `${point.x}px`;
       element.style.top = `${point.y}px`;
     });
@@ -568,12 +885,7 @@
     // reposition only matters for flyTo/pan frames while a popup stays open.
     if (state.popupId !== null) {
       const open = byId.get(state.popupId);
-      if (open) {
-        const point = worldPoint(open.latitude, open.longitude, state.zoom);
-        const popup = $("#map-popup");
-        popup.style.left = `${point.x}px`;
-        popup.style.top = `${point.y}px`;
-      }
+      if (open) positionPopup(open, view);
     }
   }
 
@@ -605,8 +917,21 @@
     return { x: view.width / 2, y: view.height / 2 };
   }
 
+  const navigation = new AirloomState.NavigationGate();
+  const prefersReducedMotion = () => Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
   let zoomAnim = null;
-  let zoomAnimGeneration = 0;
+
+  function cancelZoomAnimation() {
+    navigation.cancel("zoom");
+    zoomAnim = null;
+  }
+
+  function beginDirectManipulation() {
+    clearTimeout(pinchSettleTimer);
+    navigation.begin("direct");
+    zoomAnim = null;
+  }
+
   function animateZoomTo(target, anchor) {
     hideTransientOverlays();
     // A pending pinch/ctrl+wheel settle must never fire mid-flight and
@@ -614,11 +939,22 @@
     // gestureend entry points in one place).
     clearTimeout(pinchSettleTimer);
     target = Math.max(3, Math.min(17, Math.round(target)));
-    if (zoomAnim) { zoomAnim.target = target; zoomAnim.anchor = anchor; return; }
-    zoomAnim = { target, anchor };
-    const gen = ++zoomAnimGeneration;
+    if (zoomAnim && navigation.isCurrent("zoom", zoomAnim.token)) {
+      zoomAnim.target = target;
+      zoomAnim.anchor = anchor;
+      return;
+    }
+    const token = navigation.begin("zoom");
+    zoomAnim = { target, anchor, token };
+    if (prefersReducedMotion()) {
+      applyZoom(target, anchor);
+      zoomAnim = null;
+      renderMapMarkers();
+      scheduleViewChanged();
+      return;
+    }
     const step = () => {
-      if (!zoomAnim || gen !== zoomAnimGeneration) return;
+      if (!zoomAnim || !navigation.isCurrent("zoom", token)) return;
       const diff = zoomAnim.target - state.zoom;
       if (Math.abs(diff) < 0.02) {
         applyZoom(zoomAnim.target, zoomAnim.anchor);
@@ -634,22 +970,52 @@
     requestAnimationFrame(step);
   }
 
-  function cancelZoomAnimation() { zoomAnim = null; zoomAnimGeneration++; }
+  function createMapMarker() {
+    const marker = document.createElement("button");
+    marker.type = "button";
+    marker.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = Number(marker.dataset.id);
+      selectSensor(id, false);
+      const sensor = state.sensors.find((item) => item.id === id);
+      if (sensor) showPopup(sensor, { origin: { key: marker.dataset.id, surface: "markers" }, focus: true });
+    });
+    return marker;
+  }
+
+  function updateMapMarker(marker, sensor) {
+    const point = sensorWorldPoint(sensor);
+    marker.className = `map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}`;
+    marker.dataset.id = String(sensor.id);
+    marker.title = `${sensor.name} · AQI ${sensor.aqi ?? "unavailable"}`;
+    marker.setAttribute("aria-label", marker.title);
+    marker.style.left = `${point.x}px`;
+    marker.style.top = `${point.y}px`;
+    marker.style.setProperty("--sensor", sensor.color || "");
+    marker.style.setProperty("--sensor-fg", sensor.foreground || "");
+    marker.textContent = sensor.aqi ?? "—";
+  }
 
   function renderMapMarkers() {
     const view = mapViewport();
     if (!view.width) return;
-    if (heatmapActive()) { $("#markers").innerHTML = ""; markerDriftX = markerDriftY = 0; renderHeatmap(view); return; }
+    const container = $("#markers");
+    if (heatmapActive()) {
+      const result = AirloomState.reconcileKeyed(container, [], (sensor) => sensor.id, createMapMarker, updateMapMarker);
+      restoreRemovedFocus(result.removedFocus);
+      markerDriftX = markerDriftY = 0;
+      renderHeatmap(view);
+      return;
+    }
     markerDriftX = markerDriftY = 0;
     const pad = MARKER_CULL_PAD;
-    const markers = visibleSensors().map((sensor) => {
-      const point = worldPoint(sensor.latitude, sensor.longitude, state.zoom);
-      if (point.x < view.left - pad || point.x > view.left + view.width + pad ||
-          point.y < view.top - pad || point.y > view.top + view.height + pad) return "";
-      return `<button class="map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}" data-id="${sensor.id}" title="${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "unavailable"}" style="left:${point.x}px;top:${point.y}px;--sensor:${sensor.color};--sensor-fg:${sensor.foreground}">${sensor.aqi ?? "—"}</button>`;
+    const markers = visibleSensors().filter((sensor) => {
+      const point = sensorWorldPoint(sensor);
+      return point.x >= view.left - pad && point.x <= view.left + view.width + pad &&
+        point.y >= view.top - pad && point.y <= view.top + view.height + pad;
     });
-    $("#markers").innerHTML = markers.join("");
-    $("#markers").querySelectorAll(".map-marker").forEach((marker) => marker.addEventListener("click", (event) => { event.stopPropagation(); selectSensor(Number(marker.dataset.id), false); const sensor = state.sensors.find((s) => s.id === Number(marker.dataset.id)); if (sensor) showPopup(sensor); }));
+    const result = AirloomState.reconcileKeyed(container, markers, (sensor) => sensor.id, createMapMarker, updateMapMarker);
+    restoreRemovedFocus(result.removedFocus);
     layoutMarkers(view);
   }
 
@@ -661,21 +1027,37 @@
   function sendViewChanged() {
     const view = mapViewport();
     if (!view.width) return;
-    const nw = inverseWorld(view.left, view.top, state.zoom);
-    const se = inverseWorld(view.left + view.width, view.top + view.height, state.zoom);
-    bridge({ action: "view-changed", north: nw.lat, west: nw.lon, south: se.lat, east: se.lon, lat: state.center.lat, lon: state.center.lon, zoom: state.zoom });
+    bridge({
+      action: "view-changed",
+      ...geographicBounds(view),
+      lat: state.center.lat,
+      lon: wrapLon(state.center.lon),
+      zoom: state.zoom,
+    });
   }
 
-  let flyGeneration = 0;
   function flyTo(lat, lon, durationMs = 600) {
     const from = { ...state.center };
+    const targetLon = AirloomCore.nearestLongitude(lon, from.lon);
+    clearTimeout(pinchSettleTimer);
+    // A flight supersedes the whole active pinch, not only its zoom animation.
+    // Late change/end events from that gesture must not start another zoom.
+    pinch = null;
+    nativePinchStartZoom = null;
+    cancelZoomAnimation();
+    const token = navigation.begin("fly");
+    if (prefersReducedMotion() || durationMs <= 0) {
+      state.center = { lat, lon: targetLon };
+      renderMap();
+      scheduleViewChanged();
+      return;
+    }
     const start = performance.now();
-    const gen = ++flyGeneration;
     function step(now) {
-      if (gen !== flyGeneration) return;
+      if (!navigation.isCurrent("fly", token)) return;
       const t = Math.min(1, (now - start) / durationMs);
       const ease = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
-      state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (lon - from.lon) * ease };
+      state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (targetLon - from.lon) * ease };
       renderFrame();
       if (t < 1) requestAnimationFrame(step);
       else { renderMapMarkers(); scheduleViewChanged(); }
@@ -698,7 +1080,14 @@
 
   function openSettings(config = state.config) {
     if ($("#settings-dialog").open) return;
+    state.settingsSavePending = false;
+    $("#save-settings").disabled = false;
     const form = $("#settings-form");
+    $("#settings-intro").textContent = desktopMode
+      ? "Use demo readings immediately, or add your own PurpleAir read key for live public sensors."
+      : "Browser preview preferences apply to this tab only. PurpleAir keys and remote place search require the desktop app.";
+    form.elements.api_key.disabled = !desktopMode;
+    form.elements.clear_api_key.disabled = !desktopMode;
     for (const field of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;
@@ -757,6 +1146,14 @@
     if ($("#settings-dialog").open) renderHiddenList();
   }
 
+  function handleError(payload) {
+    if (state.settingsSavePending) {
+      state.settingsSavePending = false;
+      $("#save-settings").disabled = false;
+    }
+    toast(payload.message);
+  }
+
   function toast(message) {
     const item = document.createElement("div");
     item.className = "toast";
@@ -783,8 +1180,35 @@
     return String(value).replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   }
 
+  function invalidatePlaceSearch(context) {
+    state.placeRequests[context] = null;
+    if (context === "main") state.placeResults = [];
+  }
+
+  function submitPlaceSearch(context) {
+    const input = context === "home" ? $("#home-place-input") : $("#search");
+    const query = input.value.trim();
+    invalidatePlaceSearch(context);
+    if (query.length < 2) return;
+    const requestId = ++state.nextPlaceRequestId;
+    state.placeRequests[context] = { requestId, query };
+    actions.placeSearch(query, context, requestId);
+  }
+
+  function applyPlaces(payload) {
+    const context = payload.context;
+    if (context !== "main" && context !== "home") return;
+    const request = state.placeRequests[context];
+    if (!request || payload.request_id !== request.requestId || payload.query !== request.query) return;
+    if (context === "home" && !$("#settings-dialog").open) return;
+    state.placeRequests[context] = null;
+    if (context === "home") renderHomePlaceResults(payload.results || [], payload.error);
+    else renderSearchResults(payload.results || [], payload.error);
+  }
+
   function renderSearchResults(places, error) {
     const box = $("#search-results");
+    state.placeResults = places;
     const query = state.query.trim().toLowerCase();
     const sensors = query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query)).slice(0, 4) : [];
     if (!sensors.length && !places.length && !error) { box.hidden = true; box.innerHTML = ""; return; }
@@ -794,9 +1218,8 @@
     if (error) html += `<div class="group">${escapeHtml(error)}</div>`;
     box.innerHTML = html;
     box.hidden = false;
-    state.placeResults = places;
     box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
-      if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true); }
+      if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true, { surface: "search" }); }
       else {
         const place = state.placeResults[Number(button.dataset.index)];
         if (place) {
@@ -810,6 +1233,7 @@
         }
       }
       box.hidden = true;
+      if (button.dataset.kind === "place") $("#search").focus();
     }));
   }
 
@@ -826,58 +1250,98 @@
       form.elements.location_name.value = place.name.split(",")[0];
       $("#home-place-status").textContent = `Fixed: ${place.name}`;
       box.hidden = true;
-      state.homeSearchActive = false;
+      invalidatePlaceSearch("home");
+      $("#home-place-input").focus();
     }));
   }
 
   function browserPreviewData() {
     const readings = [18, 34, 47, 56, 72, 88, 109, 43, 63, 31, 81, 52];
     const names = ["Alberta Arts", "Laurelhurst Park", "Mount Tabor", "Sellwood Garden", "Buckman School", "Overlook Bluff", "St. Johns North", "Hawthorne Ridge", "Woodstock Library", "Council Crest", "Irvington Air", "Rose City Park"];
-    const colors = (aqi) => aqi <= 50 ? ["Good", "#35b779", "#08271b"] : aqi <= 100 ? ["Moderate", "#f6c945", "#332400"] : ["Unhealthy for sensitive groups", "#f39c3d", "#341900"];
     return readings.map((aqi, index) => {
-      const [category, color, foreground] = colors(aqi);
+      const band = AirloomCore.bandForAQI(aqi);
       const angle = index * 2.399963;
-      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category, color, foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, indoor: index % 5 === 2, guidance: aqi <= 50 ? "Air quality is satisfactory. It is a good time to be outside." : aqi <= 100 ? "Unusually sensitive people may want to reduce prolonged outdoor exertion." : "Sensitive groups should reduce prolonged or heavy outdoor exertion.", trend: ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) })) };
+      const trend = ["1w", "1d", "6h", "1h", "30m", "10m", "Now"].map((label, point) => ({ label, aqi: Math.max(4, aqi + Math.round(Math.sin(index + point) * 11)) }));
+      trend[trend.length - 1] = { label: "Now", aqi };
+      return { id: 8000 + index, name: names[index], latitude: 45.5152 + Math.sin(angle) * (.018 + index % 3 * .012), longitude: -122.6784 + Math.cos(angle) * (.024 + index % 3 * .016), aqi, category: band.label, color: band.color, foreground: band.foreground, pm25: Math.round((aqi / 3.1) * 10) / 10, pm10: Math.round((aqi / 2.3) * 10) / 10, temperature_f: 64 + index % 8, humidity: 43 + index % 6 * 5, last_seen: Math.round(Date.now() / 1000) - index * 24, favorite: index < 2, indoor: index % 5 === 2, guidance: band.guidance, trend };
     });
   }
 
-  let placeTimer = null;
+  function togglePreviewFavorite(id) {
+    const sensor = state.sensors.find((item) => item.id === id);
+    if (!sensor) return;
+    sensor.favorite = !sensor.favorite;
+    renderAll();
+    reconcilePopup();
+    announce(`${sensor.name} ${sensor.favorite ? "added to" : "removed from"} preview favorites.`);
+  }
+
+  function refreshPreview() {
+    const previous = new Map([...state.sensors, ...state.previewHidden].map((sensor) => [sensor.id, sensor]));
+    const hiddenIds = new Set((state.config.hidden || []).map((sensor) => sensor.id));
+    const preview = browserPreviewData().map((sensor) => ({
+      ...sensor,
+      favorite: previous.has(sensor.id) ? previous.get(sensor.id).favorite : sensor.favorite,
+    }));
+    state.previewHidden = preview.filter((sensor) => hiddenIds.has(sensor.id));
+    const visible = preview.filter((sensor) => !hiddenIds.has(sensor.id));
+    const selectedId = visible.some((sensor) => sensor.id === state.selectedId) ? state.selectedId : visible[0]?.id ?? null;
+    state.config.hidden = state.previewHidden.map((sensor) => ({ id: sensor.id, name: sensor.name }));
+    applySensors({ items: visible, selected_id: selectedId, source: "Browser preview · Demo data", config: state.config });
+    announce("Browser preview demo data refreshed locally.");
+  }
+
   $("#search").addEventListener("input", (event) => {
     state.query = event.target.value;
+    invalidatePlaceSearch("main");
     renderLists();
     renderMapMarkers();
     reconcilePopup();
     renderSearchResults([]);
-    clearTimeout(placeTimer);
-    if (state.query.trim().length >= 3) placeTimer = setTimeout(() => bridge({ action: "place-search", query: state.query.trim() }), 450);
   });
   $("#search").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && state.query.trim().length >= 2) bridge({ action: "place-search", query: state.query.trim() });
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    submitPlaceSearch("main");
   });
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); }
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
     if (event.key === "Escape" && !$("#settings-dialog").open) {
-      if (!$("#map-popup").hidden) hidePopup();
-      else if (!$("#search-results").hidden) $("#search-results").hidden = true;
-      else if (!$("#detail-card").hidden) $("#detail-card").hidden = true;
-      else $("#sensors-panel").hidden = true;
+      if (!$("#map-popup").hidden) hidePopup(true);
+      else if (!$("#search-results").hidden) { $("#search-results").hidden = true; $("#search").focus(); }
+      else if (!$("#detail-card").hidden) hideDetail();
+      else if (!$("#sensors-panel").hidden) {
+        $("#sensors-panel").hidden = true;
+        $("#sensors-button").setAttribute("aria-expanded", "false");
+        $("#sensors-button").focus();
+      }
     }
   });
-  $("#footer-refresh").addEventListener("click", () => bridge({ action: "refresh" }));
-  $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) bridge({ action: "favorite", id: state.selectedId }); });
+  $("#footer-refresh").addEventListener("click", () => actions.refresh());
+  $("#favorite-button").addEventListener("click", () => { if (state.selectedId !== null) actions.favorite(state.selectedId); });
+  $("#trend-retry").addEventListener("click", retryTrend);
   $("#hide-button").addEventListener("click", () => {
     if (state.selectedId === null) return;
     const id = state.selectedId;
-    $("#detail-card").hidden = true; // deterministic close; the resend reselects another sensor
+    hideDetail(false); // deterministic close; the resend reselects another sensor
+    $("#sensors-button").focus();
     requestHide(id);
   });
-  $("#popup-details").addEventListener("click", () => { $("#detail-card").hidden = false; renderDetail(); hidePopup(); });
-  $("#popup-favorite").addEventListener("click", () => { if (state.popupId !== null) { if (window.webkit?.messageHandlers?.airloom) bridge({ action: "favorite", id: state.popupId }); else { const sensor = state.sensors.find((s) => s.id === state.popupId); if (sensor) { sensor.favorite = !sensor.favorite; renderAll(); showPopup(sensor); } } } });
+  $("#popup-details").addEventListener("click", () => {
+    const origin = state.popupReturnFocus || (state.popupId !== null ? { key: String(state.popupId), surface: "markers" } : null);
+    hidePopup(false);
+    state.detailReturnFocus = origin;
+    $("#detail-card").hidden = false;
+    renderDetail();
+    $("#close-detail").focus();
+  });
+  $("#popup-favorite").addEventListener("click", () => { if (state.popupId !== null) actions.favorite(state.popupId); });
   $("#popup-hide").addEventListener("click", () => {
     if (state.popupId === null) return;
     const id = state.popupId;
-    hidePopup();
+    hidePopup(false);
+    $("#sensors-button").focus();
     requestHide(id);
   });
   $("#unhide-all").addEventListener("click", () => {
@@ -888,9 +1352,18 @@
   $("#zoom-in").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) + 1, centerAnchor()); });
   $("#zoom-out").addEventListener("click", (event) => { event.stopPropagation(); animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) - 1, centerAnchor()); });
   $("#recenter").addEventListener("click", (event) => { event.stopPropagation(); flyTo(state.home.lat, state.home.lon); });
-  $("#sensors-button").addEventListener("click", () => { $("#sensors-panel").hidden = !$("#sensors-panel").hidden; });
-  $("#close-sensors").addEventListener("click", () => { $("#sensors-panel").hidden = true; });
-  $("#close-detail").addEventListener("click", () => { $("#detail-card").hidden = true; });
+  $("#sensors-button").addEventListener("click", () => {
+    const open = $("#sensors-panel").hidden;
+    $("#sensors-panel").hidden = !open;
+    $("#sensors-button").setAttribute("aria-expanded", String(open));
+    (open ? $("#close-sensors") : $("#sensors-button")).focus();
+  });
+  $("#close-sensors").addEventListener("click", () => {
+    $("#sensors-panel").hidden = true;
+    $("#sensors-button").setAttribute("aria-expanded", "false");
+    $("#sensors-button").focus();
+  });
+  $("#close-detail").addEventListener("click", () => hideDetail());
   $("#legend-chip").addEventListener("click", () => {
     const legend = $("#legend");
     legend.hidden = !legend.hidden;
@@ -902,7 +1375,7 @@
     if (window.webkit?.messageHandlers?.airloom) bridge({ action: "set-location-filter", value: state.config.location_filter });
     else { renderAll(); reconcilePopup(); } // preview: filter locally, no bridge round-trip
   });
-  $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button, a, .map-popup")) return; hideTransientOverlays(); state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
+  $("#map-panel").addEventListener("pointerdown", (event) => { if (event.target.closest("button, a, .map-popup")) return; beginDirectManipulation(); hideTransientOverlays(); state.drag = { x: event.clientX, y: event.clientY }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); });
   $("#map-panel").addEventListener("pointermove", (event) => { if (!state.drag || !(event.buttons & 1)) return; const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y; state.drag = { x: event.clientX, y: event.clientY }; panBy(dx, dy); });
   // Rebuild (re-cull) markers only after an actual drag: rebuilding on every
   // pointerup destroys a pressed marker between pointerup and click, so the
@@ -910,8 +1383,13 @@
   // for marker presses (pointerdown early-returns on buttons).
   $("#map-panel").addEventListener("pointerup", (event) => { const dragged = state.drag !== null; state.drag = null; event.currentTarget.classList.remove("dragging"); if (dragged) renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
+  function isZoomWheel(event) {
+    return Boolean(event.deltaY) && Math.abs(event.deltaX) <= Math.abs(event.deltaY);
+  }
+
   $("#map-panel").addEventListener("wheel", (event) => {
     if (event.ctrlKey) return; // pinch path; the document-level handler owns it
+    if (!isZoomWheel(event)) return;
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
     const base = zoomAnim ? zoomAnim.target : Math.round(state.zoom);
@@ -941,8 +1419,8 @@
   document.addEventListener("wheel", (event) => {
     if (!event.ctrlKey) return;
     event.preventDefault();
-    if (overBlockingOverlay(event.target)) return;
-    cancelZoomAnimation();
+    if (overBlockingOverlay(event.target) || !isZoomWheel(event)) return;
+    beginDirectManipulation();
     hideTransientOverlays();
     lastZoomAnchor = mapAnchorFromClient(event.clientX, event.clientY);
     applyZoom(state.zoom - event.deltaY * 0.01, lastZoomAnchor);
@@ -953,7 +1431,7 @@
   document.addEventListener("gesturestart", (event) => {
     event.preventDefault();
     if (overBlockingOverlay(event.target)) return;
-    cancelZoomAnimation();
+    beginDirectManipulation();
     hideTransientOverlays();
     lastZoomAnchor = null;
     pinch = { startZoom: state.zoom };
@@ -986,7 +1464,7 @@
       const blocked = document.elementFromPoint(payload.x, payload.y)?.closest("#settings-dialog, #sensors-panel, #detail-card, #search-results");
       nativePinchStartZoom = blocked ? null : state.zoom;
       if (nativePinchStartZoom === null) return;
-      cancelZoomAnimation();
+      beginDirectManipulation();
       hideTransientOverlays();
     } else if (payload.phase === "change") {
       if (nativePinchStartZoom === null) return;
@@ -1001,29 +1479,37 @@
 
   $("#close-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
   $("#cancel-settings").addEventListener("click", () => $("#settings-dialog").close("cancel"));
-  $("#settings-dialog").addEventListener("close", () => { state.homeSearchActive = false; });
+  $("#settings-dialog").addEventListener("close", () => {
+    invalidatePlaceSearch("home");
+    $("#home-place-results").hidden = true;
+    $("#home-place-results").innerHTML = "";
+    state.settingsSavePending = false;
+    $("#save-settings").disabled = false;
+  });
   document.querySelectorAll('input[name="home_mode"]').forEach((radio) => radio.addEventListener("change", () => {
     $("#home-place-row").hidden = $("#settings-form").elements.home_mode.value !== "fixed";
   }));
-  let homePlaceTimer = null;
-  $("#home-place-input").addEventListener("input", (event) => {
-    clearTimeout(homePlaceTimer);
-    const query = event.target.value.trim();
-    if (query.length >= 3) homePlaceTimer = setTimeout(() => { state.homeSearchActive = true; bridge({ action: "place-search", query }); }, 450);
+  $("#home-place-input").addEventListener("input", () => {
+    invalidatePlaceSearch("home");
+    $("#home-place-results").hidden = true;
+    $("#home-place-results").innerHTML = "";
+  });
+  $("#home-place-input").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    submitPlaceSearch("home");
   });
   $("#settings-form").addEventListener("submit", (event) => {
     const submitter = event.submitter;
     if (!submitter || submitter.id !== "save-settings") return;
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    bridge({
-      action: "save-settings",
+    actions.saveSettings({
       api_key: form.get("api_key"), clear_api_key: form.get("clear_api_key") === "on",
       confidence_filter: form.get("confidence_filter") === "on",
       home_mode: form.get("home_mode"), home_lat: form.get("home_lat"), home_lon: form.get("home_lon"), location_name: form.get("location_name"),
       radius_km: form.get("radius_km"), heatmap_threshold_km: form.get("heatmap_threshold_km"), alert_threshold: form.get("alert_threshold"), refresh_minutes: form.get("refresh_minutes"), temperature_unit: form.get("temperature_unit"),
     });
-    $("#settings-dialog").close();
   });
   new ResizeObserver(() => renderMap()).observe($("#map-panel"));
   bridge({ action: "ready" });

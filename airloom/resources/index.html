@@ -16,11 +16,11 @@
         <canvas id="heatmap" class="heatmap-layer" hidden></canvas>
         <div id="markers" class="marker-layer"></div>
         <div id="popup-layer" class="marker-layer">
-          <div class="map-popup" id="map-popup" hidden>
+          <div class="map-popup" id="map-popup" role="dialog" aria-labelledby="popup-name" hidden>
             <div class="popup-head">
               <span class="popup-aqi" id="popup-aqi">—</span>
               <div class="popup-copy"><strong id="popup-name"></strong><small id="popup-meta"></small></div>
-              <button class="icon-button popup-star" id="popup-favorite" title="Favorite this sensor" aria-label="Favorite this sensor">
+              <button class="icon-button popup-star" id="popup-favorite" title="Favorite this sensor" aria-label="Favorite this sensor" aria-pressed="false">
                 <svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg>
               </button>
               <button class="icon-button popup-star" id="popup-hide" title="Hide this sensor" aria-label="Hide this sensor">
@@ -38,7 +38,7 @@
       <div class="overlay search-overlay">
         <label class="search-pill">
           <svg viewBox="0 0 24 24"><path d="m21 20-5.2-5.2a7 7 0 1 0-1 1L20 21l1-1ZM5 10.5a5.5 5.5 0 1 1 11 0 5.5 5.5 0 0 1-11 0Z"/></svg>
-          <input id="search" type="search" placeholder="Search sensors or places" autocomplete="off">
+          <input id="search" type="search" placeholder="Search sensors or places" aria-label="Search sensors or places" autocomplete="off">
           <kbd>Ctrl K</kbd>
         </label>
         <div id="search-results" class="search-results" hidden></div>
@@ -49,20 +49,24 @@
         <span class="summary-copy">
           <strong id="place-name">Locating…</strong>
           <small id="summary-label">Loading readings</small>
+          <small class="provenance-status" id="summary-provenance" hidden></small>
+          <small class="coverage-status" id="coverage-status" hidden>Limited coverage</small>
         </span>
         <span class="pulse" id="loading-pulse"></span>
       </button>
 
       <div class="overlay corner-buttons">
-        <button id="sensors-button">☰ Sensors <span class="count" id="sensor-count">0</span></button>
-        <button id="legend-chip" aria-expanded="false">AQI</button>
+        <button id="sensors-button" aria-controls="sensors-panel" aria-expanded="false">☰ Sensors <span class="count" id="sensor-count">0</span></button>
+        <button id="legend-chip" aria-controls="legend" aria-expanded="false">AQI</button>
         <button id="filter-chip" title="Cycle which sensors are shown">Outdoor</button>
       </div>
       <div class="legend" id="legend" aria-label="AQI color legend" hidden>
         <div><i style="--c:#35b779"></i><span>Good</span><b>0–50</b></div>
         <div><i style="--c:#f6c945"></i><span>Moderate</span><b>51–100</b></div>
         <div><i style="--c:#f39c3d"></i><span>Sensitive</span><b>101–150</b></div>
-        <div><i style="--c:#e65b65"></i><span>Unhealthy</span><b>151+</b></div>
+        <div><i style="--c:#e65b65"></i><span>Unhealthy</span><b>151–200</b></div>
+        <div><i style="--c:#9b6bc3"></i><span>Very unhealthy</span><b>201–300</b></div>
+        <div><i style="--c:#7e394d"></i><span>Hazardous</span><b>301–500</b></div>
       </div>
 
       <div class="overlay map-controls">
@@ -86,7 +90,7 @@
         <div class="detail-topbar">
           <span id="updated-time">Waiting for data</span>
           <span class="detail-actions">
-            <button class="favorite-button" id="favorite-button" title="Favorite this sensor" aria-label="Favorite this sensor">
+            <button class="favorite-button" id="favorite-button" title="Favorite this sensor" aria-label="Favorite this sensor" aria-pressed="false">
               <svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Zm0-2.3 3.5 2-.8-3.9 3-2.7-4.1-.5L12 6.2l-1.6 3.7-4.1.5 3 2.7-.8 3.9 3.5-2Z"/></svg>
             </button>
             <button class="icon-button" id="hide-button" title="Hide this sensor" aria-label="Hide this sensor">
@@ -98,10 +102,10 @@
         <p class="sensor-name"><span id="sensor-name">Choose a sensor</span><span class="indoor-tag" id="detail-indoor" hidden>Indoor</span></p>
         <div class="aqi-row">
           <span class="aqi-number" id="aqi-number">—</span>
-          <div><span class="aqi-unit">US AQI</span><strong id="aqi-category">Unavailable</strong></div>
+          <div><span class="aqi-unit">US AQI</span><strong id="aqi-category">Unavailable</strong><small class="provenance-status" id="detail-provenance" hidden></small></div>
         </div>
         <section class="chart-card">
-          <div class="chart-heading"><div><span>Air quality trend</span><strong id="trend-direction">—</strong></div><span class="chart-period">Rolling averages</span></div>
+          <div class="chart-heading"><div><span>Air quality trend</span><strong id="trend-direction">—</strong></div><div class="chart-comparison"><span class="chart-period" id="chart-period">Rolling averages</span><button type="button" class="trend-retry" id="trend-retry" hidden>Retry</button></div></div>
           <div class="chart" id="chart"></div>
         </section>
         <section class="metrics-grid">
@@ -118,15 +122,16 @@
       <div class="attribution">© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors</div>
     </main>
 
-    <div class="toast-stack" id="toast-stack"></div>
+    <div class="visually-hidden" id="ui-status" role="status" aria-live="polite" aria-atomic="true"></div>
+    <div class="toast-stack" id="toast-stack" role="alert" aria-live="assertive" aria-atomic="true"></div>
 
-    <dialog id="settings-dialog" class="settings-dialog">
+    <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-intro">
       <form method="dialog" id="settings-form">
         <div class="dialog-heading">
-          <div><p class="eyebrow">AIRLOOM</p><h2>Preferences</h2></div>
+          <div><p class="eyebrow">AIRLOOM</p><h2 id="settings-title">Preferences</h2></div>
           <button class="icon-button" type="button" id="close-settings" aria-label="Close preferences">×</button>
         </div>
-        <p class="dialog-intro">Use demo readings immediately, or add your own PurpleAir read key for live public sensors.</p>
+        <p class="dialog-intro" id="settings-intro">Use demo readings immediately, or add your own PurpleAir read key for live public sensors.</p>
         <div class="form-grid">
           <label class="wide"><span>PurpleAir read key</span><input name="api_key" type="password" placeholder="Paste a new key"></label>
           <label class="checkbox wide"><input name="clear_api_key" type="checkbox"><span>Remove the saved key</span><small id="key-status">No key saved</small></label>
@@ -160,6 +165,8 @@
         <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
       </form>
     </dialog>
+    <script src="core.js"></script>
+    <script src="state.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

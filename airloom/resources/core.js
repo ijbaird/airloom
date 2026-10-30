@@ -32,6 +32,15 @@
     ];
   }
 
+  function boundsContain(outer, inner) {
+    const outerParts = splitBounds(outer);
+    const innerParts = splitBounds(inner);
+    return innerParts.every((part) => outerParts.some((candidate) => (
+      part.north <= candidate.north && part.south >= candidate.south
+      && part.west >= candidate.west && part.east <= candidate.east
+    )));
+  }
+
   function nearestLongitude(longitude, reference) {
     if (!Number.isFinite(reference)) throw new RangeError("reference must be finite");
     if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
@@ -72,5 +81,5 @@
     }).sort((a, b) => a.aqi - b.aqi);
   }
 
-  return { splitBounds, nearestLongitude, bandForAQI, summarySensors };
+  return { splitBounds, boundsContain, nearestLongitude, bandForAQI, summarySensors };
 });
