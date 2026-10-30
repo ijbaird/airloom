@@ -227,6 +227,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app._monitoring_ids = set()
         app.selected_id = None
         app.refreshing = False
+        app.active_fetch = None
         app.pending_fetch = None
         app.current_view = None
         app.view_bounds = None
@@ -652,6 +653,59 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             self.assertIsNot(replacement, pending)
             self.assertEqual(replacement.generation, pending.generation + 1)
             self.assertEqual(app.launched, [(replacement,)])
+
+    def _real_fetch_app(self, store):
+        app = self.make_app(store=store)
+        app.webview = object()
+        app._start_worker = mock.Mock(return_value=True)
+        app._start_fetch = lambda request: AirloomApplication._start_fetch(app, request)
+        app.sensors = [make_sensor(1)]
+        app._area_ids = {1}
+        return app
+
+    def test_favorite_reissue_preserves_active_manual_refresh_force(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.save()
+            app = self._real_fetch_app(store)
+            app._on_script_message(None, ScriptMessage({"action": "refresh"}))
+            self.assertEqual(app._start_worker.call_count, 1)
+
+            app._on_script_message(
+                None, ScriptMessage({"action": "favorite", "id": 1})
+            )
+
+            self.assertIsNotNone(app.pending_fetch)
+            self.assertTrue(app.pending_fetch.force)
+
+    def test_hide_reissue_preserves_queued_manual_refresh_force(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.save()
+            app = self._real_fetch_app(store)
+            app.refresh()
+            app._on_script_message(None, ScriptMessage({"action": "refresh"}))
+            queued = app.pending_fetch
+            self.assertTrue(queued.force)
+
+            app._on_script_message(None, ScriptMessage({"action": "hide", "id": 1}))
+            replacement = app.pending_fetch
+
+            self.assertIsNot(replacement, queued)
+            self.assertGreater(replacement.request_id, queued.request_id)
+            self.assertTrue(replacement.force)
+            self.assertEqual(app._start_worker.call_count, 1)
+
+    def test_reissue_after_unforced_work_stays_unforced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "config.json")
+            store.save()
+            app = self._real_fetch_app(store)
+            app.refresh()
+
+            app._on_script_message(None, ScriptMessage({"action": "hide", "id": 1}))
+
+            self.assertFalse(app.pending_fetch.force)
 
     def test_refresh_ensures_preserved_non_first_selection_trend(self):
         app = self.make_app()

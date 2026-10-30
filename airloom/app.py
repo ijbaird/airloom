@@ -454,6 +454,7 @@ class AirloomApplication(Adw.Application):
         self.selected_id: int | None = None
         self._trend_inflight: dict[int, tuple[RequestToken, int | None]] = {}
         self.refreshing = False
+        self.active_fetch: RefreshRequest | None = None
         self.pending_fetch: RefreshRequest | None = None
         self.locator: GeoClueLocator | None = None
         self._locator_focus_handler: int | None = None
@@ -529,6 +530,7 @@ class AirloomApplication(Adw.Application):
             self._shutting_down = True
 
         self.pending_fetch = None
+        self.active_fetch = None
         self.refreshing = False
         self.requests.invalidate()
         # The pure controller has its own refresh registry. Advancing the
@@ -1437,7 +1439,13 @@ class AirloomApplication(Adw.Application):
         """Keep active or queued refresh work authorized after display changes."""
         self.controller.set_config(self.store.data)
         if self.refreshing or self.pending_fetch is not None:
-            self.pending_fetch = self.controller.begin_refresh()
+            # The replacement supersedes both, so it inherits a manual
+            # Refresh's force intent from either of them.
+            force = any(
+                request is not None and request.force
+                for request in (self.active_fetch, self.pending_fetch)
+            )
+            self.pending_fetch = self.controller.begin_refresh(force=force)
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the current view, falling back to home before one exists."""
@@ -1474,6 +1482,7 @@ class AirloomApplication(Adw.Application):
             self.pending_fetch = request
             return
         self.refreshing = True
+        self.active_fetch = request
         bounds = cap_bounds(request.bounds, request.center)
         self._send("loading", {"active": True})
         config = dict(self.store.data)
@@ -1525,6 +1534,7 @@ class AirloomApplication(Adw.Application):
                     self._ensure_trend(self.selected_id)
         finally:
             self.refreshing = False
+            self.active_fetch = None
             self._send("loading", {"active": False})
             if self.pending_fetch is not None:
                 pending, self.pending_fetch = self.pending_fetch, None
