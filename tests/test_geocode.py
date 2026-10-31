@@ -551,6 +551,46 @@ class ReverseCacheTest(unittest.TestCase):
             self.assertEqual(client.reverse(45, -122), "Stubville")
         self.assertEqual(spy.call_count, 2)
 
+    def test_adapter_cancellation_caches_nothing_and_a_retry_succeeds(self):
+        class LookupCancelled(Exception):
+            pass
+
+        client, _ = make_geocoder()
+        events = record_network_path(client)
+        admitted_throttle = client._throttle
+        cancel = [True]
+
+        def cancelling_throttle():
+            # As app.py's adapter may, after any throttle wait.
+            admitted_throttle()
+            if cancel[0]:
+                cancel[0] = False
+                raise LookupCancelled()
+
+        client._throttle = cancelling_throttle
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response(self.payload)
+        ) as spy:
+            with self.assertRaises(LookupCancelled):
+                client.reverse(45, -122)
+            self.assertEqual(spy.call_count, 0)
+            self.assertEqual(len(client._reverse_cache), 0)
+            self.assertEqual(client.reverse(45, -122), "Stubville")
+            self.assertEqual(client.reverse(45, -122), "Stubville")
+        self.assertEqual(events, ["request", "throttle", "request", "throttle"])
+        self.assertEqual(spy.call_count, 1)
+
+    def test_empty_dict_fallback_is_cached(self):
+        client, _ = make_geocoder()
+        events = record_network_path(client)
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response({})
+        ) as spy:
+            self.assertEqual(client.reverse(45, -122), "45.00, -122.00")
+            self.assertEqual(client.reverse(45, -122), "45.00, -122.00")
+        self.assertEqual(events, ["request", "throttle"])
+        self.assertEqual(spy.call_count, 1)
+
     def test_concurrent_identical_reverse_misses_share_one_request(self):
         payload = {"address": {"city": "Shared"}}
         client, _ = make_geocoder()
