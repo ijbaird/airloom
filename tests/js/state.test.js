@@ -1099,12 +1099,20 @@ test("removing a focused row during refresh advances to the remaining row", () =
   assert.equal(app.document.activeElement, remaining);
 });
 
+// Keyed rows carry the sensor ID on the row; the older innerHTML-built list
+// carried it as data-id on the button (and the fake DOM only materialises its
+// buttons). Accepting both lets this regression reach its focus assertions
+// against either implementation.
+function hiddenUnhideButton(app, id) {
+  return app.elements.get("hidden-list").querySelectorAll(".unhide-button")
+    .find((button) => (button.parentNode.dataset.key ?? button.dataset.id) === String(id));
+}
+
 test("hidden list keeps focus through refreshes and Unhide moves to a successor", () => {
   const app = loadApp();
   configureMap(app);
   const publish = (hidden) => receiveSensors(app, [fixtureSensor(9)], { config: { hidden } });
-  const unhideButton = (id) => app.elements.get("hidden-list").querySelectorAll(".hidden-row")
-    .find((row) => row.dataset.key === String(id))?.querySelector(".unhide-button");
+  const unhideButton = (id) => hiddenUnhideButton(app, id);
   const [a, b, c] = [{ id: 1, name: "A" }, { id: 2, name: "B" }, { id: 3, name: "C" }];
   publish([a, b, c]);
   openSettings(app);
@@ -1135,7 +1143,7 @@ test("hidden list stays enabled in preview and Unhide all hands focus to Close",
   receiveSensors(app, [fixtureSensor(9)], { config: { hidden: [{ id: 1, name: "A" }] } });
   openSettings(app);
   const unhideAll = app.elements.get("unhide-all");
-  assert.equal(app.elements.get("hidden-list").querySelector(".unhide-button").disabled, false);
+  assert.equal(hiddenUnhideButton(app, 1).disabled, false);
   assert.equal(unhideAll.disabled, false);
   unhideAll.focus();
 
