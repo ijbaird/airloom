@@ -296,6 +296,23 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         self.assertTrue({320, 375} <= widths)
         for state in ("search", "popup", "settings", "shell"):
             self.assertIn(state, self.script.LAYOUT_STATES_JS)
+        self.assertEqual(self.script.LAYOUT_THEMES, ("light", "dark"))
+        self.assertIn("detail", self.script.LAYOUT_STATES_JS)
+        cases = {(c["mode"], c["width"], c["scale"], c["theme"]) for c in self.script.layout_cases()}
+        for mode in ("desktop", "preview"):
+            for scale in self.script.SCALES:
+                for width in widths:
+                    self.assertIn((mode, width, scale, "light"), cases)
+                for width in (320, 375):
+                    self.assertIn((mode, width, scale, "dark"), cases)
+        self.assertIn("escaped", self.script.LAYOUT_MEASURE_JS)
+        self.assertIn("prefers-color-scheme: dark", self.script.LAYOUT_MEASURE_JS)
+        # The populated fixed-home search runs on desktop cases, including the
+        # narrowest width at the widest scale in both themes.
+        self.assertIn("home-place-input", self.script.HOME_PLACE_SEARCH_JS)
+        self.assertIn("home-place-results", self.script.HOME_PLACE_SEARCH_MEASURE_JS)
+        for theme in self.script.LAYOUT_THEMES:
+            self.assertIn(("desktop", 320, max(self.script.SCALES), theme), cases)
 
     def test_script_never_kills_by_name(self):
         source = SCRIPT.read_text(encoding="utf-8")

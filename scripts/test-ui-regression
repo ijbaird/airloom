@@ -54,6 +54,7 @@ SCALES = (1.0, 1.25, 1.5)
 # (window width, height) in device pixels; 320 and 375 are the widths whose
 # scaled search control previously overflowed (365.5px and 438px).
 LAYOUT_SIZES = ((320, 640), (375, 700), (1280, 800))
+LAYOUT_THEMES = ("light", "dark")
 
 # Stub geocoder responses. Each query maps to (delay seconds, results).
 GEOCODER_RESPONSES = {
@@ -1309,13 +1310,34 @@ LAYOUT_MEASURE_JS = r"""
     }
   }
   const clipped = [];
-  for (const selector of [".search-overlay", ".search-pill", ".summary-chip", ".corner-buttons", ".map-popup", ".settings-dialog", ".shell-status"]) {
+  const shown = (el) => el && !el.closest("[hidden]") && el.getBoundingClientRect().width;
+  for (const selector of [".search-overlay", ".search-pill", ".summary-chip", ".summary-copy", ".corner-buttons", ".map-popup",
+                          ".detail-card", ".aqi-row", ".settings-dialog", ".shell-status"]) {
     const el = document.querySelector(selector);
-    if (!el || el.closest("[hidden]") || !el.getBoundingClientRect().width) continue;
+    if (!shown(el)) continue;
     if (el.scrollWidth > el.clientWidth + 1) clipped.push(`${selector} ${el.scrollWidth}>${el.clientWidth}`);
+  }
+  // Content may be clipped by an ancestor without scrolling it: every visible
+  // descendant must also sit inside its overlay's box.
+  const escaped = [];
+  for (const selector of [".summary-chip", ".detail-card", ".map-popup", ".sensors-panel"]) {
+    const container = document.querySelector(selector);
+    if (!shown(container)) continue;
+    const box = container.getBoundingClientRect();
+    for (const el of container.querySelectorAll("*")) {
+      if (el.closest(".visually-hidden") || el.closest("[hidden]")) continue;
+      const style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") continue;
+      const rect = el.getBoundingClientRect();
+      if (!rect.width || !rect.height) continue;
+      if (rect.left < box.left - 0.5 || rect.right > box.right + 0.5) {
+        escaped.push(`${selector} ${describe(el)} [${rect.left.toFixed(1)}, ${rect.right.toFixed(1)}] outside [${box.left.toFixed(1)}, ${box.right.toFixed(1)}]`);
+      }
+    }
   }
   const input = document.querySelector("#search").getBoundingClientRect();
   return JSON.stringify({
+    theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
     viewport: width,
     scrollWidth: document.documentElement.scrollWidth,
     cssScale: getComputedStyle(document.documentElement).getPropertyValue("--interface-scale").trim(),
@@ -1324,6 +1346,7 @@ LAYOUT_MEASURE_JS = r"""
     searchInputWidth: input.width,
     overflow: overflow.slice(0, 12),
     clipped,
+    escaped: escaped.slice(0, 12),
   });
 })()
 """
@@ -1354,6 +1377,30 @@ LAYOUT_STATES_JS = {
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
       document.querySelector("#sensors-button").click();
       return "sensors";
+    })()""",
+    # The widest detail content: a three-digit AQI, a long sensor name with the
+    # indoor tag, a provenance badge and a long place name in the summary.
+    "detail": """(() => {
+      document.querySelector("#close-sensors").click();
+      const band = AirloomCore.bandForAQI(150);
+      const center = window.Airloom.debugState().center;
+      const sensor = { id: 990001, name: "Northeast Martin Luther King Junior Boulevard Community Garden Rooftop Monitor 3",
+        latitude: center.lat, longitude: center.lon, aqi: 150, category: band.label, color: band.color,
+        foreground: band.foreground, guidance: band.guidance, last_seen: Math.round(Date.now() / 1000) - 30,
+        delivery: "cache", indoor: true, favorite: true };
+      // The browser preview filters indoor sensors out of the list; show both
+      // while selecting, then restore the filter the later states expect.
+      const filter = window.Airloom.debugState().location_filter;
+      window.Airloom.receive("config", { location_filter: "both" });
+      window.Airloom.receive("sensors", { items: [sensor], area: [sensor], favorites: [], selected_id: 990001,
+        source: "PurpleAir · cached", stale: true });
+      window.Airloom.receive("view-name", { name: "Llanfairpwllgwyngyllgogerychwyrndrobwllllantysiliogogogoch, Isle of Anglesey, Wales" });
+      const row = document.querySelector("#sensor-list .sensor-row");
+      if (row) row.click();
+      window.Airloom.receive("config", { location_filter: filter });
+      const card = document.querySelector("#detail-card");
+      const visible = !card.hidden && card.getClientRects().length > 0;
+      return visible && document.querySelector("#detail-provenance").textContent === "Stale" ? "detail" : "no-detail";
     })()""",
     "settings": """(() => {
       document.querySelector("#close-sensors").click();
@@ -1390,6 +1437,58 @@ HOME_PLACE_ROW_JS = r"""
   choose("auto");
   out.autoAgain = shown();
   dialog.close();
+  return JSON.stringify(out);
+})()
+"""
+
+# Desktop only: types a fixed-home query and submits it; layout_child answers
+# the bridge's place-search with HOME_PLACE_RESULTS, never Nominatim.
+HOME_PLACE_SEARCH_JS = r"""
+(() => {
+  window.Airloom.receive("open-settings");
+  const radio = document.querySelector('#settings-form input[name="home_mode"][value="fixed"]');
+  radio.checked = true;
+  radio.dispatchEvent(new Event("change", { bubbles: true }));
+  const input = document.querySelector("#home-place-input");
+  input.focus();
+  input.value = "Llanfairpwllgwyngyll";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  return "submitted";
+})()
+"""
+
+HOME_PLACE_RESULTS = [
+    {"name": "Llanfairpwllgwyngyllgogerychwyrndrobwllllantysiliogogogoch, Isle of Anglesey, Wales, LL61 5UJ, United Kingdom",
+     "latitude": 53.2239, "longitude": -4.1979},
+    {"name": "Portland, Multnomah County, Oregon, United States", "latitude": 45.5152, "longitude": -122.6784},
+    {"name": "Portland, Cumberland County, Maine, United States", "latitude": 43.6591, "longitude": -70.2568},
+]
+
+HOME_PLACE_SEARCH_MEASURE_JS = r"""
+(() => {
+  const dialog = document.querySelector("#settings-dialog");
+  const input = document.querySelector("#home-place-input");
+  const results = document.querySelector("#home-place-results");
+  const box = (el) => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; };
+  const frame = box(dialog);
+  const escaped = [];
+  for (const el of [input, results, ...results.querySelectorAll("*")]) {
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    if (r.left < frame.left - 0.5 || r.right > frame.right + 0.5) {
+      escaped.push(`${el.id ? "#" + el.id : el.tagName.toLowerCase()} [${r.left.toFixed(1)}, ${r.right.toFixed(1)}] outside [${frame.left.toFixed(1)}, ${frame.right.toFixed(1)}]`);
+    }
+  }
+  const clipped = [];
+  for (const el of [dialog, results, ...results.querySelectorAll("button")]) {
+    if (el.scrollWidth > el.clientWidth + 1) clipped.push(`${el.id ? "#" + el.id : el.tagName.toLowerCase()} ${el.scrollWidth}>${el.clientWidth}`);
+  }
+  const out = {
+    open: dialog.open, value: input.value, resultsShown: !results.hidden && results.getClientRects().length > 0,
+    results: results.querySelectorAll("button").length, input: box(input), dropdown: box(results),
+    escaped, clipped, theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+  };
   return JSON.stringify(out);
 })()
 """
@@ -1545,7 +1644,7 @@ def layout_child(cases: list[dict]) -> int:
     # same process was never given a size under a headless compositor.
     # WebKitGTK derives prefers-color-scheme from GTK, which otherwise follows
     # the host's portal preference; pin it so "light" cases really are light.
-    dark = any(case.get("theme") == "dark" for case in cases)
+    dark = any(case["theme"] == "dark" for case in cases)
     settings = Gtk.Settings.get_default()
     if settings.find_property("gtk-interface-color-scheme"):
         scheme = Gtk.InterfaceColorScheme.DARK if dark else Gtk.InterfaceColorScheme.LIGHT
@@ -1574,6 +1673,11 @@ def layout_child(cases: list[dict]) -> int:
                         json.dumps({"items": sensors, "area": sensors, "favorites": [],
                                     "source": "Demo data", "config": config}))
                     holder_view[0].evaluate_javascript(script, -1, None, None, None, None, None)
+                elif message.get("action") == "place-search" and message.get("context") == "home":
+                    reply = {"request_id": message["request_id"], "context": "home", "query": message["query"],
+                             "results": HOME_PLACE_RESULTS}
+                    holder_view[0].evaluate_javascript("window.Airloom.receive('places', %s);" % json.dumps(reply),
+                                                       -1, None, None, None, None, None)
 
             holder_view = [webview]
             manager.connect("script-message-received::airloom", on_message)
@@ -1603,14 +1707,23 @@ def layout_child(cases: list[dict]) -> int:
         if mode == "preview":
             run_js(webview, "window.Airloom.receive('config', {interface_scale: %s}); 'ok'" % scale)
         pump(0.3)
+        # The page reports its own theme as "theme"; keep the requested one apart.
+        requested = {**case, "case_theme": case["theme"]}
         for name, script in LAYOUT_STATES_JS.items():
             outcome = run_js(webview, script)
             pump(0.3)
             measured = json.loads(run_js(webview, LAYOUT_MEASURE_JS))
-            print(json.dumps({**case, "state": name, "outcome": outcome, **measured}), flush=True)
+            print(json.dumps({**requested, "state": name, "outcome": outcome, **measured}), flush=True)
         home_row = json.loads(run_js(webview, HOME_PLACE_ROW_JS))
         pump(0.2)
-        print(json.dumps({**case, "state": "home-place-row", "homeRow": home_row}), flush=True)
+        print(json.dumps({**requested, "state": "home-place-row", "homeRow": home_row}), flush=True)
+        if mode == "desktop":
+            run_js(webview, HOME_PLACE_SEARCH_JS)
+            pump(0.5)
+            search = json.loads(run_js(webview, HOME_PLACE_SEARCH_MEASURE_JS))
+            run_js(webview, 'document.querySelector("#settings-dialog").close(); "ok"')
+            pump(0.2)
+            print(json.dumps({**requested, "state": "home-place-search", "homeSearch": search}), flush=True)
         if mode == "preview":
             # Computed style alone can't prove a native control renders it:
             # sample the painted background of each Preferences field.
@@ -1623,23 +1736,35 @@ def layout_child(cases: list[dict]) -> int:
             pump(0.2)
             actions = json.loads(run_js(webview, PREVIEW_ACTIONS_JS))
             actions["rendered"] = rendered
-            print(json.dumps({**case, "state": "preview-actions", "actions": actions}), flush=True)
+            print(json.dumps({**requested, "state": "preview-actions", "actions": actions}), flush=True)
         window.set_child(None)
         pump(0.1)
     window.destroy()
     return 0
 
 
-def scenario_layouts(root: Path):
-    print("— popup/search/settings/shell layouts at every scale, desktop zoom and preview CSS —")
+def layout_cases() -> list[dict]:
+    """Every size at every scale in light, and the narrow sizes again in dark."""
     cases = [
-        {"mode": mode, "width": width, "height": height, "scale": scale}
+        {"mode": mode, "width": width, "height": height, "scale": scale, "theme": "light"}
         for mode in ("desktop", "preview")
         for width, height in LAYOUT_SIZES
         for scale in SCALES
     ]
-    # One dark-theme preview case covers the color-scheme-dependent checks.
+    cases += [
+        {"mode": mode, "width": width, "height": height, "scale": scale, "theme": "dark"}
+        for mode in ("desktop", "preview")
+        for width, height in LAYOUT_SIZES if width in (320, 375)
+        for scale in SCALES
+    ]
+    # The wide dark preview keeps the color-scheme checks at desktop width.
     cases.append({"mode": "preview", "width": 1280, "height": 800, "scale": 1.0, "theme": "dark"})
+    return cases
+
+
+def scenario_layouts(root: Path):
+    print("— popup/search/detail/settings/shell layouts at every scale and theme, desktop zoom and preview CSS —")
+    cases = layout_cases()
     env = {**os.environ, "XDG_CONFIG_HOME": str(root / "layout-config"),
            "XDG_CACHE_HOME": str(root / "layout-cache"), "NO_AT_BRIDGE": "1"}
     rows = []
@@ -1672,8 +1797,23 @@ def scenario_layouts(root: Path):
             problems.append(message)
 
     for row in rows:
-        theme_label = " dark" if row.get("theme") == "dark" else ""
-        label = f"{row['mode']} {row['width']}px at {row['scale']}x{theme_label} [{row['state']}]"
+        theme = row["case_theme"]
+        label = f"{row['mode']} {row['width']}px at {row['scale']}x {theme} [{row['state']}]"
+        if row["state"] == "home-place-search":
+            search = row["homeSearch"]
+            expect(search["open"] and search["resultsShown"] and search["results"] == len(HOME_PLACE_RESULTS),
+                   f"{label}: typed fixed-home search shows its {len(HOME_PLACE_RESULTS)} stubbed results ({search['results']})")
+            expect(search["theme"] == theme, f"{label}: Preferences renders the {theme} color scheme ({search['theme']})")
+            expect(not search["escaped"], f"{label}: home search input and results stay inside Preferences {search['escaped']}")
+            expect(not search["clipped"], f"{label}: neither Preferences nor the home search results are clipped {search['clipped']}")
+            field, dropdown = search["input"], search["dropdown"]
+            expect(field["right"] - field["left"] >= 120,
+                   f"{label}: populated home search input stays usable ({field['right'] - field['left']:.0f}px)")
+            # Directly under: aligned with the input, with no row in between.
+            expect(abs(dropdown["left"] - field["left"]) <= 1 and abs(dropdown["right"] - field["right"]) <= 1
+                   and 0 <= dropdown["top"] - field["bottom"] <= 16,
+                   f"{label}: results sit directly under the home search input (input {field}, results {dropdown})")
+            continue
         if row["state"] == "home-place-row":
             home_row = row["homeRow"]
             expect(home_row["mode"] == "auto", f"{label}: Preferences opens in automatic location mode")
@@ -1692,7 +1832,6 @@ def scenario_layouts(root: Path):
             expect(actions["unsupportedDisabled"] is True,
                    f"{label}: preview disables radius, refresh, alert, confidence and home settings")
             expect(actions["noteVisible"] is True, f"{label}: preview explains its disabled settings")
-            theme = row.get("theme", "light")
             expect(actions["dark"] is (theme == "dark"), f"{label}: page renders the {theme} color scheme")
             look = actions["disabledLook"]
             for name, enabled_name in (("radius", "enabledNumber"), ("alert", "enabledNumber"),
@@ -1725,11 +1864,13 @@ def scenario_layouts(root: Path):
         expected_css = "1" if row["mode"] == "desktop" else ("%g" % row["scale"])
         expect(row["cssScale"] == expected_css and float(row["configuredScale"]) == row["scale"],
                f"{label}: interface scale applied once (css {row['cssScale']})")
-        expect(row["outcome"] not in ("no-marker", "no-popup", "no-results"), f"{label}: state reached ({row['outcome']})")
+        expect(row["theme"] == row["case_theme"], f"{label}: page renders the requested {theme} color scheme ({row['theme']})")
+        expect(row["outcome"] not in ("no-marker", "no-popup", "no-results", "no-detail"), f"{label}: state reached ({row['outcome']})")
         # innerWidth is rounded down at fractional zoom (853.33 -> 853), so allow 1px.
         expect(row["scrollWidth"] <= row["viewport"] + 1, f"{label}: document fits {row['viewport']}px ({row['scrollWidth']}px)")
         expect(not row["overflow"], f"{label}: nothing extends past the {row['viewport']}px viewport {row['overflow']}")
         expect(not row["clipped"], f"{label}: no clipped overlay content {row['clipped']}")
+        expect(not row["escaped"], f"{label}: overlay content stays inside its container {row['escaped']}")
         expect(row["searchInputWidth"] >= 40, f"{label}: search input stays usable ({row['searchInputWidth']:.0f}px)")
     if problems:
         raise AssertionError(f"{len(problems)} layout check(s) failed; first: {problems[0]}")
