@@ -28,9 +28,9 @@ except (ImportError, ValueError):
     from airloom import app as app_module
 
 try:
-    from tests.test_app_requests import IdleQueue, ThreadQueue
+    from tests.test_app_requests import IdleQueue, RealStoreMixin, ThreadQueue
 except ImportError:
-    from test_app_requests import IdleQueue, ThreadQueue
+    from test_app_requests import IdleQueue, RealStoreMixin, ThreadQueue
 
 from airloom import controller as controller_module
 from airloom.app import AirloomApplication
@@ -121,6 +121,11 @@ class FakeStore:
             **updates,
         }
         self.saves = 0
+        self.flushes = []
+
+    def flush(self, timeout):
+        self.flushes.append(timeout)
+        return True
 
     def hidden_ids(self):
         return {int(key) for key in self.data["hidden"]}
@@ -213,7 +218,7 @@ class ScriptMessage:
         return json.dumps(self.message)
 
 
-class ApplicationAdapterTestCase(unittest.TestCase):
+class ApplicationAdapterTestCase(RealStoreMixin, unittest.TestCase):
     def make_app(self, store=None, cache=None):
         app = AirloomApplication.__new__(AirloomApplication)
         app.store = store or FakeStore()
@@ -763,8 +768,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         self.assertEqual(app._start_worker.call_count, 1)
 
     def test_favorite_change_reissues_active_refresh_under_committed_config(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self.make_app(store=store)
             app.sensors = [make_sensor(1)]
@@ -785,8 +790,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             self.assertEqual(app.launched, [(replacement,)])
 
     def test_hide_change_replaces_pending_refresh_under_committed_config(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self.make_app(store=store)
             app.sensors = [make_sensor(1)]
@@ -816,8 +821,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         return app
 
     def test_favorite_reissue_preserves_active_manual_refresh_force(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self._real_fetch_app(store)
             app._on_script_message(None, ScriptMessage({"action": "refresh"}))
@@ -831,8 +836,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             self.assertTrue(app.pending_fetch.force)
 
     def test_hide_reissue_preserves_queued_manual_refresh_force(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self._real_fetch_app(store)
             app.refresh()
@@ -849,8 +854,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             self.assertEqual(app._start_worker.call_count, 1)
 
     def test_reissue_after_unforced_work_stays_unforced(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self._real_fetch_app(store)
             app.refresh()
@@ -905,8 +910,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
-                store = Store(Path(directory) / "config.json")
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
+                store = self.real_store(Path(directory) / "config.json")
                 store.data.update({"favorites": [1], "alert_states": {"1": False}})
                 store.save()
                 previous = deepcopy(store.data)
@@ -1207,9 +1212,9 @@ class MotionPreferenceAdapterTest(ApplicationAdapterTestCase):
 class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
     def test_all_supported_scales_persist_and_apply_to_the_webview(self):
         for scale in (1.0, 1.25, 1.5):
-            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(scale=scale), self.settings_directory() as directory:
                 path = Path(directory) / "config.json"
-                store = Store(path)
+                store = self.real_store(path)
                 starting_scale = 1.5 if scale == 1.0 else 1.0
                 store.data["interface_scale"] = starting_scale
                 store.save()
@@ -1237,9 +1242,9 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
     def test_save_accepts_interface_size_numbers_from_the_selector(self):
         # JSON turns the selector's 100% (Number 1) into a Python int.
         for sent, expected in ((1, 1.0), (1.25, 1.25), (1.5, 1.5), ("1.25", 1.25)):
-            with self.subTest(sent=sent), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(sent=sent), self.settings_directory() as directory:
                 path = Path(directory) / "config.json"
-                store = Store(path)
+                store = self.real_store(path)
                 store.data["interface_scale"] = 1.5 if expected != 1.5 else 1.0
                 store.save()
                 app = self.make_app(store=store)
@@ -1260,9 +1265,9 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(app.webview.zoom_level, expected)
 
     def test_save_rejects_unsupported_interface_size(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with self.settings_directory() as directory:
             path = Path(directory) / "config.json"
-            store = Store(path)
+            store = self.real_store(path)
             store.data["interface_scale"] = 1.25
             store.save()
             app = self.make_app(store=store)
@@ -1353,8 +1358,8 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
 
 class FilterSaveFailureTest(ApplicationAdapterTestCase):
     def test_failed_filter_save_keeps_publication_and_alerts_on_saved_filter(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.data.update({"favorites": [1, 2], "alert_states": {}})
             store.save()
             app = self.make_app(store=store)

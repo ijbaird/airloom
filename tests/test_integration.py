@@ -668,6 +668,8 @@ class CachedFallbackAlertIntegrationTest(unittest.TestCase):
         root = Path(self._tempdir.name)
         self.fixture = root / "purpleair.json"
         self.store = Store(root / "config.json")
+        # Cleanups run last-in first-out: drain its sync worker before cleanup.
+        self.addCleanup(self.store.flush, 5)
         self.store.data.update({
             "api_key": "fake-key", "latitude": 45.0, "longitude": -122.0,
             "favorites": [1, 2, 3, 900000], "alert_threshold": 101,

@@ -12,6 +12,7 @@ import threading
 import time
 import types
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ except (ImportError, ValueError):
     from airloom import app as app_module
 
 from airloom import geocode as geocode_module
+from airloom import store as store_module
 from airloom.app import AirloomApplication
 from airloom.cache import CacheError, SensorCache
 from airloom.controller import ApplicationController
@@ -37,7 +39,7 @@ from airloom.geocode import Place
 from airloom.models import Sensor
 from airloom.purpleair import FetchResult, PurpleAirError
 from airloom.requests import RequestRegistry
-from airloom.store import Store
+from airloom.store import SYNC_THREAD_NAME, SettingsDurabilityError, Store
 
 
 CONFIG = {
@@ -77,6 +79,12 @@ class FakeStore:
     def __init__(self, **updates):
         self.data = {**CONFIG, **updates}
         self.saves = 0
+        self.flushes = []
+        self.flush_result = True
+
+    def flush(self, timeout):
+        self.flushes.append(timeout)
+        return self.flush_result
 
     def apply(self, candidate):
         self.saves += 1
@@ -166,9 +174,11 @@ class ThreadQueue:
 class IdleQueue:
     def __init__(self):
         self.callbacks = []
+        self.threads = []
 
     def add(self, callback, *args):
         self.callbacks.append((callback, args))
+        self.threads.append(threading.current_thread())
         return len(self.callbacks)
 
     def run(self, index):
@@ -176,7 +186,28 @@ class IdleQueue:
         return callback(*args)
 
 
-class ApplicationRequestTestCase(unittest.TestCase):
+class RealStoreMixin:
+    """Real Stores drain their settings-sync worker before their temporary
+    directory is removed, so no worker outlives a test or syncs a deleted
+    directory."""
+
+    @contextmanager
+    def settings_directory(self):
+        self._real_stores = []
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                yield directory
+            finally:
+                for store in self._real_stores:
+                    store.flush(5)
+
+    def real_store(self, path):
+        store = Store(path)
+        self._real_stores.append(store)
+        return store
+
+
+class ApplicationRequestTestCase(RealStoreMixin, unittest.TestCase):
     def make_app(self, *, sensors=(), home_mode="auto"):
         app = AirloomApplication.__new__(AirloomApplication)
         app.store = FakeStore(home_mode=home_mode)
@@ -215,6 +246,15 @@ class ApplicationRequestTestCase(unittest.TestCase):
         app._refresh_home = lambda *args, **_kwargs: app.refreshed_homes.append(args)
         app._arm_auto_refresh = lambda: None
         app.refresh = lambda *args, **_kwargs: None
+        return app
+
+    def make_real_store_app(self, directory, *, sensors=()):
+        app = self.make_app(sensors=sensors)
+        # Wired as in AirloomApplication.__init__.
+        app.store = self.real_store(Path(directory) / "config.json")
+        app.store.on_durability_error = app._on_settings_durability_error
+        app.store.save()
+        self.assertTrue(app.store.flush(5))
         return app
 
     def trend_events(self, app):
@@ -1054,12 +1094,6 @@ class LocationModeRequestTest(ApplicationRequestTestCase):
 
 
 class TransactionalActionTest(ApplicationRequestTestCase):
-    def make_real_store_app(self, directory, *, sensors=()):
-        app = self.make_app(sensors=sensors)
-        app.store = Store(Path(directory) / "config.json")
-        app.store.save()
-        return app
-
     @staticmethod
     def capture_os_error(callback):
         try:
@@ -1090,7 +1124,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 app = self.make_real_store_app(directory)
                 path = app.store.path
                 previous = deepcopy(app.store.data)
@@ -1122,7 +1156,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 app = self.make_real_store_app(directory)
                 previous = deepcopy(app.store.data)
                 threads = ThreadQueue()
@@ -1162,7 +1196,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 app = self.make_real_store_app(directory)
                 app.store.data.update({"latitude": 10.0, "longitude": 20.0})
                 app.store.save()
@@ -1196,7 +1230,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
                 self.assertIn(str(failure), errors[0])
 
     def test_successful_settings_save_publishes_config_and_matching_success(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with self.settings_directory() as directory:
             app = self.make_real_store_app(directory)
 
             app._save_settings(self.settings_message())
@@ -1223,7 +1257,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 sensor = make_sensor(1)
                 app = self.make_real_store_app(directory, sensors=[sensor])
                 with mock.patch.object(app.store, "_write", side_effect=failure):
@@ -1254,7 +1288,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 sensor = make_sensor(1)
                 app = self.make_real_store_app(directory, sensors=[sensor])
                 with mock.patch.object(app.store, "_write", side_effect=failure):
@@ -1342,7 +1376,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
         )
         for action in ("unhide", "unhide-all"):
             for failure in failures:
-                with self.subTest(action=action, error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(action=action, error=failure.errno), self.settings_directory() as directory:
                     app = self.make_real_store_app(directory)
                     app.store.data["hidden"] = {"1": "Sensor 1"}
                     app.store.save()
@@ -1375,7 +1409,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 app = self.make_real_store_app(directory)
                 refreshes = []
                 app.refresh = lambda *args, **_kwargs: refreshes.append(args)
@@ -1402,6 +1436,115 @@ class TransactionalActionTest(ApplicationRequestTestCase):
                 self.assertIn("try again", errors[0].lower())
 
 
+class SettingsDurabilityWarningTest(ApplicationRequestTestCase):
+    settings_message = staticmethod(TransactionalActionTest.settings_message)
+
+    @staticmethod
+    def error_messages(app):
+        return [payload["message"] for event, payload in app.sent if event == "error"]
+
+    @staticmethod
+    def record_send_threads(app):
+        threads = []
+        send = app._send
+
+        def recording_send(event, payload):
+            threads.append((event, threading.current_thread()))
+            send(event, payload)
+
+        app._send = recording_send
+        return threads
+
+    def failing_directory_sync(self):
+        return mock.patch.object(
+            store_module, "_fsync_directory", side_effect=OSError(errno.EIO, "I/O error")
+        )
+
+    def assert_one_main_loop_warning(self, app, idles, send_threads):
+        # The worker only queues the warning; nothing is sent until the main
+        # loop runs the idle callback.
+        self.assertEqual(self.error_messages(app), [])
+        self.assertEqual(len(idles.callbacks), 1)
+        self.assertEqual(idles.threads[0].name, SYNC_THREAD_NAME)
+        idles.run(0)
+        errors = self.error_messages(app)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("could not confirm", errors[0])
+        self.assertFalse(errors[0].startswith("Could not save"))
+        self.assertEqual(
+            [thread for event, thread in send_threads if event == "error"],
+            [threading.main_thread()],
+        )
+
+    def test_settings_durability_failure_acknowledges_success_and_toasts_from_main_loop(self):
+        with self.settings_directory() as directory:
+            app = self.make_real_store_app(directory)
+            send_threads = self.record_send_threads(app)
+            idles = IdleQueue()
+            with (
+                self.failing_directory_sync(),
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            ):
+                app._save_settings(self.settings_message())
+                self.assertFalse(app.store.flush(5))
+
+            results = [
+                payload for event, payload in app.sent if event == "settings-save-result"
+            ]
+            self.assertEqual(
+                results, [{"request_id": "settings-17", "status": "success", "error": None}]
+            )
+            self.assertIn("config", [event for event, _payload in app.sent])
+            self.assertEqual(app.store.data["location_name"], "Pinned home")
+            self.assertEqual(Store(app.store.path).data["location_name"], "Pinned home")
+            self.assert_one_main_loop_warning(app, idles, send_threads)
+
+    def test_favorite_durability_failure_applies_favorite_and_toasts_once(self):
+        with self.settings_directory() as directory:
+            sensor = make_sensor(1)
+            app = self.make_real_store_app(directory, sensors=[sensor])
+            send_threads = self.record_send_threads(app)
+            idles = IdleQueue()
+            with (
+                self.failing_directory_sync(),
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            ):
+                app._on_script_message(None, ScriptMessage({"action": "favorite", "id": 1}))
+                self.assertFalse(app.store.flush(5))
+
+            self.assertEqual(app.store.data["favorites"], [1])
+            self.assertEqual(Store(app.store.path).data["favorites"], [1])
+            self.assertTrue(sensor.favorite)
+            self.assert_one_main_loop_warning(app, idles, send_threads)
+
+    def test_blocked_directory_sync_leaves_the_main_loop_responsive(self):
+        release = threading.Event()
+        with self.settings_directory() as directory:
+            app = self.make_real_store_app(directory)
+            idles = IdleQueue()
+            with (
+                mock.patch.object(
+                    store_module, "_fsync_directory", side_effect=lambda _path: release.wait(5)
+                ),
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            ):
+                started = time.monotonic()
+                try:
+                    app._save_settings(self.settings_message())
+                    elapsed = time.monotonic() - started
+                finally:
+                    release.set()
+                self.assertTrue(app.store.flush(5))
+
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(
+                [payload for event, payload in app.sent if event == "settings-save-result"],
+                [{"request_id": "settings-17", "status": "success", "error": None}],
+            )
+            self.assertEqual(idles.callbacks, [])
+            self.assertEqual(self.error_messages(app), [])
+
+
 class BridgeSensorIdTest(ApplicationRequestTestCase):
     SAFE_MAX = 2**53 - 1
     INVALID = (
@@ -1426,10 +1569,10 @@ class BridgeSensorIdTest(ApplicationRequestTestCase):
         for action in ("select", "favorite", "hide", "unhide"):
             for value in self.INVALID:
                 with self.subTest(action=action, value=value):
-                    with tempfile.TemporaryDirectory() as directory:
+                    with self.settings_directory() as directory:
                         sensor = make_sensor(1)
                         app = self.make_app(sensors=[sensor])
-                        app.store = Store(Path(directory) / "config.json")
+                        app.store = self.real_store(Path(directory) / "config.json")
                         app.store.data["hidden"] = {"1": "Sensor 1"}
                         app.store.save()
                         previous = deepcopy(app.store.data)
@@ -1490,6 +1633,57 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
         self.assertIsNone(app._locator_focus_fallback)
         self.assertIsNone(app.pending_fetch)
         self.assertFalse(app.refreshing)
+
+    def test_shutdown_flushes_settings_once_with_a_bounded_timeout_before_cache_close(self):
+        app = self.make_app()
+        order = []
+        flush = app.store.flush
+
+        def recording_flush(timeout):
+            # No transaction can persist once shutdown has begun.
+            order.append(("flush", app._shutting_down))
+            return flush(timeout)
+
+        app.store.flush = recording_flush
+        app.cache.close = lambda: order.append(("close", app._shutting_down))
+
+        app._on_shutdown()
+        app._on_shutdown()
+
+        self.assertEqual(order, [("flush", True), ("close", True)])
+        self.assertEqual(len(app.store.flushes), 1)
+        self.assertGreater(app.store.flushes[0], 0)
+        self.assertLessEqual(app.store.flushes[0], 2.0)
+
+    def test_unconfirmed_settings_at_shutdown_print_one_line(self):
+        app = self.make_app()
+        app.store.flush_result = False
+
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr:
+            app._on_shutdown()
+
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("settings", lines[0].lower())
+
+    def test_durability_warning_after_shutdown_begins_sends_nothing(self):
+        error = SettingsDurabilityError(
+            "Settings were saved, but the system could not confirm they reached "
+            "the disk: [Errno 5] I/O error",
+            deepcopy(CONFIG),
+        )
+        app = self.make_app()
+        idles = IdleQueue()
+        with mock.patch.object(app_module.GLib, "idle_add", new=idles.add):
+            # Queued before shutdown, delivered after it began.
+            app._on_settings_durability_error(error)
+            app._on_shutdown()
+            # Reported after shutdown began.
+            app._on_settings_durability_error(error)
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+
+        self.assertEqual([event for event, _payload in app.sent if event == "error"], [])
 
     def test_shutdown_rejects_new_work_and_invalidates_old_callbacks(self):
         sensor = make_sensor(1)

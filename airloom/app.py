@@ -70,7 +70,7 @@ from .purpleair import (
     trend_from_values,
 )
 from .requests import RequestRegistry, RequestToken
-from .store import Store
+from .store import SettingsDurabilityError, Store
 from .validation import bridge_sensor_id
 
 # How long a debug-port `eval` command waits for evaluate_javascript to
@@ -90,6 +90,8 @@ LOCATOR_FOCUS_FALLBACK_SECONDS = 20
 # Concurrent trend workers (cache read, then any paid fetch); a selection past
 # the limit ends in a terminal error the user can Retry.
 TREND_WORKER_LIMIT = 4
+# How long shutdown waits for settings saves to be confirmed durable.
+SETTINGS_FLUSH_TIMEOUT_SECONDS = 2.0
 
 
 class _PlaceSearchSuperseded(Exception):
@@ -457,7 +459,7 @@ class AirloomApplication(Adw.Application):
         self._debug_build_id: str | None = self._compute_build_id() if self.debug_mode else None
         self._captured_notifications: list[dict] | None = None
         self._install_debug_fakes(os.environ)
-        self.store = Store()
+        self.store = Store(on_durability_error=self._on_settings_durability_error)
         self.requests = RequestRegistry()
         self.controller = self._new_controller()
         self._worker_lock = threading.Lock()
@@ -616,7 +618,24 @@ class AirloomApplication(Adw.Application):
         if self._debug_port is not None:
             self._debug_port.stop()
             self._debug_port = None
+        # Nothing persists settings once shutdown has begun, so this is the
+        # last chance to confirm the final save reached the disk.
+        if not self.store.flush(SETTINGS_FLUSH_TIMEOUT_SECONDS):
+            print(
+                "Airloom: could not confirm the last settings save reached the disk",
+                file=sys.stderr,
+            )
         self._close_cache_if_drained()
+
+    def _on_settings_durability_error(self, error: SettingsDurabilityError) -> None:
+        # Runs on the store's sync worker: hand the warning to the main loop.
+        GLib.idle_add(self._report_settings_durability_error, str(error))
+
+    def _report_settings_durability_error(self, message: str) -> bool:
+        # The save itself succeeded; this is a toast, not a failed save.
+        if not self._shutting_down:
+            self._send("error", {"message": message})
+        return GLib.SOURCE_REMOVE
 
     def _on_activate(self, _application) -> None:
         if self._shutting_down:
