@@ -1029,3 +1029,28 @@ class OfflineFavoriteCoverageTest(CacheBase):
     def test_expired_incoming_row_is_not_reported_unknown(self):
         self.clock.now = 200000.0
         self.assertEqual(self.cache.upsert_rows([row(98, lat=None, last_seen=1)]), [])
+
+    def test_expired_coordinate_less_delta_rows_request_no_metadata(self):
+        self.clock.now = 200000.0
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(1, last_seen=200000)], 200000)
+        expired = {"sensor_index": 50, "last_seen": 200000 - 2 * 86400, "pm2.5_cf_1": 9.0}
+        client = FakeClient([
+            FetchResult([expired], 200300),
+            FetchResult([expired], 200600),
+            FetchResult([expired, {"sensor_index": 51, "last_seen": 200900,
+                                   "pm2.5_cf_1": 7.0}], 200900),
+            FetchResult([row(51, lat=45.52, last_seen=200900)], 200900),
+        ])
+        for _ in range(3):
+            self.clock.now += 300
+            area = cache.fetch_area(client, self.cache, bounds, "outdoor", ttl=120)
+            self.assertTrue(area.polled)
+            self.assertIsNotNone(self.cache.covering_region(bounds, "outdoor"))
+
+        self.assertEqual(
+            [c["modified_since"] for c in client.calls if "modified_since" in c],
+            [200000, 200300, 200600])
+        self.assertEqual(
+            [c["show_only"] for c in client.calls if "show_only" in c], [[51]])
+        self.assertEqual(sorted(r["sensor_index"] for r in area.rows), [1, 51])

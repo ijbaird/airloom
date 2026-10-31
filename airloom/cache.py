@@ -101,6 +101,18 @@ def _coordinates(values: dict) -> tuple[float, float] | None:
     return latitude, longitude
 
 
+def _observed_at(merged: dict, stored_observed_at: float | None, now: float) -> float:
+    """When a merged row was observed; its last_seen must already be validated."""
+    last_seen = _integer(merged.get("last_seen"))
+    if last_seen is not None:
+        return float(last_seen)
+    return float(stored_observed_at) if stored_observed_at is not None else now
+
+
+def _already_expired(merged: dict, stored_observed_at: float | None, now: float) -> bool:
+    return _observed_at(merged, stored_observed_at, now) < now - SENSOR_MAX_AGE
+
+
 class SensorCache:
     def __init__(self, path: Path | None = None, clock=time.time,
                  busy_timeout: float = 5.0):
@@ -188,10 +200,13 @@ class SensorCache:
                 raise
 
     def unknown_rows(self, rows: list[dict]) -> list[int]:
-        """Return delta IDs that need full metadata, without staging writes."""
+        """Return delta IDs that need full metadata, without staging writes.
+        Rows the cache would discard as already expired never need metadata."""
         with self._lock:
+            now = self.clock()
             order: list[int] = []
             merged_by_id: dict[int, dict] = {}
+            stored_observed_at: dict[int, float | None] = {}
             for values in rows:
                 normalized_id = sensor_id(values.get("sensor_index"))
                 if normalized_id is None:
@@ -199,14 +214,22 @@ class SensorCache:
                 if normalized_id not in merged_by_id:
                     order.append(normalized_id)
                     cursor = self._db.execute(
-                        "SELECT data FROM sensors WHERE sensor_index = ?", (normalized_id,))
+                        "SELECT data, observed_at FROM sensors WHERE sensor_index = ?",
+                        (normalized_id,))
                     existing = cursor.fetchone()
                     merged_by_id[normalized_id] = dict(json.loads(existing[0])) if existing else {}
-                merged_by_id[normalized_id].update(values)
-                merged_by_id[normalized_id]["sensor_index"] = normalized_id
+                    stored_observed_at[normalized_id] = existing[1] if existing else None
+                merged = merged_by_id[normalized_id]
+                merged.update(values)
+                if "last_seen" in values:
+                    merged["last_seen"] = plausible_observation_time(
+                        _integer(values["last_seen"]), now)
+                merged["sensor_index"] = normalized_id
             return [
                 normalized_id for normalized_id in order
-                if _coordinates(merged_by_id[normalized_id]) is None
+                if not _already_expired(
+                    merged_by_id[normalized_id], stored_observed_at[normalized_id], now)
+                and _coordinates(merged_by_id[normalized_id]) is None
             ]
 
     def _upsert_locked(self, rows: list[dict]) -> list[int]:
@@ -231,15 +254,12 @@ class SensorCache:
                         if key in previous and key not in values:
                             merged[key] = None
             merged["sensor_index"] = normalized_id
-            last_seen = _integer(merged.get("last_seen"))
-            observed_at = (
-                float(last_seen) if last_seen is not None
-                else float(existing[1]) if existing else now
-            )
-            if observed_at < now - SENSOR_MAX_AGE:
+            stored_observed_at = existing[1] if existing else None
+            if _already_expired(merged, stored_observed_at, now):
                 # Storing an already-expired row would only make the next prune
                 # wipe every region's coverage; the caller still shows the row.
                 continue
+            observed_at = _observed_at(merged, stored_observed_at, now)
             coordinates = _coordinates(merged)
             if coordinates is None:
                 unknown.append(normalized_id)
