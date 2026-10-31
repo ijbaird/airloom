@@ -166,17 +166,23 @@ def become_subreaper() -> None:
 
 
 def descendants(pid: int) -> list[int]:
+    """Every process descending from pid, found through /proc.
+
+    A process or task that exits mid-walk is skipped. Any other error,
+    such as a permission or I/O failure, propagates, so cleanup never
+    reports a partial walk as complete.
+    """
     found, frontier = [], [pid]
     while frontier:
         parent = frontier.pop()
         try:
             tasks = os.listdir(f"/proc/{parent}/task")
-        except OSError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         for task in tasks:
             try:
                 children = Path(f"/proc/{parent}/task/{task}/children").read_text().split()
-            except OSError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue
             for child in map(int, children):
                 found.append(child)
