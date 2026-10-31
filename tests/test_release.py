@@ -1124,6 +1124,8 @@ elif command == "update":
     # FAKE_UPGRADE_RESULT models partial upgrades so the version and commit
     # checks are each exercised alone.
     result = "stale" if env.get("FAKE_STALE_UPGRADE") == "1" else env.get("FAKE_UPGRADE_RESULT", "complete")
+    if result == "stale":
+        print("Nothing to update.")
     if result in ("complete", "same-commit"):
         state["version"] = current_version
     if result in ("complete", "old-version"):
@@ -1356,7 +1358,8 @@ else:
         # candidate, whatever version it reports.
         result, _, summary = self.run_client_gate(FAKE_UPGRADE_RESULT="same-commit")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("previous installation (trusting CORRECTFPR) rejected the candidate release", result.stderr)
+        self.assertIn("previous installation (trusting CORRECTFPR) did not update to the candidate release: "
+                      "flatpak update left commit previous-commit installed.", result.stderr)
         self.assertNotIn("upgrade_verified", summary)
 
     def test_previous_release_must_update_from_the_published_repository(self):
@@ -1381,7 +1384,7 @@ else:
     def test_previous_installation_must_reach_the_current_commit(self):
         result, _, summary = self.run_client_gate(FAKE_STALE_UPGRADE="1")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("rejected the candidate release", result.stderr)
+        self.assertIn("did not update to the candidate release", result.stderr)
         self.assertNotIn("upgrade_verified", summary)
 
     def test_accepting_a_wrong_signing_key_fails_the_gate(self):
@@ -1429,11 +1432,17 @@ else:
         self.assertIn("upgrade_verified previous_version=1.2.2 version=1.2.3", summary)
         self.assertIn("trust=preserved previous_keys=CORRECTFPR", summary)
 
+    ROTATION_ADVICE = (
+        "If the signing key changed, this is likely an unmigrated key rotation; "
+        "a signing-key rotation needs a reviewed client migration."
+    )
+
     def test_production_upgrade_rejects_a_candidate_the_previous_install_does_not_trust(self):
         result, entries, summary = self.run_client_gate(FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("previous installation (trusting PREVIOUSFPR) rejected the candidate release; "
-                      "a signing-key rotation needs a reviewed client migration", result.stderr)
+        self.assertIn("previous installation (trusting PREVIOUSFPR) did not update to the candidate release: "
+                      "flatpak update exited 1. " + self.ROTATION_ADVICE, result.stderr)
+        self.assertIn("flatpak update output: GPG signatures found, but none are in trusted keyring", result.stderr)
         self.assertIn("bundle_verified", summary)
         self.assertIn("repository_install_verified", summary)
         self.assertNotIn("upgrade_verified", summary)
@@ -1444,9 +1453,23 @@ else:
             FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR", FAKE_UPDATE_IGNORES_UNTRUSTED="1")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Nothing to update.", result.stdout)
-        self.assertIn("previous installation (trusting PREVIOUSFPR) rejected the candidate release; "
-                      "a signing-key rotation needs a reviewed client migration", result.stderr)
+        self.assertIn("previous installation (trusting PREVIOUSFPR) did not update to the candidate release: "
+                      "flatpak update left commit previous-commit installed. " + self.ROTATION_ADVICE, result.stderr)
+        self.assertIn("flatpak update output: F: Warning: Treating remote fetch error as non-fatal\nNothing to update.",
+                      result.stderr)
         self.assertNotIn("does not match expected", result.stderr)
+        self.assertNotIn("upgrade_verified", result.stdout)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_development_no_op_update_is_denied_without_rotation_advice(self):
+        # The candidate key was imported, so a key rotation cannot explain it.
+        result, _, summary = self.run_client_gate(
+            "--import-candidate-key", FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR", FAKE_STALE_UPGRADE="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation (trusting PREVIOUSFPR) did not update to the candidate release: "
+                      "flatpak update left commit previous-commit installed. flatpak update output: Nothing to update.",
+                      result.stderr)
+        self.assertNotIn("key rotation", result.stderr)
         self.assertNotIn("upgrade_verified", result.stdout)
         self.assertNotIn("upgrade_verified", summary)
 

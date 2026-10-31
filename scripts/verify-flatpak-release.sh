@@ -197,14 +197,24 @@ verify_previous_upgrade() (
     trust="preserved"
     flatpak remote-modify --user --url="${repo_url}" "${origin}"
   fi
-  local rejected="previous installation (trusting ${previous_keys:-none}) rejected the candidate release; a signing-key rotation needs a reviewed client migration"
-  flatpak update --user --noninteractive --no-deps --arch="${arch}" "${app_id}" || fail "${rejected}"
+  local update_output update_status=0 not_updated advice=""
+  update_output="$(flatpak update --user --noninteractive --no-deps --arch="${arch}" "${app_id}" 2>&1)" || update_status=$?
+  [[ -z "${update_output}" ]] || printf '%s\n' "${update_output}"
+  not_updated="previous installation (trusting ${previous_keys:-none}) did not update to the candidate release"
+  # Only production mode leaves the previous trust alone, so only there can
+  # an unmigrated signing-key rotation explain the failure.
+  if [[ "${trust}" == "preserved" ]]; then
+    advice=" If the signing key changed, this is likely an unmigrated key rotation; a signing-key rotation needs a reviewed client migration."
+  fi
+  [[ "${update_status}" == "0" ]] \
+    || fail "${not_updated}: flatpak update exited ${update_status}.${advice} flatpak update output: ${update_output:-none}"
   # flatpak 1.18.1 treats an untrusted summary as a non-fatal fetch error for
-  # an installed ref: it reports "Nothing to update." and exits 0. An
-  # unchanged commit is that rejection, so name it before the version check.
+  # an installed ref: it reports "Nothing to update." and exits 0. Catch the
+  # unchanged commit here so the version check does not misname the cause.
   new_commit="$(installed_commit)"
   [[ -n "${new_commit}" ]] || fail "upgrade did not reach a new commit"
-  [[ "${new_commit}" != "${old_commit}" ]] || fail "${rejected}"
+  [[ "${new_commit}" != "${old_commit}" ]] \
+    || fail "${not_updated}: flatpak update left commit ${old_commit} installed.${advice} flatpak update output: ${update_output:-none}"
   if [[ "${trust}" == "preserved" ]]; then
     current_keys="$(remote_trusted_keys "${origin}")"
     [[ "${current_keys}" == "${previous_keys}" ]] \
