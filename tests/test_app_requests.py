@@ -3,13 +3,16 @@ from __future__ import annotations
 import errno
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
+import time
 import types
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,14 +31,15 @@ except (ImportError, ValueError):
     from airloom import app as app_module
 
 from airloom import geocode as geocode_module
+from airloom import store as store_module
 from airloom.app import AirloomApplication
-from airloom.cache import CacheError
+from airloom.cache import CacheError, SensorCache
 from airloom.controller import ApplicationController
 from airloom.geocode import Place
 from airloom.models import Sensor
 from airloom.purpleair import FetchResult, PurpleAirError
 from airloom.requests import RequestRegistry
-from airloom.store import Store
+from airloom.store import SYNC_THREAD_NAME, SettingsDurabilityError, Store
 
 
 CONFIG = {
@@ -75,6 +79,12 @@ class FakeStore:
     def __init__(self, **updates):
         self.data = {**CONFIG, **updates}
         self.saves = 0
+        self.flushes = []
+        self.flush_result = True
+
+    def flush(self, timeout):
+        self.flushes.append(timeout)
+        return self.flush_result
 
     def apply(self, candidate):
         self.saves += 1
@@ -164,9 +174,11 @@ class ThreadQueue:
 class IdleQueue:
     def __init__(self):
         self.callbacks = []
+        self.threads = []
 
     def add(self, callback, *args):
         self.callbacks.append((callback, args))
+        self.threads.append(threading.current_thread())
         return len(self.callbacks)
 
     def run(self, index):
@@ -174,7 +186,28 @@ class IdleQueue:
         return callback(*args)
 
 
-class ApplicationRequestTestCase(unittest.TestCase):
+class RealStoreMixin:
+    """Real Stores drain their settings-sync worker before their temporary
+    directory is removed, so no worker outlives a test or syncs a deleted
+    directory."""
+
+    @contextmanager
+    def settings_directory(self):
+        self._real_stores = []
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                yield directory
+            finally:
+                for store in self._real_stores:
+                    store.flush(5)
+
+    def real_store(self, path):
+        store = Store(path)
+        self._real_stores.append(store)
+        return store
+
+
+class ApplicationRequestTestCase(RealStoreMixin, unittest.TestCase):
     def make_app(self, *, sensors=(), home_mode="auto"):
         app = AirloomApplication.__new__(AirloomApplication)
         app.store = FakeStore(home_mode=home_mode)
@@ -184,6 +217,9 @@ class ApplicationRequestTestCase(unittest.TestCase):
         app._worker_lock = threading.Lock()
         app._active_workers = 0
         app._cache_closed = False
+        app._active_kinds = {}
+        app._coalesced_jobs = {}
+        app._coalesced_running = set()
         app._debug_port = None
         app._auto_refresh_id = None
         app.refreshing = False
@@ -199,6 +235,7 @@ class ApplicationRequestTestCase(unittest.TestCase):
         app.locator = None
         app._locator_focus_handler = None
         app._locator_focus_fallback = None
+        app._awaiting_shell_ready = False
         app.sent = []
         app.sensor_state_sends = 0
         app.refreshed_homes = []
@@ -209,6 +246,15 @@ class ApplicationRequestTestCase(unittest.TestCase):
         app._refresh_home = lambda *args, **_kwargs: app.refreshed_homes.append(args)
         app._arm_auto_refresh = lambda: None
         app.refresh = lambda *args, **_kwargs: None
+        return app
+
+    def make_real_store_app(self, directory, *, sensors=()):
+        app = self.make_app(sensors=sensors)
+        # Wired as in AirloomApplication.__init__.
+        app.store = self.real_store(Path(directory) / "config.json")
+        app.store.on_durability_error = app._on_settings_durability_error
+        app.store.save()
+        self.assertTrue(app.store.flush(5))
         return app
 
     def trend_events(self, app):
@@ -256,6 +302,98 @@ class TrendRequestTest(ApplicationRequestTestCase):
         self.assertEqual(loaded["reading_last_seen"], 1234)
         self.assertEqual(sensor.trend, trend)
         self.assertEqual(client.fetch_rows.call_count, 1)
+
+    def test_key_change_revokes_queued_trend_before_paid_io(self):
+        for case, update in (("clear", {"clear_api_key": True}), ("replace", {"api_key": "replacement-key"})):
+            with self.subTest(case=case):
+                app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+                threads, idles = ThreadQueue(), IdleQueue()
+                client_type = mock.Mock()
+                with (mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                      mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                      mock.patch.object(app_module, "PurpleAirClient", client_type)):
+                    app._ensure_trend(1)
+                    app._save_settings({**TransactionalActionTest.settings_message(), **update})
+                    threads.threads[0].run()
+                    for index in range(len(idles.callbacks)):
+                        idles.run(index)
+                client_type.assert_not_called()
+                self.assertNotIn("loaded", [p["status"] for p in self.trend_events(app)])
+                self.assertEqual(app._trend_inflight, {})
+
+    def run_trend_with_key_change(self, update, *, during_check=False, during_client=False):
+        """Run one trend worker, committing ``update`` at the chosen interleaving.
+
+        Returns the PurpleAirClient mock and the app. ``during_check`` commits
+        right after the worker's authority check returns (the old check/capture
+        gap); a commit that must wait for the atomic check runs on a real thread
+        that is joined before completion. ``during_client`` commits inside the
+        client constructor, after authority and key capture.
+        """
+        app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+        threads, idles = ThreadQueue(), IdleQueue()
+        real_thread = threading.Thread
+        settings = {**TransactionalActionTest.settings_message(), **update}
+        commit = lambda: app.controller.save_settings(settings)  # noqa: E731
+        waiting = []
+        client = mock.Mock()
+        client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+        def construct(api_key):
+            if during_client:
+                commit()
+            return client
+
+        client_type = mock.Mock(side_effect=construct)
+        check = app.controller.trend_wanted
+
+        def check_then_commit(plan):
+            wanted = check(plan)
+            lock = getattr(app.controller, "_credential_lock", None)
+            if lock is not None and lock.locked():
+                waiting.append(real_thread(target=commit))
+                waiting[-1].start()
+            else:
+                commit()
+            return wanted
+
+        with (mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+              mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+              mock.patch.object(app_module, "PurpleAirClient", client_type),
+              mock.patch.object(app_module, "trend_from_values", return_value=[{"label": "Now", "aqi": 9}])):
+            if during_check:
+                app.controller.trend_wanted = check_then_commit
+            app._ensure_trend(1)
+            threads.threads[0].run()
+            for thread in waiting:
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+        return client_type, app
+
+    def test_key_change_after_check_never_spends_a_revoked_or_replacement_key(self):
+        for case, update in (("clear", {"clear_api_key": True}), ("replace", {"api_key": "replacement-key"})):
+            with self.subTest(case=case):
+                client_type, app = self.run_trend_with_key_change(update, during_check=True)
+                # The change is serialized after the atomic authorization, so
+                # only the key that authorized the plan may be spent ...
+                client_type.assert_called_once_with("test-api-key")
+                # ... and the revoked completion is discarded.
+                self.assertNotIn("loaded", [p["status"] for p in self.trend_events(app)])
+                self.assertEqual(app._trend_inflight, {})
+                self.assertEqual(app.controller.sensors[0].trend, [])
+                self.assertEqual(app.cache.stored, [])
+
+    def test_key_change_after_authorization_discards_inflight_completion(self):
+        for case, update in (("clear", {"clear_api_key": True}), ("replace", {"api_key": "replacement-key"})):
+            with self.subTest(case=case):
+                client_type, app = self.run_trend_with_key_change(update, during_client=True)
+                client_type.assert_called_once_with("test-api-key")
+                self.assertNotIn("loaded", [p["status"] for p in self.trend_events(app)])
+                self.assertEqual(app._trend_inflight, {})
+                self.assertEqual(app.controller.sensors[0].trend, [])
+                self.assertEqual(app.cache.stored, [])
 
     def test_trend_error_is_terminal_and_allows_manual_retry(self):
         app = self.make_app(sensors=[make_sensor(last_seen=1234)])
@@ -366,6 +504,8 @@ class TrendRequestTest(ApplicationRequestTestCase):
             threads.threads[0].run()
             try:
                 idles.run(0)
+                threads.threads[1].run()
+                idles.run(1)
             except Exception as exc:
                 self.fail(f"trend cache write escaped: {exc}")
 
@@ -488,6 +628,260 @@ class TrendRequestTest(ApplicationRequestTestCase):
             self.trend_events(app)[-1]["request_id"],
             self.trend_events(app)[0]["request_id"],
         )
+
+    def test_trend_admission_is_bounded_and_refusal_is_terminal(self):
+        app = self.make_app(sensors=[make_sensor(i, last_seen=1000 + i) for i in range(1, 6)])
+        threads = ThreadQueue()
+        client_type = mock.Mock()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module, "PurpleAirClient", client_type),
+        ):
+            for sensor_id in range(1, 6):
+                app._ensure_trend(sensor_id)
+
+        self.assertEqual(len(threads.threads), app_module.TREND_WORKER_LIMIT)
+        refused = [p for p in self.trend_events(app) if p["sensor_id"] == 5]
+        # A refused admission is terminal, so the panel offers Retry.
+        self.assertEqual(refused[-1]["status"], "error")
+        self.assertNotIn(5, app._trend_inflight)
+        client_type.assert_not_called()
+
+    def run_queued(self, threads, idles, ran, *, hold=None):
+        """Run each queued thread and idle callback not yet run, except ``hold``.
+
+        Repeats until nothing new is queued, so follow-on work runs too.
+        """
+        while True:
+            fresh = [
+                thread for thread in threads.threads
+                if thread is not hold and id(thread) not in ran["threads"]
+            ]
+            if not fresh and ran["idles"] == len(idles.callbacks):
+                return
+            for thread in fresh:
+                ran["threads"].add(id(thread))
+                thread.run()
+            while ran["idles"] < len(idles.callbacks):
+                ran["idles"] += 1
+                idles.run(ran["idles"] - 1)
+
+    def test_reselecting_a_reading_before_its_cache_write_settles_never_refetches(self):
+        trend = [{"label": "Now", "aqi": 50}]
+        with tempfile.TemporaryDirectory() as directory:
+            cache = SensorCache(Path(directory) / "cache.db")
+            self.addCleanup(cache.close)
+            app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+            app.cache = cache
+            threads, idles = ThreadQueue(), IdleQueue()
+            ran = {"threads": set(), "idles": 0}
+            client = mock.Mock()
+            client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+            with (
+                mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                mock.patch.object(app_module, "PurpleAirClient", return_value=client),
+                mock.patch.object(app_module, "trend_from_values", return_value=trend),
+            ):
+                # Worker A fetches and completes; its cache write is queued.
+                app._ensure_trend(1)
+                threads.threads[0].run()
+                ran["threads"].add(id(threads.threads[0]))
+                idles.run(0)
+                ran["idles"] = 1
+                writer = threads.threads[1]
+                first_id = self.trend_events(app)[0]["request_id"]
+
+                # Reselect the same reading while the writer is held.
+                app._ensure_trend(1)
+                self.run_queued(threads, idles, ran, hold=writer)
+
+                self.assertEqual(client.fetch_rows.call_count, 1)
+                second = self.trend_events(app)[-1]
+                self.assertEqual(second["status"], "loaded")
+                self.assertEqual(second["trend"], trend)
+                self.assertEqual(second["reading_last_seen"], 1234)
+                self.assertNotEqual(second["request_id"], first_id)
+                self.assertIn(1, app.controller.trend_unsettled)
+
+                # Releasing the writer settles and clears the entry.
+                self.run_queued(threads, idles, ran)
+                self.assertNotIn(1, app.controller.trend_unsettled)
+                self.assertEqual(cache.get_trend(1, 600), trend)
+
+                # Persisted now: a further selection is a cache hit, not a fetch.
+                app._ensure_trend(1)
+                self.run_queued(threads, idles, ran)
+            self.assertEqual(client.fetch_rows.call_count, 1)
+            self.assertEqual(self.trend_events(app)[-1]["status"], "loaded")
+
+    def test_credential_change_revokes_an_unsettled_trend(self):
+        trend = [{"label": "Now", "aqi": 50}]
+        app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+        threads, idles = ThreadQueue(), IdleQueue()
+        client = mock.Mock()
+        client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "PurpleAirClient", return_value=client),
+            mock.patch.object(app_module, "trend_from_values", return_value=trend),
+        ):
+            app._ensure_trend(1)
+            threads.threads[0].run()
+            idles.run(0)
+            writer = threads.threads[1]
+            app._save_settings(
+                {**TransactionalActionTest.settings_message(), "api_key": "replacement-key"}
+            )
+            self.assertNotIn(1, app.controller.trend_unsettled)
+
+            app._ensure_trend(1)
+            # Not served from memory: a fresh worker is admitted under the new key.
+            self.assertEqual(self.trend_events(app)[-1]["status"], "loading")
+            self.assertIn(1, app._trend_inflight)
+            writer.run()
+            for index in range(1, len(idles.callbacks)):
+                idles.run(index)
+
+        # The revoked write was skipped and its settlement cleared nothing new.
+        self.assertEqual(app.cache.stored, [])
+        self.assertNotIn(1, app.controller.trend_unsettled)
+
+    def test_obsolete_cache_read_error_sends_no_live_fetch_toast(self):
+        app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+        app.cache.get_trend = mock.Mock(side_effect=CacheError("cache read failed"))
+        threads, idles = ThreadQueue(), IdleQueue()
+        client_type = mock.Mock()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "PurpleAirClient", client_type),
+        ):
+            app._ensure_trend(1)
+            app._save_settings(
+                {**TransactionalActionTest.settings_message(), "clear_api_key": True}
+            )
+            threads.threads[0].run()
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+
+        client_type.assert_not_called()
+        messages = [p["message"] for event, p in app.sent if event == "error"]
+        self.assertFalse(
+            [m for m in messages if "Fetching a live trend instead" in m], messages
+        )
+
+
+class CoalescedQueueTest(ApplicationRequestTestCase):
+    def submit(self, app, key, job, run):
+        return app._submit_coalesced("test-kind", key, job, run, name="airloom-test")
+
+    def test_unstarted_same_key_job_is_replaced_in_place_and_keys_run_fifo(self):
+        app = self.make_app()
+        threads = ThreadQueue()
+        ran = []
+
+        with mock.patch.object(app_module.threading, "Thread", new=threads.factory):
+            for key, job in (("a", "a1"), ("b", "b1"), ("a", "a2"), ("c", "c1")):
+                self.assertTrue(self.submit(app, key, job, ran.append))
+            self.assertEqual(len(threads.threads), 1)
+            threads.threads[0].run()
+
+        self.assertEqual(ran, ["a2", "b1", "c1"])
+        self.assertEqual(app._coalesced_jobs, {})
+        self.assertEqual(app._coalesced_running, set())
+        self.assertEqual(app._active_workers, 0)
+        self.assertEqual(app._active_kinds, {})
+
+    def test_failing_job_is_reported_and_later_work_still_runs(self):
+        app = self.make_app()
+        threads = ThreadQueue()
+        ran = []
+        stderr = io.StringIO()
+
+        def run(job):
+            if job == "bad":
+                raise RuntimeError("boom")
+            ran.append(job)
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.sys, "stderr", stderr),
+        ):
+            self.submit(app, "bad", "bad", run)
+            self.submit(app, "good", "good", run)
+            threads.threads[0].run()
+            # A drained kind admits a new worker for later work.
+            self.submit(app, "later", "later", run)
+            self.assertEqual(len(threads.threads), 2)
+            threads.threads[1].run()
+
+        self.assertEqual(ran, ["good", "later"])
+        self.assertIn("test-kind job failed", stderr.getvalue())
+        self.assertIn("boom", stderr.getvalue())
+        self.assertEqual(app._active_workers, 0)
+
+
+MAIN_LOOP_BLOCK_BOUND = 0.25  # seconds; the production busy timeout is 5.0
+
+
+class MainLoopCacheTest(ApplicationRequestTestCase):
+    def test_cache_lock_never_blocks_the_main_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.db"
+            cache = SensorCache(path)  # production busy_timeout=5.0
+            self.addCleanup(cache.close)
+            cache.store_trend(1, [{"label": "Now", "aqi": 42}])
+            reader = self.make_app(
+                sensors=[make_sensor(1, last_seen=1234), make_sensor(2, last_seen=99)]
+            )
+            startup = self.make_app()
+            reader.cache = startup.cache = cache
+            idles = IdleQueue()
+            blocker = sqlite3.connect(path)
+            self.addCleanup(blocker.close)
+            blocker.execute("BEGIN EXCLUSIVE")
+            client_type = mock.Mock()
+            with (
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                mock.patch.object(app_module, "PurpleAirClient", client_type),
+            ):
+                plan = reader.controller.begin_trend(2)
+                reader.controller.track_trend(plan)
+                for label, call in (
+                    ("trend read", lambda: reader._ensure_trend(1)),
+                    (
+                        "trend write",
+                        lambda: reader._finish_trend(
+                            2, 99, plan.token, [{"label": "Now", "aqi": 7}], False
+                        ),
+                    ),
+                    ("startup paint", startup._paint_cached_home),
+                ):
+                    started = time.monotonic()
+                    call()
+                    self.assertLess(
+                        time.monotonic() - started, MAIN_LOOP_BLOCK_BOUND, label
+                    )
+                blocker.rollback()
+                deadline = time.monotonic() + 10
+                while (
+                    reader._active_workers or startup._active_workers
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                for index in range(len(idles.callbacks)):
+                    idles.run(index)
+            self.assertEqual(reader._active_workers + startup._active_workers, 0)
+            client_type.assert_not_called()
+            loaded = [p for p in self.trend_events(reader) if p["sensor_id"] == 1]
+            self.assertEqual(loaded[-1]["status"], "loaded")
+            self.assertEqual(loaded[-1]["trend"], [{"label": "Now", "aqi": 42}])
+            self.assertEqual(cache.get_trend(2, 600), [{"label": "Now", "aqi": 7}])
 
 
 class PlaceSearchRequestTest(ApplicationRequestTestCase):
@@ -690,16 +1084,16 @@ class ReverseLabelRequestTest(ApplicationRequestTestCase):
             mock.patch.object(app_module.threading, "Thread", new=threads.factory),
             mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
             mock.patch.object(
-                app_module, "reverse_geocode", side_effect=["A home", "B home"]
-            ),
+                app_module, "reverse_geocode", return_value="B home"
+            ) as reverse_geocode,
         ):
             app._on_location_fix(10.0, 20.0, 50.0)
             app._on_location_fix(30.0, 40.0, 50.0)
+            self.assertEqual(len(threads.threads), 1)
             threads.threads[0].run()
-            threads.threads[1].run()
-            idles.run(1)
             idles.run(0)
 
+        self.assertEqual(reverse_geocode.call_args_list, [mock.call(30.0, 40.0)])
         self.assertEqual(app.store.data["location_name"], "B home")
         self.assertEqual(
             (app.store.data["latitude"], app.store.data["longitude"]),
@@ -711,6 +1105,91 @@ class ReverseLabelRequestTest(ApplicationRequestTestCase):
             if event == "config"
         ]
         self.assertEqual(labels, ["B home"])
+
+    def test_superseded_label_never_reaches_geocoder(self):
+        app = self.make_app()
+        threads = ThreadQueue()
+        idles = IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "reverse_geocode") as reverse_geocode,
+        ):
+            app._start_view_label(10.0, 20.0)
+            app.controller.shutdown()
+            threads.threads[0].run()
+
+        reverse_geocode.assert_not_called()
+        self.assertEqual(idles.callbacks, [])
+
+        app = self.make_app()
+        threads = ThreadQueue()
+        idles = IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "reverse_geocode") as reverse_geocode,
+        ):
+            app._on_location_fix(30.0, 40.0, 50.0)
+            app.requests.invalidate("home-label")
+            threads.threads[0].run()
+
+        reverse_geocode.assert_not_called()
+        self.assertEqual(idles.callbacks, [])
+
+    def test_label_superseded_during_throttle_wait_never_sends(self):
+        app = self.make_app()
+        app.current_view = (None, (10.0, 20.0))
+        threads = ThreadQueue()
+        idles = IdleQueue()
+        client = geocode_module.Geocoder(
+            clock=lambda: 100.0,
+            sleep=lambda _seconds: app.requests.invalidate("view-label"),
+        )
+        client._last_request = 100.0
+        base_url = geocode_module._base_url()
+
+        with (
+            mock.patch.object(geocode_module, "_default_geocoder", client),
+            mock.patch.object(geocode_module, "_default_base_url", base_url),
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(geocode_module.urllib.request, "urlopen") as urlopen,
+        ):
+            app._start_view_label(10.0, 20.0)
+            threads.threads[0].run()
+
+        urlopen.assert_not_called()
+        self.assertEqual(idles.callbacks, [])
+
+    def test_queued_view_labels_coalesce_to_newest_target(self):
+        app = self.make_app()
+        app.current_view = (None, (12.0, 22.0))
+        threads = ThreadQueue()
+        idles = IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(
+                app_module, "reverse_geocode", return_value="Newest view"
+            ) as reverse_geocode,
+        ):
+            app._start_view_label(10.0, 20.0)
+            app._start_view_label(11.0, 21.0)
+            app._start_view_label(12.0, 22.0)
+            self.assertEqual(len(threads.threads), 1)
+            threads.threads[0].run()
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+
+        self.assertEqual(reverse_geocode.call_args_list, [mock.call(12.0, 22.0)])
+        self.assertEqual(
+            [payload for event, payload in app.sent if event == "view-name"],
+            [{"name": "Newest view"}],
+        )
 
     def test_view_label_requires_matching_coordinates_as_well_as_generation(self):
         app = self.make_app()
@@ -793,12 +1272,6 @@ class LocationModeRequestTest(ApplicationRequestTestCase):
 
 
 class TransactionalActionTest(ApplicationRequestTestCase):
-    def make_real_store_app(self, directory, *, sensors=()):
-        app = self.make_app(sensors=sensors)
-        app.store = Store(Path(directory) / "config.json")
-        app.store.save()
-        return app
-
     @staticmethod
     def capture_os_error(callback):
         try:
@@ -829,7 +1302,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 app = self.make_real_store_app(directory)
                 path = app.store.path
                 previous = deepcopy(app.store.data)
@@ -861,7 +1334,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 app = self.make_real_store_app(directory)
                 previous = deepcopy(app.store.data)
                 threads = ThreadQueue()
@@ -901,7 +1374,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 app = self.make_real_store_app(directory)
                 app.store.data.update({"latitude": 10.0, "longitude": 20.0})
                 app.store.save()
@@ -935,7 +1408,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
                 self.assertIn(str(failure), errors[0])
 
     def test_successful_settings_save_publishes_config_and_matching_success(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with self.settings_directory() as directory:
             app = self.make_real_store_app(directory)
 
             app._save_settings(self.settings_message())
@@ -962,7 +1435,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 sensor = make_sensor(1)
                 app = self.make_real_store_app(directory, sensors=[sensor])
                 with mock.patch.object(app.store, "_write", side_effect=failure):
@@ -993,7 +1466,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 sensor = make_sensor(1)
                 app = self.make_real_store_app(directory, sensors=[sensor])
                 with mock.patch.object(app.store, "_write", side_effect=failure):
@@ -1043,6 +1516,37 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             [payload for event, payload in app.sent if event == "error"], []
         )
 
+    def test_malformed_settings_payload_gets_matching_error_result(self):
+        malformed = (
+            {"radius_km": "NaN", "confidence_filter": "false"},
+            {"home_mode": "auto", "location_name": {"x": 1}},
+        )
+        for changes in malformed:
+            with self.subTest(changes=changes):
+                app = self.make_app()
+                message = {**self.settings_message(), **changes}
+
+                app._on_script_message(
+                    None, ScriptMessage({"action": "save-settings", **message})
+                )
+
+                results = [
+                    payload
+                    for event, payload in app.sent
+                    if event == "settings-save-result"
+                ]
+                self.assertEqual(
+                    results,
+                    [{"request_id": "settings-17", "status": "error", "error": mock.ANY}],
+                )
+                self.assertEqual(app.store.saves, 0)
+                self.assertEqual(
+                    [payload for event, payload in app.sent if event == "config"], []
+                )
+                self.assertEqual(
+                    [payload for event, payload in app.sent if event == "error"], []
+                )
+
     def test_unhide_permission_and_space_failures_are_actionable_and_unchanged(self):
         failures = (
             PermissionError(errno.EACCES, "Permission denied"),
@@ -1050,7 +1554,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
         )
         for action in ("unhide", "unhide-all"):
             for failure in failures:
-                with self.subTest(action=action, error=failure.errno), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(action=action, error=failure.errno), self.settings_directory() as directory:
                     app = self.make_real_store_app(directory)
                     app.store.data["hidden"] = {"1": "Sensor 1"}
                     app.store.save()
@@ -1083,7 +1587,7 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
                 app = self.make_real_store_app(directory)
                 refreshes = []
                 app.refresh = lambda *args, **_kwargs: refreshes.append(args)
@@ -1110,6 +1614,122 @@ class TransactionalActionTest(ApplicationRequestTestCase):
                 self.assertIn("try again", errors[0].lower())
 
 
+class SettingsDurabilityWarningTest(ApplicationRequestTestCase):
+    settings_message = staticmethod(TransactionalActionTest.settings_message)
+
+    @staticmethod
+    def error_messages(app):
+        return [payload["message"] for event, payload in app.sent if event == "error"]
+
+    @staticmethod
+    def record_send_threads(app):
+        threads = []
+        send = app._send
+
+        def recording_send(event, payload):
+            threads.append((event, threading.current_thread()))
+            send(event, payload)
+
+        app._send = recording_send
+        return threads
+
+    def failing_directory_sync(self):
+        return mock.patch.object(
+            store_module, "_fsync_directory", side_effect=OSError(errno.EIO, "I/O error")
+        )
+
+    def assert_one_main_loop_warning(self, app, idles, send_threads):
+        # The worker only queues the warning; nothing is sent until the main
+        # loop runs the idle callback.
+        self.assertEqual(self.error_messages(app), [])
+        self.assertEqual(len(idles.callbacks), 1)
+        self.assertEqual(idles.threads[0].name, SYNC_THREAD_NAME)
+        idles.run(0)
+        errors = self.error_messages(app)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("could not confirm", errors[0])
+        self.assertFalse(errors[0].startswith("Could not save"))
+        self.assertEqual(
+            [thread for event, thread in send_threads if event == "error"],
+            [threading.main_thread()],
+        )
+
+    def test_settings_durability_failure_acknowledges_success_and_toasts_from_main_loop(self):
+        with self.settings_directory() as directory:
+            app = self.make_real_store_app(directory)
+            send_threads = self.record_send_threads(app)
+            idles = IdleQueue()
+            with (
+                self.failing_directory_sync(),
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            ):
+                app._save_settings(self.settings_message())
+                self.assertFalse(app.store.flush(5))
+
+            results = [
+                payload for event, payload in app.sent if event == "settings-save-result"
+            ]
+            self.assertEqual(
+                results, [{"request_id": "settings-17", "status": "success", "error": None}]
+            )
+            self.assertIn("config", [event for event, _payload in app.sent])
+            self.assertEqual(app.store.data["location_name"], "Pinned home")
+            self.assertEqual(Store(app.store.path).data["location_name"], "Pinned home")
+            self.assert_one_main_loop_warning(app, idles, send_threads)
+
+    def test_favorite_durability_failure_applies_favorite_and_toasts_once(self):
+        with self.settings_directory() as directory:
+            sensor = make_sensor(1)
+            app = self.make_real_store_app(directory, sensors=[sensor])
+            send_threads = self.record_send_threads(app)
+            idles = IdleQueue()
+            with (
+                self.failing_directory_sync(),
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            ):
+                app._on_script_message(None, ScriptMessage({"action": "favorite", "id": 1}))
+                self.assertFalse(app.store.flush(5))
+
+            self.assertEqual(app.store.data["favorites"], [1])
+            self.assertEqual(Store(app.store.path).data["favorites"], [1])
+            self.assertTrue(sensor.favorite)
+            self.assert_one_main_loop_warning(app, idles, send_threads)
+
+    def test_blocked_directory_sync_leaves_the_main_loop_responsive(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_fsync(_path):
+            entered.set()
+            release.wait(5)
+
+        with self.settings_directory() as directory:
+            app = self.make_real_store_app(directory)
+            idles = IdleQueue()
+            with (
+                mock.patch.object(store_module, "_fsync_directory", side_effect=blocked_fsync),
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            ):
+                started = time.monotonic()
+                try:
+                    app._save_settings(self.settings_message())
+                    elapsed = time.monotonic() - started
+                    # The save returned while the worker is inside the sync.
+                    self.assertTrue(entered.wait(5))
+                    self.assertFalse(app.store.flush(0.05))
+                finally:
+                    release.set()
+                self.assertTrue(app.store.flush(5))
+
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(
+                [payload for event, payload in app.sent if event == "settings-save-result"],
+                [{"request_id": "settings-17", "status": "success", "error": None}],
+            )
+            self.assertEqual(idles.callbacks, [])
+            self.assertEqual(self.error_messages(app), [])
+
+
 class BridgeSensorIdTest(ApplicationRequestTestCase):
     SAFE_MAX = 2**53 - 1
     INVALID = (
@@ -1134,10 +1754,10 @@ class BridgeSensorIdTest(ApplicationRequestTestCase):
         for action in ("select", "favorite", "hide", "unhide"):
             for value in self.INVALID:
                 with self.subTest(action=action, value=value):
-                    with tempfile.TemporaryDirectory() as directory:
+                    with self.settings_directory() as directory:
                         sensor = make_sensor(1)
                         app = self.make_app(sensors=[sensor])
-                        app.store = Store(Path(directory) / "config.json")
+                        app.store = self.real_store(Path(directory) / "config.json")
                         app.store.data["hidden"] = {"1": "Sensor 1"}
                         app.store.save()
                         previous = deepcopy(app.store.data)
@@ -1198,6 +1818,57 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
         self.assertIsNone(app._locator_focus_fallback)
         self.assertIsNone(app.pending_fetch)
         self.assertFalse(app.refreshing)
+
+    def test_shutdown_flushes_settings_once_with_a_bounded_timeout_before_cache_close(self):
+        app = self.make_app()
+        order = []
+        flush = app.store.flush
+
+        def recording_flush(timeout):
+            # No transaction can persist once shutdown has begun.
+            order.append(("flush", app._shutting_down))
+            return flush(timeout)
+
+        app.store.flush = recording_flush
+        app.cache.close = lambda: order.append(("close", app._shutting_down))
+
+        app._on_shutdown()
+        app._on_shutdown()
+
+        self.assertEqual(order, [("flush", True), ("close", True)])
+        self.assertEqual(len(app.store.flushes), 1)
+        self.assertGreater(app.store.flushes[0], 0)
+        self.assertLessEqual(app.store.flushes[0], 2.0)
+
+    def test_unconfirmed_settings_at_shutdown_print_one_line(self):
+        app = self.make_app()
+        app.store.flush_result = False
+
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr:
+            app._on_shutdown()
+
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("settings", lines[0].lower())
+
+    def test_durability_warning_after_shutdown_begins_sends_nothing(self):
+        error = SettingsDurabilityError(
+            "Settings were saved, but the system could not confirm they reached "
+            "the disk: [Errno 5] I/O error",
+            deepcopy(CONFIG),
+        )
+        app = self.make_app()
+        idles = IdleQueue()
+        with mock.patch.object(app_module.GLib, "idle_add", new=idles.add):
+            # Queued before shutdown, delivered after it began.
+            app._on_settings_durability_error(error)
+            app._on_shutdown()
+            # Reported after shutdown began.
+            app._on_settings_durability_error(error)
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+
+        self.assertEqual([event for event, _payload in app.sent if event == "error"], [])
 
     def test_shutdown_rejects_new_work_and_invalidates_old_callbacks(self):
         sensor = make_sensor(1)
@@ -1295,6 +1966,14 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
                         marker.write("close\n")
                     super().close()
 
+                def sensors_in(self, bounds):
+                    block("startup-cache")
+                    return super().sensors_in(bounds)
+
+                def store_trend(self, sensor_id, trend):
+                    block("trend-cache")
+                    super().store_trend(sensor_id, trend)
+
             lock = threading.Lock()
             started = []
             all_started = threading.Event()
@@ -1303,7 +1982,7 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
             def block(name):
                 with lock:
                     started.append(name)
-                    if len(started) == 5:
+                    if len(started) == 7:
                         all_started.set()
                 if not release.wait(5):
                     raise RuntimeError(f"{name} was not released")
@@ -1347,12 +2026,17 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
             app._worker_lock = threading.Lock()
             app._active_workers = 0
             app._cache_closed = False
+            app._active_kinds = {}
+            app._coalesced_jobs = {}
+            app._coalesced_running = set()
             app._shutting_down = False
             app._debug_port = None
             app._auto_refresh_id = None
             app.refreshing = False
             app.pending_fetch = None
+            app._paint_cached_home()
             app.sensors = [h.make_sensor(1)]
+            app._queue_trend_write(1, [])
             app._trend_inflight = {}
             app._home_name_generation = 0
             app._view_name_generation = 0
@@ -1400,12 +2084,20 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
             lines = marker.read_text(encoding="utf-8").splitlines() if marker.exists() else []
 
         diagnostic = f"stdout={result.stdout!r}\nstderr={result.stderr!r}\nmarkers={lines!r}"
-        self.assertEqual(len(lines), 6, diagnostic)
+        self.assertEqual(len(lines), 8, diagnostic)
         self.assertEqual(lines.count("close"), 1, diagnostic)
         self.assertEqual(lines[-1], "close", diagnostic)
         self.assertEqual(
             set(lines[:-1]),
-            {"refresh", "trend", "place-search", "home-label", "view-label"},
+            {
+                "refresh",
+                "trend",
+                "place-search",
+                "home-label",
+                "view-label",
+                "startup-cache",
+                "trend-cache",
+            },
             diagnostic,
         )
         self.assertEqual(result.returncode, 0, diagnostic)

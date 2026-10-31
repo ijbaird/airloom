@@ -1859,3 +1859,96 @@ test("the largest safe sensor id round-trips Python to JS to Python exactly", ()
   const trend = result.events.find(([event]) => event === "trend")[1];
   assert.equal(trend.sensor_id, SAFE_MAX);
 });
+
+// Shell recovery (W2): restore-view adopts only a canonical viewport. The
+// vm timeout bounds each delivery, so a payload that hangs rendering fails
+// the test instead of stalling the suite.
+function deliverRestoreView(app, payload) {
+  app.context.__restorePayload = payload;
+  vm.runInContext('Airloom.receive("restore-view", __restorePayload)', app.context, { timeout: 2000 });
+}
+
+function mapView(app) {
+  const { center, zoom } = app.context.Airloom.debugState();
+  return { lat: center.lat, lon: center.lon, zoom };
+}
+
+test("restore-view ignores malformed payloads without throwing or navigating", () => {
+  const malformed = [
+    null,
+    "15,-20",
+    [15, -20, 9],
+    42,
+    { lat: Number.NaN, lon: -20, zoom: 9 },
+    { lat: 15, lon: Number.POSITIVE_INFINITY, zoom: 9 },
+    { lat: Number.NEGATIVE_INFINITY, lon: -20, zoom: 9 },
+    { lat: 15, lon: Number.NaN, zoom: 9 },
+    { lat: 15, lon: -20, zoom: 2 },
+    { lat: 15, lon: -20, zoom: 18 },
+    { lat: 15, lon: -20, zoom: 2.9 },
+    { lat: 15, lon: -20, zoom: 17.2 },
+    { lat: 15, lon: -20, zoom: "9" },
+    { lat: null, lon: -20, zoom: 9 },
+    { lat: "15", lon: -20, zoom: 9 },
+    { lat: true, lon: -20, zoom: 9 },
+    { lon: -20, zoom: 9 },
+    { lat: 15, zoom: 9 },
+    { lat: 15, lon: -20 },
+  ];
+  for (const payload of malformed) {
+    const app = loadApp();
+    configureMap(app);
+    const before = mapView(app);
+    assert.doesNotThrow(() => deliverRestoreView(app, payload), `payload ${JSON.stringify(payload)}`);
+    assert.deepEqual(mapView(app), before, `payload ${JSON.stringify(payload)} moved the map`);
+    app.runTimers();
+    assert.deepEqual(app.messages.filter((message) => message.action === "view-changed"), []);
+  }
+});
+
+test("restore-view adopts a valid viewport without echoing view-changed", () => {
+  const app = loadApp();
+  configureMap(app);
+  deliverRestoreView(app, { lat: 15, lon: -20, zoom: 9 });
+  assert.deepEqual(mapView(app), { lat: 15, lon: -20, zoom: 9 });
+
+  deliverRestoreView(app, { lat: 89, lon: 180, zoom: null });
+  const clamped = mapView(app);
+  closeTo(clamped.lat, 85.0511);
+  closeTo(clamped.lon, -180);
+  assert.equal(clamped.zoom, 9);
+
+  app.runTimers();
+  assert.deepEqual(app.messages.filter((message) => message.action === "view-changed"), []);
+});
+
+test("restore-view rounds a fractional zoom to the nearest whole level", () => {
+  const app = loadApp();
+  configureMap(app);
+  deliverRestoreView(app, { lat: 15, lon: -20, zoom: 12.4 });
+  assert.deepEqual(mapView(app), { lat: 15, lon: -20, zoom: 12 });
+  deliverRestoreView(app, { lat: 16, lon: -21, zoom: 12.6 });
+  assert.deepEqual(mapView(app), { lat: 16, lon: -21, zoom: 13 });
+});
+
+test("restore-view clamps latitude and wraps longitude to the place the user saw", () => {
+  const app = loadApp();
+  configureMap(app);
+  deliverRestoreView(app, { lat: 15, lon: 190, zoom: 9 });
+  assert.deepEqual(mapView(app), { lat: 15, lon: -170, zoom: 9 });
+  deliverRestoreView(app, { lat: 15, lon: -200, zoom: 9 });
+  assert.deepEqual(mapView(app), { lat: 15, lon: 160, zoom: 9 });
+  deliverRestoreView(app, { lat: 95, lon: 20, zoom: 9 });
+  closeTo(mapView(app).lat, 85.0511);
+  closeTo(mapView(app).lon, 20);
+
+  // A huge finite longitude wraps arithmetically (the vm timeout bounds a hang).
+  deliverRestoreView(app, { lat: 15, lon: 1e300, zoom: 9 });
+  const wrapped = mapView(app);
+  assert.equal(wrapped.lat, 15);
+  assert.ok(wrapped.lon >= -180 && wrapped.lon < 180, `lon ${wrapped.lon} was not wrapped`);
+  deliverRestoreView(app, { lat: -1e300, lon: -1e300, zoom: 9 });
+  closeTo(mapView(app).lat, -85.0511);
+  app.runTimers();
+  assert.deepEqual(app.messages.filter((message) => message.action === "view-changed"), []);
+});

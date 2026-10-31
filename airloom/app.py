@@ -70,7 +70,7 @@ from .purpleair import (
     trend_from_values,
 )
 from .requests import RequestRegistry, RequestToken
-from .store import Store
+from .store import SettingsDurabilityError, Store
 from .validation import bridge_sensor_id
 
 # How long a debug-port `eval` command waits for evaluate_javascript to
@@ -87,6 +87,11 @@ APP_ID = "ai.stealthvision.Airloom"
 RESOURCE_DIR = Path(__file__).parent / "resources"
 BUNDLED_ENTRY_URI = (RESOURCE_DIR / "index.html").as_uri()
 LOCATOR_FOCUS_FALLBACK_SECONDS = 20
+# Concurrent trend workers (cache read, then any paid fetch); a selection past
+# the limit ends in a terminal error the user can Retry.
+TREND_WORKER_LIMIT = 4
+# How long shutdown waits for settings saves to be confirmed durable.
+SETTINGS_FLUSH_TIMEOUT_SECONDS = 2.0
 
 
 class _PlaceSearchSuperseded(Exception):
@@ -110,8 +115,10 @@ def _install_place_search_admission() -> None:
     public search flow nevertheless exposes two adapter admission points:
     ``_request`` after its search-lock wait and ``_throttle`` after any sleep.
     Wrapping those points preserves its cache, throttling, and transport code.
-    Unannotated users of the shared client, including reverse geocoding, retain
-    the original behavior.
+    Annotated callers, place search and the reverse-label workers (via
+    ``_reverse_name``), share these admission points; a reverse request has no
+    search lock, so it is checked before its throttle and after any sleep.
+    Unannotated users of the shared client retain the original behavior.
     """
     client = geocode_module._default_client()
     with _place_search_install_lock:
@@ -452,17 +459,25 @@ class AirloomApplication(Adw.Application):
         self._debug_build_id: str | None = self._compute_build_id() if self.debug_mode else None
         self._captured_notifications: list[dict] | None = None
         self._install_debug_fakes(os.environ)
-        self.store = Store()
+        self.store = Store(on_durability_error=self._on_settings_durability_error)
         self.requests = RequestRegistry()
         self.controller = self._new_controller()
         self._worker_lock = threading.Lock()
         self._active_workers = 0
         self._cache_closed = False
+        # Active workers per admission kind, and coalesced job queues (kind ->
+        # key -> job) with the kinds whose single drain worker is running.
+        self._active_kinds: dict[str, int] = {}
+        self._coalesced_jobs: dict[str, dict] = {}
+        self._coalesced_running: set[str] = set()
         self.cache, self._cache_error = _open_sensor_cache()
         self._auto_refresh_id: int | None = None
         self.window: Adw.ApplicationWindow | None = None
         self.webview: WebKit.WebView | None = None
         self._shell_recovery_notice: str | None = None
+        # Set while a reloaded shell has not yet sent ready: messages still
+        # arriving from the replaced page must not steer the controller.
+        self._awaiting_shell_ready = False
         self.title: Adw.WindowTitle | None = None
         self.locator: GeoClueLocator | None = None
         self._locator_focus_handler: int | None = None
@@ -486,18 +501,32 @@ class AirloomApplication(Adw.Application):
             requests=self.requests,
         )
 
-    def _start_worker(self, target, *, name: str, args=()) -> bool:
-        """Admit one tracked worker unless shutdown has begun."""
+    def _start_worker(
+        self,
+        target,
+        *,
+        name: str,
+        args=(),
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> bool:
+        """Admit one tracked worker unless shutdown has begun, or ``limit``
+        workers of ``kind`` are already active."""
         with self._worker_lock:
             if self._shutting_down:
                 return False
+            if kind is not None:
+                active = self._active_kinds.get(kind, 0)
+                if limit is not None and active >= limit:
+                    return False
+                self._active_kinds[kind] = active + 1
             self._active_workers += 1
 
         def run() -> None:
             try:
                 target(*args)
             finally:
-                self._worker_finished()
+                self._worker_finished(kind)
 
         try:
             # Python waits for non-daemon workers at interpreter shutdown, so
@@ -506,14 +535,56 @@ class AirloomApplication(Adw.Application):
             # queued GUI callback, avoiding shutdown deadlocks.
             threading.Thread(target=run, name=name, daemon=False).start()
         except BaseException:
-            self._worker_finished()
+            self._worker_finished(kind)
             raise
         return True
 
-    def _worker_finished(self) -> None:
+    def _worker_finished(self, kind: str | None = None) -> None:
         with self._worker_lock:
             self._active_workers -= 1
+            if kind is not None:
+                self._active_kinds[kind] -= 1
+                if not self._active_kinds[kind]:
+                    del self._active_kinds[kind]
         self._close_cache_if_drained()
+
+    def _submit_coalesced(self, kind: str, key, job, run, *, name: str) -> bool:
+        """Queue ``job`` for the single tracked worker draining ``kind``.
+
+        A queued job replaces an unstarted one with the same key; the drain
+        runs ``run(job)`` in FIFO order, and a failing job does not stop it.
+        """
+        with self._worker_lock:
+            if self._shutting_down:
+                return False
+            self._coalesced_jobs.setdefault(kind, {})[key] = job
+            if kind in self._coalesced_running:
+                return True
+            self._coalesced_running.add(kind)
+
+        def drain() -> None:
+            while True:
+                with self._worker_lock:
+                    jobs = self._coalesced_jobs.get(kind)
+                    if not jobs:
+                        self._coalesced_jobs.pop(kind, None)
+                        self._coalesced_running.discard(kind)
+                        return
+                    next_job = jobs.pop(next(iter(jobs)))
+                try:
+                    run(next_job)
+                except Exception as exc:  # noqa: BLE001 — later jobs still run
+                    print(f"Airloom: {kind} job failed: {exc!r}", file=sys.stderr)
+
+        started = False
+        try:
+            started = self._start_worker(drain, name=name, kind=kind)
+        finally:
+            if not started:
+                with self._worker_lock:
+                    self._coalesced_jobs.pop(kind, None)
+                    self._coalesced_running.discard(kind)
+        return started
 
     def _close_cache_if_drained(self) -> None:
         with self._worker_lock:
@@ -547,7 +618,26 @@ class AirloomApplication(Adw.Application):
         if self._debug_port is not None:
             self._debug_port.stop()
             self._debug_port = None
+        # Workers drain asynchronously, but none of their completions can
+        # persist settings once shutdown has begun (adapter and controller
+        # both refuse them; ShutdownPersistenceTest pins this), so the last
+        # save has already happened and this is the place to confirm it.
+        if not self.store.flush(SETTINGS_FLUSH_TIMEOUT_SECONDS):
+            print(
+                "Airloom: could not confirm the last settings save reached the disk",
+                file=sys.stderr,
+            )
         self._close_cache_if_drained()
+
+    def _on_settings_durability_error(self, error: SettingsDurabilityError) -> None:
+        # Runs on the store's sync worker: hand the warning to the main loop.
+        GLib.idle_add(self._report_settings_durability_error, str(error))
+
+    def _report_settings_durability_error(self, message: str) -> bool:
+        # The save itself succeeded; this is a toast, not a failed save.
+        if not self._shutting_down:
+            self._send("error", {"message": message})
+        return GLib.SOURCE_REMOVE
 
     def _on_activate(self, _application) -> None:
         if self._shutting_down:
@@ -791,6 +881,10 @@ class AirloomApplication(Adw.Application):
     def _reload_shell(self) -> None:
         if self._shutting_down or not self.webview:
             return
+        self._awaiting_shell_ready = True
+        # The old page's searches and labels can't apply to the new one.
+        for context in ("place-search:main", "place-search:home", "view-label"):
+            self.requests.invalidate(context)
         self._send(
             "shell-status",
             {
@@ -940,11 +1034,37 @@ class AirloomApplication(Adw.Application):
         self._home_name_generation += 1
         generation = self._home_name_generation
         token = self.requests.begin("home-label", generation)
-        self._start_worker(
-            self._reverse_label_worker,
-            args=(float(latitude), float(longitude), generation, token),
+        # Only the newest queued fix is worth labelling; older targets are
+        # replaced before they reach the geocoder.
+        self._submit_coalesced(
+            "home-label",
+            None,
+            (float(latitude), float(longitude), generation, token),
+            lambda job: self._reverse_label_worker(*job),
             name="airloom-revgeo",
         )
+
+    def _reverse_name(
+        self, latitude: float, longitude: float, token: RequestToken
+    ) -> str | None:
+        """Reverse-geocode for ``token``, or ``None`` once it is superseded.
+
+        The token is checked before any geocoder I/O and again at the shared
+        client's admission points, including after its throttle wait.
+        """
+        if self._shutting_down or not self.requests.is_current(token):
+            return None
+        _install_place_search_admission()
+        _place_search_admission.is_current = lambda: self.requests.is_current(token)
+        try:
+            return reverse_geocode(latitude, longitude)
+        except _PlaceSearchSuperseded:
+            return None
+        except GeocodeError as exc:
+            print(f"Airloom: {exc}", file=sys.stderr)
+            return f"{latitude:.2f}, {longitude:.2f}"
+        finally:
+            _place_search_admission.is_current = None
 
     def _reverse_label_worker(
         self,
@@ -953,11 +1073,9 @@ class AirloomApplication(Adw.Application):
         generation: int,
         token: RequestToken,
     ) -> None:
-        try:
-            name = reverse_geocode(latitude, longitude)
-        except GeocodeError as exc:
-            print(f"Airloom: {exc}", file=sys.stderr)
-            name = f"{latitude:.2f}, {longitude:.2f}"
+        name = self._reverse_name(latitude, longitude, token)
+        if name is None:
+            return
         GLib.idle_add(
             self._apply_location_name,
             name,
@@ -1008,10 +1126,20 @@ class AirloomApplication(Adw.Application):
             return
 
         action = message.get("action")
+        if self._awaiting_shell_ready and action != "ready":
+            print(f"Airloom: ignored {action!r} from a replaced page", file=sys.stderr)
+            return
         if action == "reload-shell":
             self._reload_shell()
         elif action == "ready":
+            self._awaiting_shell_ready = False
             self._send("config", self.store.public_config())
+            # Hand the new page the controller's view so both target it
+            # before the refresh below.
+            restore = self.controller.restore_view()
+            if restore is not None:
+                self._send("restore-view", restore)
+                self._start_view_label(restore["lat"], restore["lon"])
             self._send_motion_preference()
             recovery_notice = getattr(self, "_shell_recovery_notice", None)
             if recovery_notice:
@@ -1093,9 +1221,12 @@ class AirloomApplication(Adw.Application):
         self._view_name_generation += 1
         generation = self._view_name_generation
         token = self.requests.begin("view-label", generation)
-        self._start_worker(
-            self._view_label_worker,
-            args=(latitude, longitude, generation, token),
+        # Panning queues many centers; only the newest one is labelled.
+        self._submit_coalesced(
+            "view-label",
+            None,
+            (latitude, longitude, generation, token),
+            lambda job: self._view_label_worker(*job),
             name="airloom-viewgeo",
         )
 
@@ -1106,11 +1237,9 @@ class AirloomApplication(Adw.Application):
         generation: int,
         token: RequestToken,
     ) -> None:
-        try:
-            name = reverse_geocode(latitude, longitude)
-        except GeocodeError as exc:
-            print(f"Airloom: {exc}", file=sys.stderr)
-            name = f"{latitude:.2f}, {longitude:.2f}"
+        name = self._reverse_name(latitude, longitude, token)
+        if name is None:
+            return
         GLib.idle_add(
             self._apply_view_name, name, latitude, longitude, generation, token
         )
@@ -1248,17 +1377,38 @@ class AirloomApplication(Adw.Application):
 
     def _paint_cached_home(self) -> None:
         """First paint from the cache so launch never blocks on the network.
-        The refresh that follows replaces it under the normal TTL rules."""
-        if self.cache is None or not self.controller.wants_cached_startup():
+        The refresh that follows replaces it under the normal TTL rules; the
+        read runs on a tracked worker so a locked cache never stalls launch."""
+        if self.cache is None:
             return
-        bounds = self.controller.home_bounds()
+        token = self.controller.begin_cached_startup()
+        if token is None:
+            return
+        self._submit_coalesced(
+            "startup-cache",
+            None,
+            (token, self.controller.home_bounds()),
+            self._read_cached_home,
+            name="airloom-startup-cache",
+        )
+
+    def _read_cached_home(self, job) -> None:
+        """Worker: read the cached home rows for the first paint."""
+        token, bounds = job
+        cache = self.cache
+        if cache is None:
+            return
         try:
-            cached = _sensors_from_rows(self.cache.sensors_in(bounds))
+            sensors = _sensors_from_rows(cache.sensors_in(bounds))
         except _CACHE_FAILURES:
             # First paint is optional; the refresh that follows reports it.
             return
-        if self.controller.apply_cached_startup(cached, bounds):
+        GLib.idle_add(self._apply_cached_home, token, sensors, bounds)
+
+    def _apply_cached_home(self, token: RequestToken, sensors: list, bounds: Bounds) -> bool:
+        if self.controller.apply_cached_startup(token, sensors, bounds):
             self._send_sensor_state("PurpleAir · cached")
+        return GLib.SOURCE_REMOVE
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the current view, falling back to home before one exists."""
@@ -1336,47 +1486,38 @@ class AirloomApplication(Adw.Application):
             )
             return
 
-        cached = None
-        if self.cache is not None:
-            try:
-                cached = self.cache.get_trend(sensor_id, self._refresh_seconds())
-            except Exception as exc:  # noqa: BLE001 — caching is optional
-                self._send(
-                    "error",
-                    {
-                        "message": (
-                            f"Could not read cached trend: {exc}. "
-                            "Fetching a live trend instead."
-                        )
-                    },
-                )
-        if cached is not None:
-            update = self.controller.cached_trend(plan, cached)
-            if update.sensor_changed:
-                self._send_sensor_state()
-            self._send_trend_state(
-                sensor_id, plan.token, update.status, plan.reading_last_seen, cached
-            )
-            return
-
         self.controller.track_trend(plan)
         self._send_trend_state(sensor_id, plan.token, "loading", plan.reading_last_seen)
-        api_key = self.controller.config["api_key"]
+        cache = self.cache
+        ttl = self._refresh_seconds()
 
         def worker() -> None:
-            trend = None
+            cached = None
+            cache_error = None
+            if cache is not None:
+                try:
+                    cached = cache.get_trend(sensor_id, ttl)
+                except Exception as exc:  # noqa: BLE001 — caching is optional
+                    cache_error = str(exc)
+            trend = cached
             failed = False
-            try:
-                if self.controller.trend_wanted(plan):
-                    result = _new_purpleair_client(api_key).fetch_rows(
-                        show_only=[sensor_id], fields=TREND_FETCH_FIELDS
-                    )
-                    if result.rows:
-                        trend = trend_from_values(result.rows[0])
-            except PurpleAirError:
-                failed = True
-            except Exception:  # noqa: BLE001 — worker failures must reach a terminal state
-                failed = True
+            if cached is None:
+                try:
+                    # Authority and the key come from one atomic step. A key
+                    # change after it can still race the socket send below (no
+                    # lock is held across network I/O); finish_trend discards
+                    # that result.
+                    api_key = self.controller.trend_credential(plan)
+                    if api_key is not None:
+                        result = _new_purpleair_client(api_key).fetch_rows(
+                            show_only=[sensor_id], fields=TREND_FETCH_FIELDS
+                        )
+                        if result.rows:
+                            trend = trend_from_values(result.rows[0])
+                except PurpleAirError:
+                    failed = True
+                except Exception:  # noqa: BLE001 — worker failures must reach a terminal state
+                    failed = True
             GLib.idle_add(
                 self._finish_trend,
                 sensor_id,
@@ -1384,9 +1525,15 @@ class AirloomApplication(Adw.Application):
                 plan.token,
                 trend,
                 failed,
+                cached is not None,
+                cache_error,
             )
 
-        self._start_worker(worker, name="airloom-trend")
+        if not self._start_worker(
+            worker, name="airloom-trend", kind="trend", limit=TREND_WORKER_LIMIT
+        ):
+            # Refused admission is terminal, so the trend panel offers Retry.
+            self._finish_trend(sensor_id, plan.reading_last_seen, plan.token, None, True)
 
     def _finish_trend(
         self,
@@ -1395,28 +1542,87 @@ class AirloomApplication(Adw.Application):
         token: RequestToken,
         trend: list | None,
         failed: bool,
+        from_cache: bool = False,
+        cache_error: str | None = None,
     ) -> bool:
         update = self.controller.finish_trend(
-            sensor_id, reading_last_seen, token, trend, failed
+            sensor_id, reading_last_seen, token, trend, failed, cached=from_cache
         )
         if update is None:
+            # A discarded completion reports nothing, not even its cache read.
             return GLib.SOURCE_REMOVE
+        if cache_error is not None:
+            self._send(
+                "error",
+                {
+                    "message": (
+                        f"Could not read cached trend: {cache_error}. "
+                        "Fetching a live trend instead."
+                    )
+                },
+            )
         if update.store and self.cache is not None:
-            try:
-                self.cache.store_trend(sensor_id, trend)
-            except Exception as exc:  # noqa: BLE001 — live data remains valid
-                self._send(
-                    "error",
-                    {
-                        "message": (
-                            f"Could not cache trend: {exc}. "
-                            "Showing the live result without trend caching."
-                        )
-                    },
-                )
+            self._queue_trend_write(sensor_id, trend, reading_last_seen)
         if update.sensor_changed:
             self._send_sensor_state()
         self._send_trend_state(sensor_id, token, update.status, reading_last_seen, trend)
+        return GLib.SOURCE_REMOVE
+
+    def _queue_trend_write(
+        self, sensor_id: int, trend: list, reading_last_seen: int | None = None
+    ) -> None:
+        """Persist a live trend on the trend-cache worker, newest per sensor.
+
+        Until the write settles, the controller holds the accepted trend so a
+        reselection of that reading is answered without another paid fetch.
+        """
+        generation = self.controller.credential_generation
+        if self._submit_coalesced(
+            "trend-cache",
+            sensor_id,
+            (sensor_id, trend, generation, reading_last_seen),
+            self._write_trend,
+            name="airloom-trend-cache",
+        ):
+            self.controller.hold_trend(sensor_id, reading_last_seen, generation, trend)
+
+    def _write_trend(self, job) -> None:
+        """Worker: store one trend unless its key has since been revoked."""
+        sensor_id, trend, generation, reading_last_seen = job
+        cache = self.cache
+        error = None
+        try:
+            if cache is not None and generation == self.controller.credential_generation:
+                cache.store_trend(sensor_id, trend)
+        except Exception as exc:  # noqa: BLE001 — live data remains valid
+            error = str(exc)
+        GLib.idle_add(
+            self._settle_trend_write, sensor_id, reading_last_seen, generation, error
+        )
+
+    def _settle_trend_write(
+        self,
+        sensor_id: int,
+        reading_last_seen: int | None,
+        generation: int,
+        error: str | None,
+    ) -> bool:
+        self.controller.settle_trend(sensor_id, reading_last_seen, generation)
+        if error is not None:
+            self._report_trend_cache_error(error)
+        return GLib.SOURCE_REMOVE
+
+    def _report_trend_cache_error(self, message: str) -> bool:
+        if not self._shutting_down:
+            self._send(
+                "error",
+                {
+                    "message": (
+                        f"Could not cache trend: {message}. "
+                        "Showing the live result without trend caching."
+                    )
+                },
+            )
         return GLib.SOURCE_REMOVE
 
     def _send_sensor_state(self, source: str | None = None) -> None:
@@ -1438,23 +1644,26 @@ class AirloomApplication(Adw.Application):
     def _check_alerts(self) -> None:
         decision = self.controller.evaluate_alerts()
         for sensor in decision.notify:
-            self._notify_alert(sensor)
+            self.controller.record_alert_delivery(sensor.sensor_id, self._notify_alert(sensor))
         if decision.error:
             self._send("error", {"message": decision.error})
 
-    def _notify_alert(self, sensor: Sensor) -> None:
+    def _notify_alert(self, sensor: Sensor) -> bool:
+        """Show one alert; True when it was submitted or captured."""
         title = f"Air quality alert · {sensor.name[:80]}"
         body = f"AQI is now {sensor.aqi}. Open Airloom for health guidance."
         if self._captured_notifications is not None:
             self._captured_notifications.append(
                 {"sensor_id": sensor.sensor_id, "title": title, "body": body}
             )
-            return
+            return True
         notification = Notify.Notification.new(title, body, APP_ID)
         try:
             notification.show()
-        except GLib.Error:
-            pass
+        except GLib.Error as exc:
+            print(f"Airloom: could not show alert notification: {exc}", file=sys.stderr)
+            return False
+        return True
 
     def _send(self, event: str, payload) -> None:
         if self._shutting_down or not self.webview:

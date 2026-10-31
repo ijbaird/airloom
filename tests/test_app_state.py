@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import errno
+import io
 import json
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -24,6 +27,11 @@ except (ImportError, ValueError):
         import gi_stub
     gi_stub.install()
     from airloom import app as app_module
+
+try:
+    from tests.test_app_requests import IdleQueue, RealStoreMixin, ThreadQueue
+except ImportError:
+    from test_app_requests import IdleQueue, RealStoreMixin, ThreadQueue
 
 from airloom import controller as controller_module
 from airloom.app import AirloomApplication
@@ -114,6 +122,11 @@ class FakeStore:
             **updates,
         }
         self.saves = 0
+        self.flushes = []
+
+    def flush(self, timeout):
+        self.flushes.append(timeout)
+        return True
 
     def hidden_ids(self):
         return {int(key) for key in self.data["hidden"]}
@@ -206,13 +219,19 @@ class ScriptMessage:
         return json.dumps(self.message)
 
 
-class ApplicationAdapterTestCase(unittest.TestCase):
+class ApplicationAdapterTestCase(RealStoreMixin, unittest.TestCase):
     def make_app(self, store=None, cache=None):
         app = AirloomApplication.__new__(AirloomApplication)
         app.store = store or FakeStore()
         app.cache = cache
         app.requests = app_module.RequestRegistry()
         app.controller = app._new_controller()
+        app._worker_lock = threading.Lock()
+        app._active_workers = 0
+        app._cache_closed = False
+        app._active_kinds = {}
+        app._coalesced_jobs = {}
+        app._coalesced_running = set()
         app.sensors = []
         app._area_ids = set()
         app._monitoring_ids = set()
@@ -233,6 +252,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app.title = None
         app._cache_error = None
         app._shell_recovery_notice = None
+        app._awaiting_shell_ready = False
         app._captured_notifications = None
         app.sent = []
         app.launched = []
@@ -276,8 +296,15 @@ class ApplicationAdapterTestCase(unittest.TestCase):
 class CachedStartupTest(ApplicationAdapterTestCase):
     def test_cached_startup_is_real_cache_delivery_but_not_stale_fallback(self):
         app = self.make_app(cache=FakeCache([make_row(7)]))
+        threads, idles = ThreadQueue(), IdleQueue()
 
-        app._paint_cached_home()
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+        ):
+            app._paint_cached_home()
+            threads.threads[0].run()
+            idles.run(0)
 
         payload = self.sensor_payloads(app)[0]
         self.assertIs(payload.get("stale"), False)
@@ -286,6 +313,89 @@ class CachedStartupTest(ApplicationAdapterTestCase):
         self.assertEqual(payload["items"][0]["delivery"], "cache")
         self.assertFalse(payload["items"][0]["remote_favorite"])
         self.assertIs(payload["coverage"]["capped"], False)
+
+    def test_refresh_published_first_wins_over_late_cached_paint(self):
+        # An empty live publication leaves wants_cached_startup true, so only
+        # the cached-startup token can keep the late paint out.
+        for case, live in (("readings", [make_sensor(9)]), ("empty", [])):
+            with self.subTest(case=case):
+                app = self.make_app(cache=FakeCache([make_row(7)]))
+                threads, idles = ThreadQueue(), IdleQueue()
+
+                with (
+                    mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                    mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                ):
+                    app._paint_cached_home()
+                    threads.threads[0].run()
+                    app._finish_refresh(self.make_outcome(app, list(live)))
+                    idles.run(0)
+
+                self.assertEqual(len(self.sensor_payloads(app)), 1)
+                self.assertEqual(
+                    [sensor.sensor_id for sensor in app.sensors],
+                    [sensor.sensor_id for sensor in live],
+                )
+
+    def home_report(self, app):
+        bounds = app.controller.home_bounds()
+        config = app.store.data
+        return {
+            "north": bounds.north,
+            "west": bounds.west,
+            "south": bounds.south,
+            "east": bounds.east,
+            "lat": config["latitude"],
+            "lon": config["longitude"],
+        }
+
+    def test_navigation_during_a_delayed_home_read_drops_the_home_paint(self):
+        # A report of the home target itself still coalesces into the paint.
+        for case, report, painted in (
+            ("elsewhere", lambda app: VIEW, False),
+            ("home", self.home_report, True),
+        ):
+            with self.subTest(case=case):
+                app = self.make_app(cache=FakeCache([make_row(7)]))
+                threads, idles = ThreadQueue(), IdleQueue()
+
+                with (
+                    mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                    mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                ):
+                    app._paint_cached_home()
+                    app._on_view_changed(report(app))
+                    threads.threads[0].run()
+                    for index in range(len(idles.callbacks)):
+                        idles.run(index)
+
+                self.assertEqual(len(self.sensor_payloads(app)), int(painted))
+                self.assertEqual(
+                    [sensor.sensor_id for sensor in app.sensors], [7] if painted else []
+                )
+
+    def test_recovery_away_from_home_queues_no_home_paint(self):
+        app = self.make_app(cache=FakeCache([make_row(7)]))
+        app.webview = FakeWebView()
+        app._start_fetch = lambda request: app.sent.append(("fetch", request.center))
+        app.controller.view_changed({**VIEW, "zoom": 9})
+        app.sent.clear()
+        threads, idles = ThreadQueue(), IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+        ):
+            app._on_web_process_terminated(None, "crashed")
+            app._on_script_message(None, ScriptMessage({"action": "ready"}))
+            for thread in threads.threads:
+                thread.run()
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+
+        self.assertEqual(self.sensor_payloads(app), [])
+        self.assertEqual(app.sensors, [])
+        self.assertEqual([p for e, p in app.sent if e == "fetch"], [(15.0, -20.0)])
 
 
 class PresentationPayloadTest(ApplicationAdapterTestCase):
@@ -719,8 +829,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         self.assertEqual(app._start_worker.call_count, 1)
 
     def test_favorite_change_reissues_active_refresh_under_committed_config(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self.make_app(store=store)
             app.sensors = [make_sensor(1)]
@@ -741,8 +851,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             self.assertEqual(app.launched, [(replacement,)])
 
     def test_hide_change_replaces_pending_refresh_under_committed_config(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self.make_app(store=store)
             app.sensors = [make_sensor(1)]
@@ -772,8 +882,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
         return app
 
     def test_favorite_reissue_preserves_active_manual_refresh_force(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self._real_fetch_app(store)
             app._on_script_message(None, ScriptMessage({"action": "refresh"}))
@@ -787,8 +897,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             self.assertTrue(app.pending_fetch.force)
 
     def test_hide_reissue_preserves_queued_manual_refresh_force(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self._real_fetch_app(store)
             app.refresh()
@@ -805,8 +915,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             self.assertEqual(app._start_worker.call_count, 1)
 
     def test_reissue_after_unforced_work_stays_unforced(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.save()
             app = self._real_fetch_app(store)
             app.refresh()
@@ -861,8 +971,8 @@ class RefreshAdapterTest(ApplicationAdapterTestCase):
             OSError(errno.ENOSPC, "No space left on device"),
         )
         for failure in failures:
-            with self.subTest(error=failure.errno), tempfile.TemporaryDirectory() as directory:
-                store = Store(Path(directory) / "config.json")
+            with self.subTest(error=failure.errno), self.settings_directory() as directory:
+                store = self.real_store(Path(directory) / "config.json")
                 store.data.update({"favorites": [1], "alert_states": {"1": False}})
                 store.save()
                 previous = deepcopy(store.data)
@@ -1005,6 +1115,35 @@ class ShellRecoveryTest(ApplicationAdapterTestCase):
         self.assertIn("reloaded", statuses[-1]["message"].lower())
         self.assertTrue(statuses[-1]["can_reload"])
 
+    def test_crash_away_from_home_restores_view_before_refresh(self):
+        app = self.make_app()
+        app.webview = FakeWebView()
+        app._start_fetch = lambda request: app.sent.append(("fetch", request.center))
+        app.controller.view_changed({**VIEW, "zoom": 9})
+        app.sent.clear()
+        old_search = app.requests.begin("place-search:main")
+        old_label = app.requests.begin("view-label")
+        labels = []
+        app._start_view_label = lambda *center: labels.append(center)
+        app._on_web_process_terminated(None, "crashed")
+        app._on_script_message(None, ScriptMessage({**VIEW, "action": "view-changed", "lat": 0.0, "lon": 0.0}))
+        app._on_script_message(None, ScriptMessage({"action": "refresh"}))
+        app._on_script_message(None, ScriptMessage({"action": "ready"}))
+        events = [event for event, _ in app.sent]
+        self.assertLess(events.index("config"), events.index("restore-view"))
+        self.assertLess(events.index("restore-view"), events.index("fetch"))
+        self.assertEqual(dict(app.sent)["restore-view"], {"lat": 15.0, "lon": -20.0, "zoom": 9.0})
+        self.assertEqual([p for e, p in app.sent if e == "fetch"], [(15.0, -20.0)])
+        self.assertEqual(app.controller.current_view[1], (15.0, -20.0))
+        self.assertFalse(app.requests.is_current(old_search))
+        self.assertFalse(app.requests.is_current(old_label))
+        self.assertEqual(labels, [(15.0, -20.0)])
+
+    def test_first_ready_without_a_view_sends_no_restore(self):
+        app = self.make_app()
+        app._on_script_message(None, ScriptMessage({"action": "ready"}))
+        self.assertNotIn("restore-view", [event for event, _ in app.sent])
+
 
 class DebugFakeWiringTest(ApplicationAdapterTestCase):
     def setUp(self):
@@ -1134,9 +1273,9 @@ class MotionPreferenceAdapterTest(ApplicationAdapterTestCase):
 class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
     def test_all_supported_scales_persist_and_apply_to_the_webview(self):
         for scale in (1.0, 1.25, 1.5):
-            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(scale=scale), self.settings_directory() as directory:
                 path = Path(directory) / "config.json"
-                store = Store(path)
+                store = self.real_store(path)
                 starting_scale = 1.5 if scale == 1.0 else 1.0
                 store.data["interface_scale"] = starting_scale
                 store.save()
@@ -1164,9 +1303,9 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
     def test_save_accepts_interface_size_numbers_from_the_selector(self):
         # JSON turns the selector's 100% (Number 1) into a Python int.
         for sent, expected in ((1, 1.0), (1.25, 1.25), (1.5, 1.5), ("1.25", 1.25)):
-            with self.subTest(sent=sent), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(sent=sent), self.settings_directory() as directory:
                 path = Path(directory) / "config.json"
-                store = Store(path)
+                store = self.real_store(path)
                 store.data["interface_scale"] = 1.5 if expected != 1.5 else 1.0
                 store.save()
                 app = self.make_app(store=store)
@@ -1187,9 +1326,9 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(app.webview.zoom_level, expected)
 
     def test_save_rejects_unsupported_interface_size(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with self.settings_directory() as directory:
             path = Path(directory) / "config.json"
-            store = Store(path)
+            store = self.real_store(path)
             store.data["interface_scale"] = 1.25
             store.save()
             app = self.make_app(store=store)
@@ -1278,10 +1417,127 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(app.webview.zoom_level, scale)
 
 
+class ShutdownPersistenceTest(ApplicationAdapterTestCase):
+    """Shutdown flushes the settings store once, so nothing may persist
+    settings after it begins.
+
+    Late refresh (alert-state), home-label, and location-fix completions are
+    cut off both by the adapter and by the stopped controller; each layer is
+    pinned on its own, and the end-to-end check pins the invariant."""
+
+    PERSISTING = ("accept_refresh", "evaluate_alerts", "set_home_label", "set_detected_home")
+
+    def make_late_completion_app(self, directory):
+        store = self.real_store(Path(directory) / "config.json")
+        store.data.update({
+            "home_mode": "auto",
+            "latitude": 10.0,
+            "longitude": 20.0,
+            "favorites": [1],
+            "alert_states": {"1": False},
+        })
+        store.save()
+        app = self.make_app(store=store)
+        app._auto_refresh_id = None
+        app._locator_focus_handler = None
+        app._locator_focus_fallback = None
+        app.locator = None
+        app._debug_port = None
+        app._home_name_generation = 1
+        app._view_name_generation = 0
+        app._refresh_home = lambda *_args, **_kwargs: None
+        app._captured_notifications = []
+        # No geocoder worker; patching threading.Thread would also stall the
+        # store's own sync worker.
+        app._start_worker = mock.Mock(return_value=False)
+        # Started before shutdown; they complete after it begins.
+        outcome = self.make_outcome(app, [make_sensor(1, favorite=True, aqi=150)])
+        label = app.requests.begin("home-label", 1)
+        return app, outcome, label
+
+    @staticmethod
+    def deliver(app, outcome, label):
+        with mock.patch.object(controller_module.time, "time", return_value=NOW):
+            app._finish_refresh(outcome)
+            app._apply_location_name("Detected home", 10.0, 20.0, 1, label)
+            app._on_location_fix(30.0, 40.0, 10.0)
+
+    def deliver_late_completions(self, *, shut_down):
+        with self.settings_directory() as directory:
+            app, outcome, label = self.make_late_completion_app(directory)
+            store = app.store
+            if shut_down:
+                app._on_shutdown()
+            before = (deepcopy(store.data), store.path.read_bytes())
+            with mock.patch.object(store, "_write", wraps=store._write) as write:
+                self.deliver(app, outcome, label)
+            after = (deepcopy(store.data), store.path.read_bytes())
+            return write.call_count, before, after
+
+    def test_completions_after_shutdown_persist_nothing(self):
+        writes, before, after = self.deliver_late_completions(shut_down=True)
+
+        self.assertEqual(writes, 0)
+        self.assertEqual(after, before)
+
+    def test_the_same_completions_persist_before_shutdown(self):
+        # Control: each delivery is a real settings write when not cut off,
+        # so the tests here do not pass vacuously.
+        writes, _before, after = self.deliver_late_completions(shut_down=False)
+
+        self.assertEqual(writes, 3)
+        self.assertEqual(after[0]["alert_states"], {"1": True})
+        self.assertEqual(after[0]["location_name"], "Detected home")
+        self.assertEqual((after[0]["latitude"], after[0]["longitude"]), (30.0, 40.0))
+
+    def test_adapter_drops_late_completions_before_the_controller(self):
+        with self.settings_directory() as directory:
+            app, outcome, label = self.make_late_completion_app(directory)
+            app._on_shutdown()
+            with contextlib.ExitStack() as stack:
+                spies = {
+                    name: stack.enter_context(
+                        mock.patch.object(
+                            app.controller, name, wraps=getattr(app.controller, name)
+                        )
+                    )
+                    for name in self.PERSISTING
+                }
+                self.deliver(app, outcome, label)
+
+        self.assertEqual({name: spy.call_count for name, spy in spies.items()},
+                         dict.fromkeys(self.PERSISTING, 0))
+
+    def controller_writes(self, *, stopped):
+        with self.settings_directory() as directory:
+            app, _outcome, _label = self.make_late_completion_app(directory)
+            # The alert crossing is already published; only persistence remains.
+            app.sensors = [make_sensor(1, favorite=True, aqi=150)]
+            app._area_ids = {1}
+            app._monitoring_ids = {1}
+            if stopped:
+                app.controller.shutdown()
+            store = app.store
+            with (
+                mock.patch.object(store, "_write", wraps=store._write) as write,
+                mock.patch.object(controller_module.time, "time", return_value=NOW),
+            ):
+                app.controller.evaluate_alerts()
+                app.controller.set_home_label("Detected home", 10.0, 20.0)
+                app.controller.set_detected_home(30.0, 40.0)
+            return write.call_count
+
+    def test_stopped_controller_persists_nothing(self):
+        self.assertEqual(self.controller_writes(stopped=True), 0)
+
+    def test_running_controller_persists_each_change(self):
+        self.assertEqual(self.controller_writes(stopped=False), 3)
+
+
 class FilterSaveFailureTest(ApplicationAdapterTestCase):
     def test_failed_filter_save_keeps_publication_and_alerts_on_saved_filter(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = Store(Path(directory) / "config.json")
+        with self.settings_directory() as directory:
+            store = self.real_store(Path(directory) / "config.json")
             store.data.update({"favorites": [1, 2], "alert_states": {}})
             store.save()
             app = self.make_app(store=store)
@@ -1440,6 +1696,27 @@ class AlertAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(notification_type.new.call_count, notification_count)
                 self.assertEqual(store.data["alert_states"], {"1": should_save})
                 self.assertEqual(store.saves, int(should_save))
+
+    def test_failed_notification_is_retried_then_settles(self):
+        store = FakeStore(favorites=[1], alert_states={"1": False})
+        app = self.make_app(store=store)
+        app.sensors = [make_sensor(1, favorite=True)]
+        app._area_ids = {1}
+        with (
+            mock.patch.object(controller_module.time, "time", return_value=NOW),
+            mock.patch.object(app_module.Notify, "Notification") as notification_type,
+            mock.patch.object(app_module.sys, "stderr", new_callable=io.StringIO) as stderr,
+        ):
+            show = notification_type.new.return_value.show
+            show.side_effect = [app_module.GLib.Error("daemon busy"), True]
+            app._check_alerts()
+            app._check_alerts()
+            app._check_alerts()
+
+        self.assertEqual(show.call_count, 2)
+        self.assertEqual(store.data["alert_states"], {"1": True})
+        self.assertIn("Airloom: could not show alert notification:", stderr.getvalue())
+        self.assertIn("daemon busy", stderr.getvalue())
 
 
 if __name__ == "__main__":

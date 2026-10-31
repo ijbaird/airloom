@@ -34,6 +34,7 @@ VIEW = {
     "lat": 15.0,
     "lon": -20.0,
 }
+OTHER = {**VIEW, "north": 40.0, "south": 30.0, "lat": 35.0}
 
 
 def make_sensor(sensor_id, *, indoor=False, confidence=100):
@@ -356,6 +357,82 @@ class RefreshWorkflowTest(unittest.TestCase):
         h.monotonic += 120
         self.assertEqual(h.controller.view_changed(VIEW), (15.0, -20.0))
 
+    def test_automatic_refresh_never_downgrades_queued_manual_refresh(self):
+        h = Harness()
+        h.controller.refresh()
+        h.controller.refresh(force=True)
+        self.assertIsNone(h.controller.refresh())
+        self.assertTrue(h.controller.pending_fetch.force)
+        self.assertTrue(h.controller.settle_refresh().force)
+
+    def test_automatic_refresh_coalesces_with_active_manual_refresh(self):
+        h = Harness()
+        manual = h.controller.refresh(force=True)
+        self.assertIsNone(h.controller.refresh())
+        self.assertIsNone(h.controller.pending_fetch)
+        self.assertTrue(h.finish(manual, [reading(1, aqi=150)]).publish)
+        self.assertEqual(len(h.started), 1)  # no second billed poll
+
+    def test_identical_covered_view_keeps_manual_refresh(self):
+        h = Harness()
+        h.controller.view_changed(VIEW)
+        h.finish(h.started[-1], [reading(1, aqi=30)])
+        forced = h.controller.refresh(force=True)
+        self.assertIsNone(h.controller.view_changed(VIEW))
+        decision = h.finish(forced, [reading(1, aqi=150)])
+        self.assertTrue(decision.publish)
+        self.assertEqual(h.controller.sensors[0].aqi, 150)
+        self.assertFalse(h.controller.refresh().force)  # satisfied force is cleared
+
+    def test_new_target_supersedes_manual_refresh(self):
+        h = Harness()
+        h.controller.view_changed(VIEW)
+        h.finish(h.started[-1], [reading(1)])
+        forced = h.controller.refresh(force=True)
+        self.assertEqual(h.controller.view_changed(OTHER), (35.0, -20.0))
+        self.assertFalse(h.controller.accept_refresh(h.outcome(forced, [reading(2)])).publish)
+        self.assertFalse(h.controller.settle_refresh().force)
+
+    def test_home_report_keeps_manual_refresh_for_implicit_and_explicit_home(self):
+        for name, start in (
+            ("implicit", lambda c: c.refresh(force=True)),
+            ("explicit", lambda c: c.refresh_home(force=True)),
+        ):
+            with self.subTest(home=name):
+                h = Harness()
+                forced = start(h.controller)
+                bounds = forced.bounds
+                home = {
+                    "north": bounds.north,
+                    "west": bounds.west,
+                    "south": bounds.south,
+                    "east": bounds.east,
+                    "lat": forced.center[0],
+                    "lon": forced.center[1],
+                }
+
+                self.assertIsNone(h.controller.view_changed(home))
+                self.assertIsNone(h.controller.refresh())
+
+                self.assertIsNone(h.controller.pending_fetch)
+                self.assertIs(h.controller.active_fetch, forced)
+                self.assertTrue(h.finish(forced, [reading(1, aqi=150)]).publish)
+                self.assertEqual(len(h.started), 1)  # one billed poll
+
+    def test_new_target_supersedes_implicit_home_manual_refresh(self):
+        h = Harness()
+        forced = h.controller.refresh(force=True)
+        self.assertEqual(h.controller.view_changed(OTHER), (35.0, -20.0))
+        self.assertFalse(h.controller.accept_refresh(h.outcome(forced, [reading(2)])).publish)
+        self.assertFalse(h.controller.settle_refresh().force)
+
+    def test_force_is_sticky_across_an_unforced_filter_refresh(self):
+        h = Harness()
+        h.controller.refresh(force=True)
+        h.controller.set_location_filter("indoor")
+        h.controller.refresh()
+        self.assertTrue(h.controller.pending_fetch.force)
+
     def test_invalid_views_are_ignored(self):
         h = Harness()
         for view in ({**VIEW, "lat": float("nan")}, {**VIEW, "north": 91.0}, {"lat": 1}):
@@ -398,6 +475,18 @@ class RefreshWorkflowTest(unittest.TestCase):
         h.controller.select(2)
         decision = h.finish(h.controller.refresh(), [reading(1), reading(2)])
         self.assertEqual(decision.trend_ids, (2,))
+
+    def test_restore_view_reports_last_valid_view_and_zoom(self):
+        h = Harness()
+        self.assertIsNone(h.controller.restore_view())
+
+        h.controller.view_changed({**VIEW, "zoom": 9})
+        self.assertEqual(
+            h.controller.restore_view(), {"lat": 15.0, "lon": -20.0, "zoom": 9.0}
+        )
+
+        h.controller.view_changed({**VIEW, "lat": 16.0, "zoom": "x"})
+        self.assertIsNone(h.controller.restore_view()["zoom"])
 
 
 class PreferenceTransactionTest(unittest.TestCase):
@@ -480,6 +569,79 @@ class PreferenceTransactionTest(unittest.TestCase):
         self.assertEqual(h.config, before)
         self.assertEqual(h.saves, [])
 
+    MALFORMED = (
+        ("radius_km", "NaN"), ("radius_km", "Infinity"), ("radius_km", "-inf"), ("radius_km", True),
+        ("radius_km", None), ("radius_km", []), ("heatmap_threshold_km", "NaN"),
+        ("heatmap_threshold_km", True), ("alert_threshold", True), ("alert_threshold", "NaN"),
+        ("alert_threshold", "120.5"), ("refresh_minutes", True), ("refresh_minutes", "inf"),
+        ("home_lat", "NaN"), ("home_lon", True), ("confidence_filter", "false"),
+        ("confidence_filter", 1), ("clear_api_key", "yes"), ("api_key", {"x": 1}),
+        ("api_key", 123), ("api_key", ["k"]), ("location_name", {"x": 1}),
+    )
+
+    def test_malformed_settings_values_are_rejected_without_persisting(self):
+        for field, value in self.MALFORMED:
+            with self.subTest(field=field, value=value):
+                h = Harness()
+                before = deepcopy(h.config)
+                result = h.controller.save_settings({**self.SETTINGS, field: value})
+                self.assertEqual(result.status, "invalid")
+                self.assertIn(field, result.error)
+                self.assertEqual(h.config, before)
+                self.assertEqual(h.saves, [])
+
+    def test_malformed_home_fields_are_rejected_in_auto_mode_too(self):
+        cases = (
+            ("location_name", {"x": 1}), ("location_name", 7), ("home_lat", "NaN"),
+            ("home_lat", True), ("home_lon", "inf"), ("home_lon", []),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                h = Harness(home_mode="auto")
+                before = deepcopy(h.config)
+                result = h.controller.save_settings(
+                    {**self.SETTINGS, "home_mode": "auto", field: value}
+                )
+                self.assertEqual(result.status, "invalid")
+                self.assertIn(field, result.error)
+                self.assertEqual(h.config, before)
+                self.assertEqual(h.saves, [])
+
+    def test_auto_mode_saves_with_well_formed_or_absent_home_fields(self):
+        payloads = (
+            {**self.SETTINGS, "home_mode": "auto", "home_lat": "10.5", "home_lon": "-20.25",
+             "location_name": "Somewhere"},
+            {key: value for key, value in self.SETTINGS.items()
+             if key not in ("home_lat", "home_lon", "location_name")} | {"home_mode": "auto"},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                h = Harness(home_mode="auto")
+                before = {k: h.config[k] for k in ("latitude", "longitude", "location_name")}
+                result = h.controller.save_settings(payload)
+                self.assertEqual(result.status, "success")
+                self.assertEqual(
+                    {k: h.config[k] for k in ("latitude", "longitude", "location_name")}, before
+                )
+
+    def test_form_numeric_strings_still_save(self):
+        h = Harness(home_mode="auto")
+        result = h.controller.save_settings({
+            **self.SETTINGS, "radius_km": "30", "heatmap_threshold_km": "50",
+            "alert_threshold": "120", "refresh_minutes": "5", "home_lat": "10.5",
+            "home_lon": "-20.25", "api_key": "  new-key  ", "clear_api_key": False,
+            "confidence_filter": False, "interface_scale": 1,
+        })
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            {k: h.config[k] for k in ("radius_km", "heatmap_threshold_km", "alert_threshold",
+                                      "refresh_minutes", "latitude", "longitude", "api_key",
+                                      "confidence_filter")},
+            {"radius_km": 30.0, "heatmap_threshold_km": 50.0, "alert_threshold": 120,
+             "refresh_minutes": 5, "latitude": 10.5, "longitude": -20.25,
+             "api_key": "new-key", "confidence_filter": False},
+        )
+
     def test_detected_home_requires_auto_mode(self):
         h = Harness(home_mode="fixed")
         self.assertIsNone(h.controller.set_detected_home(1.0, 2.0))
@@ -496,6 +658,7 @@ class AlertWorkflowTest(unittest.TestCase):
         self.assertTrue(decision.publish)
 
         alerts = h.controller.evaluate_alerts()
+        h.controller.record_alert_delivery(1, True)
         repeat = h.controller.evaluate_alerts()
 
         self.assertEqual([sensor.sensor_id for sensor in alerts.notify], [1])
@@ -525,6 +688,50 @@ class AlertWorkflowTest(unittest.TestCase):
 
         self.assertIn("Could not save alert state", alerts.error)
         self.assertEqual(h.config["alert_states"], {"1": False})
+
+    def test_failed_delivery_retries_each_evaluation_only_while_eligible(self):
+        h = Harness(favorites=[1], alert_states={})
+        h.finish(h.controller.refresh(), [reading(1, aqi=150)])
+        first = h.controller.evaluate_alerts()
+        self.assertEqual([s.sensor_id for s in first.notify], [1])
+        h.controller.record_alert_delivery(1, False)
+        self.assertEqual([s.sensor_id for s in h.controller.evaluate_alerts().notify], [1])
+        h.controller.record_alert_delivery(1, False)
+        h.wall += 7201                                     # age 7261 s > 7200: not is_fresh_observation
+        self.assertEqual(h.controller.evaluate_alerts().notify, ())
+        h.finish(h.controller.refresh(), [reading(1, aqi=160, last_seen=int(h.wall) - 60)])
+        retry = h.controller.evaluate_alerts()
+        self.assertEqual([s.aqi for s in retry.notify], [160])
+        h.controller.record_alert_delivery(1, True)
+        self.assertEqual(h.controller.evaluate_alerts().notify, ())
+        self.assertEqual(h.config["alert_states"], {"1": True})
+        self.assertEqual(len(h.saves), 1)
+
+    def test_persistence_failure_never_renotifies_the_same_crossing(self):
+        h = Harness(favorites=[1], alert_states={})
+        h.finish(h.controller.refresh(), [reading(1, aqi=150)])
+        h.failure = DENIED
+        counts = []
+        for _ in range(3):
+            decision = h.controller.evaluate_alerts()
+            counts.append(len(decision.notify))
+            self.assertIn("Could not save alert state", decision.error)
+            for sensor in decision.notify:
+                h.controller.record_alert_delivery(sensor.sensor_id, True)
+        self.assertEqual(counts, [1, 0, 0])
+        self.assertEqual(h.config["alert_states"], {})
+        h.failure = None
+        self.assertEqual(h.controller.evaluate_alerts().notify, ())
+        self.assertEqual(h.config["alert_states"], {"1": True})
+
+    def test_reset_crossing_alerts_again(self):
+        h = Harness(favorites=[1], alert_states={})
+        h.finish(h.controller.refresh(), [reading(1, aqi=150)])
+        h.controller.evaluate_alerts(); h.controller.record_alert_delivery(1, True)
+        h.finish(h.controller.refresh(), [reading(1, aqi=20)])
+        self.assertEqual(h.controller.evaluate_alerts().notify, ())
+        h.finish(h.controller.refresh(), [reading(1, aqi=150)])
+        self.assertEqual([s.sensor_id for s in h.controller.evaluate_alerts().notify], [1])
 
 
 class TrendDecisionTest(unittest.TestCase):
@@ -564,6 +771,120 @@ class TrendDecisionTest(unittest.TestCase):
         self.assertEqual(loaded.status, "loaded")
         self.assertTrue(loaded.store)
         self.assertEqual(sensor.trend, [{"label": "Now", "aqi": 9}])
+
+    def test_successful_key_change_revokes_tracked_trend(self):
+        h = Harness()
+        h.controller.sensors = [reading(1, last_seen=100)]
+        plan = h.controller.begin_trend(1)
+        h.controller.track_trend(plan)
+
+        result = h.controller.save_settings(
+            {**PreferenceTransactionTest.SETTINGS, "clear_api_key": True}
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertFalse(h.controller.trend_wanted(plan))
+        self.assertIsNone(
+            h.controller.finish_trend(1, 100, plan.token, [{"label": "Now", "aqi": 9}], False)
+        )
+        self.assertNotIn(1, h.controller.trend_inflight)
+
+        for case, failure, update in (
+            ("failed", DENIED, {"clear_api_key": True}),
+            ("unchanged", None, {}),
+        ):
+            with self.subTest(case=case):
+                h = Harness()
+                h.controller.sensors = [reading(1, last_seen=100)]
+                plan = h.controller.begin_trend(1)
+                h.controller.track_trend(plan)
+                h.failure = failure
+
+                result = h.controller.save_settings({**PreferenceTransactionTest.SETTINGS, **update})
+
+                self.assertEqual(result.status, "error" if failure else "success")
+                self.assertTrue(h.controller.trend_wanted(plan))
+                self.assertIn(1, h.controller.trend_inflight)
+
+    def test_trend_credential_is_the_committed_key_only_while_authorized(self):
+        for case, update in (("clear", {"clear_api_key": True}), ("replace", {"api_key": "new"})):
+            with self.subTest(case=case):
+                h = Harness()
+                h.controller.sensors = [reading(1, last_seen=100)]
+                plan = h.controller.begin_trend(1)
+                h.controller.track_trend(plan)
+                self.assertEqual(h.controller.trend_credential(plan), "key")
+
+                h.controller.save_settings({**PreferenceTransactionTest.SETTINGS, **update})
+
+                # Neither the old key nor its replacement is spent on a revoked plan.
+                self.assertIsNone(h.controller.trend_credential(plan))
+
+    def test_unsettled_trend_serves_only_its_reading_and_credential(self):
+        trend = [{"label": "Now", "aqi": 9}]
+        h = Harness()
+        sensor = reading(1, last_seen=100)
+        h.controller.sensors = [sensor]
+        plan = h.controller.begin_trend(1)
+        h.controller.track_trend(plan)
+        h.controller.finish_trend(1, 100, plan.token, trend, False)
+        h.controller.hold_trend(1, 100, h.controller.credential_generation, trend)
+
+        served = h.controller.begin_trend(1)
+        self.assertEqual((served.kind, served.status, served.trend), ("local", "loaded", trend))
+        self.assertFalse(h.requests.is_current(served.token))
+
+        # Settling an older write leaves a newer hold in place.
+        h.controller.settle_trend(1, 99, h.controller.credential_generation)
+        self.assertIn(1, h.controller.trend_unsettled)
+        h.controller.settle_trend(1, 100, h.controller.credential_generation)
+        self.assertNotIn(1, h.controller.trend_unsettled)
+        self.assertEqual(h.controller.begin_trend(1).kind, "remote")
+
+        # A newer reading supersedes the hold instead of being served by it.
+        h.controller.hold_trend(1, 100, h.controller.credential_generation, trend)
+        sensor.last_seen = 200
+        self.assertEqual(h.controller.begin_trend(1).kind, "remote")
+        self.assertNotIn(1, h.controller.trend_unsettled)
+
+        # A credential change revokes the hold.
+        sensor.last_seen = 100
+        h.controller.hold_trend(1, 100, h.controller.credential_generation, trend)
+        h.controller.save_settings({**PreferenceTransactionTest.SETTINGS, "api_key": "new"})
+        self.assertNotIn(1, h.controller.trend_unsettled)
+        self.assertEqual(h.controller.begin_trend(1).kind, "remote")
+
+
+class CachedStartupDecisionTest(unittest.TestCase):
+    def test_home_paint_is_bound_to_the_home_target(self):
+        h = Harness()
+        home_bounds = h.controller.home_bounds()
+        token = h.controller.begin_cached_startup()
+        h.controller.view_changed(VIEW)
+
+        self.assertFalse(h.controller.apply_cached_startup(token, [reading(7)], home_bounds))
+        self.assertEqual(h.controller.sensors, [])
+        self.assertEqual(h.controller.current_view[1], (15.0, -20.0))
+        # A view away from home never admits a home paint.
+        self.assertIsNone(h.controller.begin_cached_startup())
+
+    def test_home_report_keeps_the_home_paint(self):
+        h = Harness()
+        home_bounds = h.controller.home_bounds()
+        token = h.controller.begin_cached_startup()
+        config = h.config
+        h.controller.view_changed(
+            {
+                "north": home_bounds.north,
+                "west": home_bounds.west,
+                "south": home_bounds.south,
+                "east": home_bounds.east,
+                "lat": float(config["latitude"]),
+                "lon": float(config["longitude"]),
+            }
+        )
+
+        self.assertTrue(h.controller.apply_cached_startup(token, [reading(7)], home_bounds))
 
 
 class LifecycleTest(unittest.TestCase):

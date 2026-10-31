@@ -100,6 +100,7 @@
       if (event === "motion") { state.systemReducedMotion = payload.reduced === true; applyMotionPreference(); }
       if (event === "trend") applyTrend(payload);
       if (event === "places") applyPlaces(payload);
+      if (event === "restore-view") restoreView(payload);
     },
     // Small, legitimate debug accessors used by the debug port (see
     // airloom/debugport.py and app.py's _debug_* handlers) to read and
@@ -196,6 +197,25 @@
     if (payload.name) state.config.location_name = payload.name;
     stampPlaceName();
     if (payload.source === "geoclue" || payload.source === "fixed") flyTo(lat, lon);
+  }
+
+  // Shell recovery: adopt the controller's viewport so the reloaded page and
+  // Python target one view before the refresh that follows ready.
+  // Anything but a finite center and a zoom in [3, 17] (or null) is ignored
+  // whole, so a malformed payload can never move or hang the map. Latitude
+  // clamps to the Mercator limit and longitude wraps arithmetically (the same
+  // place, bounded for projection); a fractional zoom settles on the nearest
+  // whole level, as gestures do.
+  function restoreView(payload) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+    const { lat, lon, zoom } = payload;
+    if (typeof lat !== "number" || !Number.isFinite(lat)) return;
+    if (typeof lon !== "number" || !Number.isFinite(lon)) return;
+    if (zoom !== null && (typeof zoom !== "number" || !(zoom >= 3 && zoom <= 17))) return;
+    state.center = { lat: clampLat(lat), lon: wrapLon(lon) };
+    if (zoom !== null) state.zoom = Math.round(zoom);
+    state.positioned = true;
+    renderMap();
   }
 
   function applyConfig(config) {

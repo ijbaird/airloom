@@ -11,7 +11,6 @@ import contextlib
 import errno
 import json
 import sys
-import tempfile
 from unittest import mock
 
 from airloom.controller import sensor_payload
@@ -20,13 +19,15 @@ from tests.test_app_requests import ScriptMessage, TransactionalActionTest, make
 
 def main() -> None:
     request = json.load(sys.stdin)
-    with tempfile.TemporaryDirectory() as directory:
+    helper = TransactionalActionTest()
+    # Drains the store's settings-sync worker before the directory is removed.
+    with helper.settings_directory() as directory:
         sensors = []
         for item in request.get("sensors", []):
             sensor = make_sensor(item["id"])
             sensor.origin = item.get("origin", "live")
             sensors.append(sensor)
-        app = TransactionalActionTest().make_real_store_app(directory, sensors=sensors)
+        app = helper.make_real_store_app(directory, sensors=sensors)
         failure = PermissionError(errno.EACCES, "Permission denied")
         writes = (
             mock.patch.object(app.store, "_write", side_effect=failure)
