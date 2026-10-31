@@ -275,6 +275,80 @@ class TrendRequestTest(ApplicationRequestTestCase):
                 self.assertNotIn("loaded", [p["status"] for p in self.trend_events(app)])
                 self.assertEqual(app._trend_inflight, {})
 
+    def run_trend_with_key_change(self, update, *, during_check=False, during_client=False):
+        """Run one trend worker, committing ``update`` at the chosen interleaving.
+
+        Returns the PurpleAirClient mock and the app. ``during_check`` commits
+        right after the worker's authority check returns (the old check/capture
+        gap); a commit that must wait for the atomic check runs on a real thread
+        that is joined before completion. ``during_client`` commits inside the
+        client constructor, after authority and key capture.
+        """
+        app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+        threads, idles = ThreadQueue(), IdleQueue()
+        real_thread = threading.Thread
+        settings = {**TransactionalActionTest.settings_message(), **update}
+        commit = lambda: app.controller.save_settings(settings)  # noqa: E731
+        waiting = []
+        client = mock.Mock()
+        client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+        def construct(api_key):
+            if during_client:
+                commit()
+            return client
+
+        client_type = mock.Mock(side_effect=construct)
+        check = app.controller.trend_wanted
+
+        def check_then_commit(plan):
+            wanted = check(plan)
+            lock = getattr(app.controller, "_credential_lock", None)
+            if lock is not None and lock.locked():
+                waiting.append(real_thread(target=commit))
+                waiting[-1].start()
+            else:
+                commit()
+            return wanted
+
+        with (mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+              mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+              mock.patch.object(app_module, "PurpleAirClient", client_type),
+              mock.patch.object(app_module, "trend_from_values", return_value=[{"label": "Now", "aqi": 9}])):
+            if during_check:
+                app.controller.trend_wanted = check_then_commit
+            app._ensure_trend(1)
+            threads.threads[0].run()
+            for thread in waiting:
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+        return client_type, app
+
+    def test_key_change_after_check_never_spends_a_revoked_or_replacement_key(self):
+        for case, update in (("clear", {"clear_api_key": True}), ("replace", {"api_key": "replacement-key"})):
+            with self.subTest(case=case):
+                client_type, app = self.run_trend_with_key_change(update, during_check=True)
+                # The change is serialized after the atomic authorization, so
+                # only the key that authorized the plan may be spent ...
+                client_type.assert_called_once_with("test-api-key")
+                # ... and the revoked completion is discarded.
+                self.assertNotIn("loaded", [p["status"] for p in self.trend_events(app)])
+                self.assertEqual(app._trend_inflight, {})
+                self.assertEqual(app.controller.sensors[0].trend, [])
+                self.assertEqual(app.cache.stored, [])
+
+    def test_key_change_after_authorization_discards_inflight_completion(self):
+        for case, update in (("clear", {"clear_api_key": True}), ("replace", {"api_key": "replacement-key"})):
+            with self.subTest(case=case):
+                client_type, app = self.run_trend_with_key_change(update, during_client=True)
+                client_type.assert_called_once_with("test-api-key")
+                self.assertNotIn("loaded", [p["status"] for p in self.trend_events(app)])
+                self.assertEqual(app._trend_inflight, {})
+                self.assertEqual(app.controller.sensors[0].trend, [])
+                self.assertEqual(app.cache.stored, [])
+
     def test_trend_error_is_terminal_and_allows_manual_retry(self):
         app = self.make_app(sensors=[make_sensor(last_seen=1234)])
         threads = ThreadQueue()

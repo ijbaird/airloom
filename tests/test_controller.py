@@ -794,6 +794,20 @@ class TrendDecisionTest(unittest.TestCase):
                 self.assertTrue(h.controller.trend_wanted(plan))
                 self.assertIn(1, h.controller.trend_inflight)
 
+    def test_trend_credential_is_the_committed_key_only_while_authorized(self):
+        for case, update in (("clear", {"clear_api_key": True}), ("replace", {"api_key": "new"})):
+            with self.subTest(case=case):
+                h = Harness()
+                h.controller.sensors = [reading(1, last_seen=100)]
+                plan = h.controller.begin_trend(1)
+                h.controller.track_trend(plan)
+                self.assertEqual(h.controller.trend_credential(plan), "key")
+
+                h.controller.save_settings({**PreferenceTransactionTest.SETTINGS, **update})
+
+                # Neither the old key nor its replacement is spent on a revoked plan.
+                self.assertIsNone(h.controller.trend_credential(plan))
+
 
 class LifecycleTest(unittest.TestCase):
     def test_shutdown_rejects_new_work_and_invalidates_callbacks(self):

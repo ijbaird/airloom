@@ -1366,10 +1366,11 @@ class AirloomApplication(Adw.Application):
             trend = None
             failed = False
             try:
-                if self.controller.trend_wanted(plan):
-                    # Read the key only once authority is confirmed, so a
-                    # revoked plan never holds a client for the old key.
-                    api_key = self.controller.config.get("api_key", "")
+                # Authority and the key come from one atomic step. A key change
+                # after it can still race the socket send below (no lock is
+                # held across network I/O); finish_trend discards that result.
+                api_key = self.controller.trend_credential(plan)
+                if api_key is not None:
                     result = _new_purpleair_client(api_key).fetch_rows(
                         show_only=[sensor_id], fields=TREND_FETCH_FIELDS
                     )

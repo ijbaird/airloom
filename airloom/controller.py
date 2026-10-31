@@ -11,6 +11,7 @@ outside: workers fetch, and the adapter reads/writes the trend cache.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -233,8 +234,10 @@ class ApplicationController:
         self.coverage: dict | None = None
         # Trend work by sensor: token, reading last_seen, credential generation.
         self.trend_inflight: dict[int, tuple[RequestToken, int | None, int]] = {}
-        # Advanced by each committed API key change or clear.
+        # Advanced by each committed API key change or clear. The lock orders
+        # each key commit against trend_credential, never across network I/O.
         self._credential_generation = 0
+        self._credential_lock = threading.Lock()
         # Observed threshold state, overlaying persisted alert_states so a
         # failed save never makes the same crossing look new again.
         self._alert_observed: dict[str, bool] = {}
@@ -724,8 +727,21 @@ class ApplicationController:
             plan.credential_generation,
         )
 
+    def trend_credential(self, plan: TrendPlan) -> str | None:
+        """The key to spend on an authorized plan, or None once revoked.
+
+        Authorization and the key read are one step under the credential lock,
+        so a key change commits either before it (no request) or after it (the
+        request is in flight and ``finish_trend`` discards its completion).
+        Callable from the trend worker.
+        """
+        with self._credential_lock:
+            if not self.trend_wanted(plan):
+                return None
+            return self.config.get("api_key")
+
     def trend_wanted(self, plan: TrendPlan) -> bool:
-        """Recheck before paid network I/O; callable from the trend worker."""
+        """Whether a plan is still authorized; ``trend_credential`` gates spending."""
         sensor = self._sensor(plan.sensor_id)
         return (
             self._requests.is_current(plan.token)
@@ -904,18 +920,21 @@ class ApplicationController:
             candidate["api_key"] = ""
         elif api_key:
             candidate["api_key"] = api_key
-        try:
-            self._save(candidate)
-        except OSError as exc:
-            return SettingsResult("error", _persistence_error("save preferences", exc))
-        self._commit(reissue=False)
-        if candidate.get("api_key", "") != previous_key:
-            # Trend work authorized by the old credential (or live mode) must
-            # neither spend the new key nor publish under it.
-            self._credential_generation += 1
-            for sensor_id in self.trend_inflight:
-                self._requests.invalidate(f"trend:{sensor_id}")
-            self.trend_inflight.clear()
+        # Saving publishes the new key, so the save and the revocation are one
+        # step against trend_credential.
+        with self._credential_lock:
+            try:
+                self._save(candidate)
+            except OSError as exc:
+                return SettingsResult("error", _persistence_error("save preferences", exc))
+            self._commit(reissue=False)
+            if candidate.get("api_key", "") != previous_key:
+                # Trend work authorized by the old credential (or live mode)
+                # must neither spend the new key nor publish under it.
+                self._credential_generation += 1
+                for sensor_id in self.trend_inflight:
+                    self._requests.invalidate(f"trend:{sensor_id}")
+                self.trend_inflight.clear()
         home_mode = updates["home_mode"]
         return SettingsResult(
             "success",
