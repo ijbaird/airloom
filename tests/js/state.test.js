@@ -2902,6 +2902,68 @@ test("a successful filter save updates the chip from Python's acknowledgment", (
   assert.equal(app.context.Airloom.debugState().location_filter, "indoor");
 });
 
+function runSharedFavoriteTrend(messages) {
+  return JSON.parse(require("node:child_process").execFileSync(
+    "python3",
+    [path.resolve(__dirname, "fixtures/shared_favorite_trend.py")],
+    {
+      cwd: path.resolve(__dirname, "../.."),
+      env: { ...process.env, PYTHONPATH: path.resolve(__dirname, "../..") },
+      input: JSON.stringify({ messages }),
+      encoding: "utf8",
+    },
+  ));
+}
+
+test("a shared-id favorite renders the trend Python sends for the reading it published", () => {
+  // Python replays deterministically, so each later run extends the events
+  // the page has already received; only the new tail is delivered.
+  let messages = [];
+  let delivered = [];
+  const deliver = (app) => {
+    const { events } = runSharedFavoriteTrend(messages);
+    assert.deepEqual(events.slice(0, delivered.length), delivered, "the replay extends the delivered events");
+    const tail = events.slice(delivered.length);
+    for (const [event, payload] of tail) app.context.Airloom.receive(event, payload);
+    delivered = events;
+    return tail.filter(([event]) => event === "trend").map(([, payload]) => payload);
+  };
+  const select = (app, list, id) => {
+    const before = app.messages.length;
+    rowFor(app, list, id).click();
+    const posted = app.messages.slice(before).filter((message) => message.action === "select");
+    assert.deepEqual(posted, [{ action: "select", id }]);
+    messages = [...messages, ...posted];
+  };
+  const settled = (app) => {
+    const chart = app.elements.get("chart").innerHTML;
+    assert.doesNotMatch(chart, /Loading/);
+    assert.match(chart, /<svg/);
+  };
+
+  const app = loadApp({ nowMs: 1_790_000_060_000 });
+  configureMap(app, { has_api_key: true });
+  app.elements.get("sensors-panel").hidden = false;
+  deliver(app);
+  const published = delivered.filter(([event]) => event === "sensors").at(-1)[1];
+  const favorite = published.favorites.find((sensor) => sensor.id === 7);
+  const area = published.area.find((sensor) => sensor.id === 7);
+  assert.notEqual(published.selected_id, 7);
+
+  select(app, "favorites-list", 7);
+  const favoriteTrend = deliver(app);
+  assert.equal(app.elements.get("aqi-number").textContent, String(favorite.aqi));
+  settled(app);
+  assert.deepEqual(favoriteTrend.map((event) => [event.sensor_id, event.status, event.reading_last_seen]),
+    [[7, "loading", favorite.last_seen], [7, "loaded", favorite.last_seen]]);
+
+  select(app, "sensor-list", 7);
+  const areaTrend = deliver(app);
+  assert.equal(app.elements.get("aqi-number").textContent, String(area.aqi));
+  settled(app);
+  assert.ok(areaTrend.every((event) => event.sensor_id === 7 && event.reading_last_seen === area.last_seen));
+});
+
 test("rapid filter clicks before acknowledgment advance from the requested filter", () => {
   const app = loadApp();
   configureMap(app, { location_filter: "indoor" });

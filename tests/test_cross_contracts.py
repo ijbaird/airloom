@@ -8,6 +8,7 @@ the Store's background durability reporting (data) and the adapter's toast.
 from __future__ import annotations
 
 import errno
+import importlib.util
 import io
 import json
 import threading
@@ -257,6 +258,68 @@ class SettingsInspectionWarningContractTest(app_requests.ApplicationRequestTestC
     @staticmethod
     def errors(app):
         return [payload["message"] for event, payload in app.sent if event == "error"]
+
+
+def load_shared_favorite_fixture():
+    path = Path(__file__).resolve().parent / "js" / "fixtures" / "shared_favorite_trend.py"
+    spec = importlib.util.spec_from_file_location("shared_favorite_trend", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class SharedFavoriteTrendContractTest(unittest.TestCase):
+    """A favorite also in the area is published, and trended, as one reading.
+
+    The page keys trend state per published reading (W3), so the backend's
+    trend events must carry the published favorite's own last_seen. The
+    page side of this contract is tests/js/state.test.js ("a shared-id
+    favorite renders the trend ..."), fed by the same fixture."""
+
+    def setUp(self):
+        self.fixture = load_shared_favorite_fixture()
+
+    def sensor_events(self, events):
+        return [payload for event, payload in events if event == "sensors"]
+
+    def trend_events(self, events, sensor_id):
+        return [
+            payload for event, payload in events
+            if event == "trend" and payload["sensor_id"] == sensor_id
+        ]
+
+    def test_the_shared_favorite_is_the_area_reading_in_every_collection(self):
+        fixture = self.fixture
+        result = fixture.capture([])
+
+        favorite_fetches = [call["ids"] for call in result["calls"] if call["kind"] == "favorites"]
+        self.assertEqual(favorite_fetches, [[fixture.REMOTE_ID]])
+        publications = self.sensor_events(result["events"])
+        self.assertTrue(publications)
+        for payload in publications:
+            for collection in ("items", "area", "favorites"):
+                with self.subTest(collection=collection):
+                    shared = [s for s in payload[collection] if s["id"] == fixture.SHARED_ID]
+                    self.assertEqual(len(shared), 1)
+                    self.assertEqual(shared[0]["last_seen"], fixture.AREA_SEEN)
+                    self.assertIs(shared[0]["remote_favorite"], False)
+                    self.assertIs(shared[0]["favorite"], True)
+
+    def test_selecting_a_favorite_trends_the_reading_it_was_published_as(self):
+        fixture = self.fixture
+        for sensor_id in (fixture.SHARED_ID, fixture.REMOTE_ID):
+            with self.subTest(sensor_id=sensor_id):
+                result = fixture.capture([{"action": "select", "id": sensor_id}])
+                published = self.sensor_events(result["events"])[-1]
+                favorite = next(s for s in published["favorites"] if s["id"] == sensor_id)
+                trends = self.trend_events(result["events"], sensor_id)
+
+                self.assertEqual([t["status"] for t in trends], ["loading", "loaded"])
+                self.assertEqual(
+                    {t["reading_last_seen"] for t in trends}, {favorite["last_seen"]}
+                )
+                self.assertEqual(published["selected_id"], sensor_id)
+                self.assertIn({"kind": "trend", "ids": [sensor_id]}, result["calls"])
 
 
 if __name__ == "__main__":
