@@ -34,6 +34,7 @@ VIEW = {
     "lat": 15.0,
     "lon": -20.0,
 }
+OTHER = {**VIEW, "north": 40.0, "south": 30.0, "lat": 35.0}
 
 
 def make_sensor(sensor_id, *, indoor=False, confidence=100):
@@ -355,6 +356,49 @@ class RefreshWorkflowTest(unittest.TestCase):
         self.assertEqual(len(h.started), 2)
         h.monotonic += 120
         self.assertEqual(h.controller.view_changed(VIEW), (15.0, -20.0))
+
+    def test_automatic_refresh_never_downgrades_queued_manual_refresh(self):
+        h = Harness()
+        h.controller.refresh()
+        h.controller.refresh(force=True)
+        self.assertIsNone(h.controller.refresh())
+        self.assertTrue(h.controller.pending_fetch.force)
+        self.assertTrue(h.controller.settle_refresh().force)
+
+    def test_automatic_refresh_coalesces_with_active_manual_refresh(self):
+        h = Harness()
+        manual = h.controller.refresh(force=True)
+        self.assertIsNone(h.controller.refresh())
+        self.assertIsNone(h.controller.pending_fetch)
+        self.assertTrue(h.finish(manual, [reading(1, aqi=150)]).publish)
+        self.assertEqual(len(h.started), 1)  # no second billed poll
+
+    def test_identical_covered_view_keeps_manual_refresh(self):
+        h = Harness()
+        h.controller.view_changed(VIEW)
+        h.finish(h.started[-1], [reading(1, aqi=30)])
+        forced = h.controller.refresh(force=True)
+        self.assertIsNone(h.controller.view_changed(VIEW))
+        decision = h.finish(forced, [reading(1, aqi=150)])
+        self.assertTrue(decision.publish)
+        self.assertEqual(h.controller.sensors[0].aqi, 150)
+        self.assertFalse(h.controller.refresh().force)  # satisfied force is cleared
+
+    def test_new_target_supersedes_manual_refresh(self):
+        h = Harness()
+        h.controller.view_changed(VIEW)
+        h.finish(h.started[-1], [reading(1)])
+        forced = h.controller.refresh(force=True)
+        self.assertEqual(h.controller.view_changed(OTHER), (35.0, -20.0))
+        self.assertFalse(h.controller.accept_refresh(h.outcome(forced, [reading(2)])).publish)
+        self.assertFalse(h.controller.settle_refresh().force)
+
+    def test_force_is_sticky_across_an_unforced_filter_refresh(self):
+        h = Harness()
+        h.controller.refresh(force=True)
+        h.controller.set_location_filter("indoor")
+        h.controller.refresh()
+        self.assertTrue(h.controller.pending_fetch.force)
 
     def test_invalid_views_are_ignored(self):
         h = Harness()

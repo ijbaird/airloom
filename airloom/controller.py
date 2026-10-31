@@ -207,6 +207,9 @@ class ApplicationController:
         self.refreshing = False
         self.active_fetch: RefreshRequest | None = None
         self.pending_fetch: RefreshRequest | None = None
+        # The (bounds, center) a manual Refresh asked to force; it stays forced
+        # until a forced fetch for that target publishes or the target changes.
+        self._forced_target: tuple[Bounds, tuple[float, float]] | None = None
         # Where the user is looking, stamped as one (bounds, center) pair so a
         # refresh can never combine a stale half.
         self.current_view: tuple[Bounds, tuple[float, float]] | None = None
@@ -245,6 +248,7 @@ class ApplicationController:
         self.pending_fetch = None
         self.active_fetch = None
         self.refreshing = False
+        self._forced_target = None
         self._requests.invalidate()
         self._generation += 1
 
@@ -303,14 +307,36 @@ class ApplicationController:
         )
         self.current_view = (bounds, (float(view["lat"]), float(view["lon"])))
 
+    def _target(self) -> tuple[Bounds, tuple[float, float]]:
+        """The (bounds, center) a refresh would fetch: the view, else home."""
+        if self.current_view is not None:
+            return self.current_view
+        config = self.config
+        center = (float(config["latitude"]), float(config["longitude"]))
+        return bounds_around(*center, float(config["radius_km"])), center
+
+    def _forced_outstanding(self, target) -> bool:
+        """Whether a still-authorized forced fetch for ``target`` is queued or running."""
+        return any(
+            request is not None
+            and request.force
+            and request.generation == self._generation
+            and (request.bounds, request.center) == target
+            and self._requests.is_current(
+                RequestToken(request.request_id, "refresh", request.generation)
+            )
+            for request in (self.pending_fetch, self.active_fetch)
+        )
+
     def begin_refresh(self, force=False) -> RefreshRequest:
-        """Register refresh intent, superseding every earlier request."""
-        if self.current_view is None:
-            config = self.config
-            center = (float(config["latitude"]), float(config["longitude"]))
-            bounds = bounds_around(*center, float(config["radius_km"]))
-        else:
-            bounds, center = self.current_view
+        """Register refresh intent, superseding every earlier request.
+
+        An unsatisfied manual Refresh for the same target keeps the new
+        request forced.
+        """
+        target = self._target()
+        bounds, center = target
+        force = bool(force) or self._forced_target == target
 
         token = self._requests.begin("refresh", self._generation)
         return RefreshRequest(
@@ -318,7 +344,7 @@ class ApplicationController:
             generation=token.generation,
             bounds=bounds,
             center=center,
-            force=bool(force),
+            force=force,
             favorite_ids=tuple(
                 int(sensor_id) for sensor_id in self.config.get("favorites", ())
             ),
@@ -328,10 +354,16 @@ class ApplicationController:
         """Refresh the current view (home before one exists).
 
         Returns the request if a worker started now; queued or rejected work
-        returns None.
+        returns None. A refresh while a forced fetch for the same target is
+        queued or running coalesces into it instead of superseding it.
         """
         if self._stopped:
             return None
+        target = self._target()
+        if self._forced_outstanding(target):
+            return None
+        if force:
+            self._forced_target = target
         return self._admit(self.begin_refresh(force=force))
 
     def refresh_home(self, force=False) -> RefreshRequest | None:
@@ -341,6 +373,8 @@ class ApplicationController:
         config = self.config
         center = (float(config["latitude"]), float(config["longitude"]))
         self.current_view = (bounds_around(*center, float(config["radius_km"])), center)
+        if self.current_view != self._forced_target:
+            self._forced_target = None
         return self.refresh(force=force)
 
     def view_changed(self, message: dict) -> tuple[float, float] | None:
@@ -348,6 +382,8 @@ class ApplicationController:
 
         New view intent is registered even when fresh cached coverage needs no
         worker: the token supersedes active and queued work for the old view.
+        A duplicate report of the current view leaves an outstanding manual
+        Refresh for it alone.
         """
         if self._stopped:
             return None
@@ -355,6 +391,10 @@ class ApplicationController:
             view, center = view_from_message(message)
         except (KeyError, TypeError, ValueError, OverflowError):
             return None
+        if (view, center) == self.current_view and self._forced_outstanding((view, center)):
+            return None
+        if (view, center) != self._forced_target:
+            self._forced_target = None
         self.current_view = (view, center)
         request = self.begin_refresh()
         self.pending_fetch = None
@@ -434,6 +474,9 @@ class ApplicationController:
         )
         if not decision.publish:
             return decision
+        request = outcome.request
+        if request.force and (request.bounds, request.center) == self._forced_target:
+            self._forced_target = None
         for sensor in outcome.sensors:
             sensor.origin, sensor.delivery = outcome.provenance.get(
                 sensor.sensor_id, (outcome.origin, outcome.delivery)
