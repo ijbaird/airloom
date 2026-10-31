@@ -114,6 +114,9 @@ class Store:
     def __init__(self, path: Path | None = None):
         self.path = path or _default_config_dir() / "config.json"
         self._save_lock = threading.RLock()
+        # Parents of directories this process created whose fsync has not
+        # yet succeeded; until they do, no save can be reported durable.
+        self._unconfirmed_directories: list[Path] = []
         self.data = self._load()
 
     def _load(self) -> dict:
@@ -150,9 +153,18 @@ class Store:
             directory = directory.parent
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Each new directory is only reachable after a crash once the entry
-        # in its parent has been synced.
-        for directory in created:
-            _fsync_directory(directory.parent)
+        # in its parent has been synced. A failed sync is retried on every
+        # later save rather than blocking this one.
+        pending = list(self._unconfirmed_directories)
+        pending += [d.parent for d in created if d.parent not in pending]
+        self._unconfirmed_directories = []
+        unconfirmed_error: OSError | None = None
+        for directory in pending:
+            try:
+                _fsync_directory(directory)
+            except OSError as exc:
+                self._unconfirmed_directories.append(directory)
+                unconfirmed_error = unconfirmed_error or exc
         # mkstemp uses O_EXCL and mode 0600, so preexisting files and links
         # cannot redirect or expose the API key while it is being written.
         descriptor, temporary_name = tempfile.mkstemp(
@@ -180,10 +192,13 @@ class Store:
         try:
             _fsync_directory(self.path.parent)
         except OSError as exc:
+            unconfirmed_error = unconfirmed_error or exc
+        if unconfirmed_error is not None:
             raise SettingsDurabilityError(
-                f"Settings were saved, but the system could not confirm they reached the disk: {exc}",
+                "Settings were saved, but the system could not confirm they reached "
+                f"the disk: {unconfirmed_error}",
                 data,
-            ) from exc
+            ) from unconfirmed_error
 
     def public_config(self) -> dict:
         api_key = self.data.get("api_key")

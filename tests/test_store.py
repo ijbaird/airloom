@@ -603,17 +603,73 @@ class DurabilityTest(unittest.TestCase):
             self.assertEqual(Store(path).data, caught.exception.saved)
             self.assertEqual(list(Path(tmp).iterdir()), [path])
 
-    def test_new_directory_sync_failure_is_a_plain_prewrite_error(self):
+    def record_new_directory_failure(self):
+        """Fails every directory fsync until the returned flag is cleared."""
+        failing = [True]
+        events = self.record(
+            fail=lambda fd, events: failing[0] and stat.S_ISDIR(os.fstat(fd).st_mode)
+        )
+        return events, failing
+
+    def test_new_directory_sync_failure_commits_but_is_not_durable(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "new" / "airloom" / "config.json"
             settings = Store(path)
-            original = deepcopy(settings.data)
-            self.record(fail=lambda fd, events: stat.S_ISDIR(os.fstat(fd).st_mode))
-            with self.assertRaises(OSError) as caught:
+            self.record_new_directory_failure()
+            with self.assertRaises(store.SettingsDurabilityError) as caught:
                 settings.apply({**settings.data, "location_name": "Changed"})
-            self.assertNotIsInstance(caught.exception, store.SettingsDurabilityError)
-            self.assertEqual(settings.data, original)
-            self.assertFalse(path.exists())
+            exc = caught.exception
+            self.assertEqual(exc.saved["location_name"], "Changed")
+            self.assertEqual(settings.data, exc.saved)
+            self.assertEqual(Store(path).data, exc.saved)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_retry_syncs_unconfirmed_directory_entries_before_durable_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "new" / "airloom" / "config.json"
+            settings = Store(path)
+            events, failing = self.record_new_directory_failure()
+            with self.assertRaises(OSError):
+                settings.apply({**settings.data, "location_name": "Changed"})
+            failing[0] = False
+            events.clear()
+            settings.save()
+
+            def ino(directory):
+                return directory.stat().st_ino
+
+            self.assertEqual(
+                events,
+                [
+                    ("fsync", ino(Path(tmp))),
+                    ("fsync", ino(Path(tmp) / "new")),
+                    ("fsync", path.stat().st_ino),
+                    ("replace",),
+                    ("fsync", ino(path.parent)),
+                ],
+            )
+            # Once confirmed, later saves no longer resync the ancestors.
+            events.clear()
+            settings.save()
+            self.assertEqual(
+                events,
+                [("fsync", path.stat().st_ino), ("replace",), ("fsync", ino(path.parent))],
+            )
+
+    def test_retry_with_ancestor_sync_still_failing_is_not_durable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "new" / "airloom" / "config.json"
+            settings = Store(path)
+            unconfirmed = {Path(tmp).stat().st_ino}
+            self.record(fail=lambda fd, events: os.fstat(fd).st_ino in unconfirmed)
+            with self.assertRaises(store.SettingsDurabilityError):
+                settings.save()
+            with self.assertRaises(store.SettingsDurabilityError) as caught:
+                settings.apply({**settings.data, "location_name": "Retried"})
+            self.assertEqual(settings.data, caught.exception.saved)
+            self.assertEqual(Store(path).data["location_name"], "Retried")
+            unconfirmed.clear()
+            settings.save()
 
 
 class SensorIdTest(unittest.TestCase):
