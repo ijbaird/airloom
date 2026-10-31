@@ -99,6 +99,9 @@ class TrendPlan:
     reading_last_seen: int | None
     status: str | None = None
     trend: list | None = None
+    # The credential generation that authorized remote work; a key change or
+    # clear revokes it.
+    credential_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -228,7 +231,10 @@ class ApplicationController:
         self.last_origin = "live"
         self.last_stale = False
         self.coverage: dict | None = None
-        self.trend_inflight: dict[int, tuple[RequestToken, int | None]] = {}
+        # Trend work by sensor: token, reading last_seen, credential generation.
+        self.trend_inflight: dict[int, tuple[RequestToken, int | None, int]] = {}
+        # Advanced by each committed API key change or clear.
+        self._credential_generation = 0
         # Observed threshold state, overlaying persisted alert_states so a
         # failed save never makes the same crossing look new again.
         self._alert_observed: dict[str, bool] = {}
@@ -247,6 +253,10 @@ class ApplicationController:
     @property
     def stopped(self) -> bool:
         return self._stopped
+
+    @property
+    def credential_generation(self) -> int:
+        return self._credential_generation
 
     def shutdown(self) -> None:
         """Reject new work and invalidate every outstanding callback."""
@@ -691,7 +701,13 @@ class ApplicationController:
             self._requests.finish(token)
             status = "loaded" if sensor.trend else "unavailable"
             return TrendPlan("local", sensor_id, token, reading_last_seen, status, sensor.trend)
-        return TrendPlan("remote", sensor_id, token, reading_last_seen)
+        return TrendPlan(
+            "remote",
+            sensor_id,
+            token,
+            reading_last_seen,
+            credential_generation=self._credential_generation,
+        )
 
     def cached_trend(self, plan: TrendPlan, cached: list) -> TrendUpdate:
         sensor = self._sensor(plan.sensor_id)
@@ -702,13 +718,19 @@ class ApplicationController:
         return TrendUpdate("loaded" if cached else "unavailable", cached, sensor_changed=changed)
 
     def track_trend(self, plan: TrendPlan) -> None:
-        self.trend_inflight[plan.sensor_id] = (plan.token, plan.reading_last_seen)
+        self.trend_inflight[plan.sensor_id] = (
+            plan.token,
+            plan.reading_last_seen,
+            plan.credential_generation,
+        )
 
     def trend_wanted(self, plan: TrendPlan) -> bool:
         """Recheck before paid network I/O; callable from the trend worker."""
         sensor = self._sensor(plan.sensor_id)
         return (
             self._requests.is_current(plan.token)
+            and plan.credential_generation == self._credential_generation
+            and bool(self.config.get("api_key"))
             and sensor is not None
             and sensor.last_seen == plan.reading_last_seen
         )
@@ -727,6 +749,7 @@ class ApplicationController:
         authorized = (
             not self._stopped
             and owns_inflight
+            and inflight[2] == self._credential_generation
             and self._requests.is_current(token)
             and sensor is not None
             and sensor.last_seen == reading_last_seen
@@ -860,6 +883,7 @@ class ApplicationController:
         config = self.config
         previous_mode = config.get("home_mode")
         previous_home = (config.get("latitude"), config.get("longitude"))
+        previous_key = config.get("api_key", "")
         try:
             updates = self._settings_updates(message, config)
             clear_api_key = (
@@ -885,6 +909,13 @@ class ApplicationController:
         except OSError as exc:
             return SettingsResult("error", _persistence_error("save preferences", exc))
         self._commit(reissue=False)
+        if candidate.get("api_key", "") != previous_key:
+            # Trend work authorized by the old credential (or live mode) must
+            # neither spend the new key nor publish under it.
+            self._credential_generation += 1
+            for sensor_id in self.trend_inflight:
+                self._requests.invalidate(f"trend:{sensor_id}")
+            self.trend_inflight.clear()
         home_mode = updates["home_mode"]
         return SettingsResult(
             "success",

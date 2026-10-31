@@ -760,6 +760,40 @@ class TrendDecisionTest(unittest.TestCase):
         self.assertTrue(loaded.store)
         self.assertEqual(sensor.trend, [{"label": "Now", "aqi": 9}])
 
+    def test_successful_key_change_revokes_tracked_trend(self):
+        h = Harness()
+        h.controller.sensors = [reading(1, last_seen=100)]
+        plan = h.controller.begin_trend(1)
+        h.controller.track_trend(plan)
+
+        result = h.controller.save_settings(
+            {**PreferenceTransactionTest.SETTINGS, "clear_api_key": True}
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertFalse(h.controller.trend_wanted(plan))
+        self.assertIsNone(
+            h.controller.finish_trend(1, 100, plan.token, [{"label": "Now", "aqi": 9}], False)
+        )
+        self.assertNotIn(1, h.controller.trend_inflight)
+
+        for case, failure, update in (
+            ("failed", DENIED, {"clear_api_key": True}),
+            ("unchanged", None, {}),
+        ):
+            with self.subTest(case=case):
+                h = Harness()
+                h.controller.sensors = [reading(1, last_seen=100)]
+                plan = h.controller.begin_trend(1)
+                h.controller.track_trend(plan)
+                h.failure = failure
+
+                result = h.controller.save_settings({**PreferenceTransactionTest.SETTINGS, **update})
+
+                self.assertEqual(result.status, "error" if failure else "success")
+                self.assertTrue(h.controller.trend_wanted(plan))
+                self.assertIn(1, h.controller.trend_inflight)
+
 
 class LifecycleTest(unittest.TestCase):
     def test_shutdown_rejects_new_work_and_invalidates_callbacks(self):

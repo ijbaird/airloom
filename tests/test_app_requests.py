@@ -257,6 +257,24 @@ class TrendRequestTest(ApplicationRequestTestCase):
         self.assertEqual(sensor.trend, trend)
         self.assertEqual(client.fetch_rows.call_count, 1)
 
+    def test_key_change_revokes_queued_trend_before_paid_io(self):
+        for case, update in (("clear", {"clear_api_key": True}), ("replace", {"api_key": "replacement-key"})):
+            with self.subTest(case=case):
+                app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+                threads, idles = ThreadQueue(), IdleQueue()
+                client_type = mock.Mock()
+                with (mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                      mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                      mock.patch.object(app_module, "PurpleAirClient", client_type)):
+                    app._ensure_trend(1)
+                    app._save_settings({**TransactionalActionTest.settings_message(), **update})
+                    threads.threads[0].run()
+                    for index in range(len(idles.callbacks)):
+                        idles.run(index)
+                client_type.assert_not_called()
+                self.assertNotIn("loaded", [p["status"] for p in self.trend_events(app)])
+                self.assertEqual(app._trend_inflight, {})
+
     def test_trend_error_is_terminal_and_allows_manual_retry(self):
         app = self.make_app(sensors=[make_sensor(last_seen=1234)])
         threads = ThreadQueue()
