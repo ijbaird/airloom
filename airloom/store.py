@@ -55,6 +55,24 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _make_directories(directory: Path, mode: int = 0o700) -> list[Path]:
+    """``directory.mkdir(parents=True, exist_ok=True, mode=mode)``, with the
+    same system calls, returning the directories it created, outermost first."""
+    try:
+        directory.mkdir(mode=mode)
+    except FileNotFoundError:
+        if directory.parent == directory:
+            raise
+        created = _make_directories(directory.parent, mode=0o777)
+        directory.mkdir(mode=mode)
+        return [*created, directory]
+    except OSError:
+        if not directory.is_dir():
+            raise
+        return []
+    return [directory]
+
+
 def _default_config_dir() -> Path:
     # An empty or relative XDG_CONFIG_HOME must be ignored per the XDG spec;
     # honoring it would write the API key relative to the current directory.
@@ -198,12 +216,7 @@ class Store:
         return confirmed
 
     def _write(self, data: dict) -> None:
-        created = []
-        directory = self.path.parent
-        while not directory.exists():
-            created.insert(0, directory)
-            directory = directory.parent
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        created = _make_directories(self.path.parent)
         if created:
             # Each new directory is only reachable after a crash once the
             # entry in its parent is synced, even if this write then fails.
