@@ -1832,6 +1832,147 @@ test("reconcileKeyed tolerates text and comment children", () => {
   assert.equal(container.childNodes[0].textContent, "One");
 });
 
+function typeSearch(app, query) {
+  const search = app.elements.get("search");
+  search.value = query;
+  search.dispatch("input", { target: search });
+}
+
+function sensorResults(app) {
+  return app.elements.get("search-results").children.filter((button) => button.dataset.kind === "sensor");
+}
+
+function resultBadge(button) {
+  return button.innerHTML.match(/class="provenance-badge"[^>]*>(\w+)</)?.[1] ?? "";
+}
+
+test("sensor search results carry the category and a Demo badge for a synthetic favorite", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { name: "Live area", last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { name: "Synthetic remote", origin: "demo", favorite: true, last_seen: FRESH })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    stale: false,
+  });
+
+  typeSearch(app, "Synthetic");
+  const [synthetic] = sensorResults(app);
+  assert.equal(synthetic.getAttribute("aria-label"), "Synthetic remote, AQI 22, Fixture, Demo");
+  assert.match(synthetic.innerHTML, /Synthetic remote · AQI 22 · Fixture/);
+  assert.equal(resultBadge(synthetic), "Demo");
+  assert.match(synthetic.innerHTML, /title="Demo data, not a real sensor reading"/);
+
+  typeSearch(app, "Live");
+  const [live] = sensorResults(app);
+  assert.equal(live.getAttribute("aria-label"), "Live area, AQI 21, Fixture");
+  assert.equal(resultBadge(live), "");
+});
+
+test("sensor search results badge Stale and Old readings", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { name: "Stale one", delivery: "cache", last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { name: "Old one", favorite: true, remote_favorite: true, last_seen: NOW_S - 7201 })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+
+  typeSearch(app, "one");
+  const results = sensorResults(app);
+  assert.deepEqual(results.map((button) => button.getAttribute("aria-label")), [
+    "Stale one, AQI 21, Fixture, Stale",
+    "Old one, AQI 22, Fixture, Old",
+  ]);
+  assert.deepEqual(results.map(resultBadge), ["Stale", "Old"]);
+});
+
+test("live and in-interval cached sensor search results carry no badge", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [
+    fixtureSensor(1, { name: "Shop one", delivery: "cache", last_seen: FRESH }),
+    fixtureSensor(2, { name: "Live one", last_seen: FRESH }),
+  ], { source: "PurpleAir · cached", stale: false });
+
+  typeSearch(app, "one");
+  const results = sensorResults(app);
+  assert.deepEqual(results.map((button) => button.getAttribute("aria-label")), ["Shop one, AQI 21, Fixture", "Live one, AQI 22, Fixture"]);
+  for (const button of results) {
+    assert.equal(resultBadge(button), "");
+    assert.doesNotMatch(button.innerHTML, /Cached|provenance-badge/);
+  }
+});
+
+test("an open sensor result gains Old on the minute tick without losing focus or its pending place search", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1, { name: "Ticking", last_seen: NOW_S - 30 })]);
+  typeSearch(app, "Ticking");
+  app.elements.get("search").dispatch("keydown", { key: "Enter" });
+  const [request] = app.messages.filter((message) => message.action === "place-search");
+  const [result] = sensorResults(app);
+  result.focus();
+  assert.equal(resultBadge(result), "");
+
+  app.setNow((NOW_S - 30 + 7201) * 1000);
+  app.runTimers();
+  receiveSensors(app, [fixtureSensor(1, { name: "Ticking", last_seen: NOW_S - 30 })]);
+
+  assert.equal(sensorResults(app)[0], result, "the result keeps its element");
+  assert.equal(app.document.activeElement, result, "focus stays on the result");
+  assert.equal(result.getAttribute("aria-label"), "Ticking, AQI 21, Fixture, Old");
+  assert.equal(resultBadge(result), "Old");
+  assert.equal(app.messages.filter((message) => message.action === "cancel-place-search").length, 0);
+  app.context.Airloom.receive("places", {
+    context: "main",
+    request_id: request.request_id,
+    query: request.query,
+    results: [{ name: "Ticking, Oregon", latitude: 1, longitude: 1 }],
+  });
+  assert.match(app.elements.get("search-results").innerHTML, /Ticking, Oregon/, "the pending place search still answers");
+});
+
+test("a publication that changes open sensor matches keeps focus on the same sensor's result", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(2, { name: "Station two", last_seen: FRESH })]);
+  typeSearch(app, "Station");
+  sensorResults(app)[0].focus();
+
+  receiveSensors(app, [
+    fixtureSensor(1, { name: "Station one", last_seen: FRESH }),
+    fixtureSensor(2, { name: "Station two", last_seen: NOW_S - 7201 }),
+  ]);
+  const results = sensorResults(app);
+  assert.deepEqual(results.map((button) => button.dataset.id), ["1", "2"]);
+  assert.equal(app.document.activeElement, results[1]);
+  assert.equal(resultBadge(results[1]), "Old");
+
+  receiveSensors(app, [fixtureSensor(3, { name: "Elsewhere", last_seen: FRESH })]);
+  assert.equal(app.elements.get("search-results").hidden, true);
+  assert.equal(app.document.activeElement, app.elements.get("search"), "focus falls back to the search field");
+});
+
+test("minute ticks and publications do not reopen dismissed sensor results", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1, { name: "Ticking", last_seen: NOW_S - 30 })]);
+  typeSearch(app, "Ticking");
+  const results = app.elements.get("search-results");
+  assert.equal(results.hidden, false);
+  app.document.dispatch("keydown", { key: "Escape", ctrlKey: false, metaKey: false });
+  assert.equal(results.hidden, true);
+
+  app.setNow((NOW_S - 30 + 7201) * 1000);
+  app.runTimers();
+  receiveSensors(app, [fixtureSensor(1, { name: "Ticking", last_seen: NOW_S - 30 })]);
+  assert.equal(results.hidden, true);
+});
+
 test("main search typing filters locally without remote geocoding", () => {
   const app = loadApp();
   configureMap(app);

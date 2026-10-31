@@ -301,6 +301,7 @@
     $("#data-source").textContent = state.source;
     renderAll();
     reconcilePopup();
+    refreshSearchResults();
     if ($("#settings-dialog").open) renderHiddenList();
     // A publication also answers the header-bar Refresh.
     retryFailedTiles();
@@ -333,6 +334,7 @@
   const categoryOf = (sensor) => sensor.category || AirloomCore.bandForAQI(sensor.aqi).label;
 
   const explainProvenance = (sensor, label) => AirloomCore.provenanceDescription(label, sensor.last_seen, nowSeconds());
+  const badgeMarkup = (sensor, label) => label ? `<span class="provenance-badge" title="${explainProvenance(sensor, label)}">${label}</span>` : "";
 
   // Shows the reading's badge (or hides it with no reading) and returns it.
   function stampProvenance(id, sensor) {
@@ -445,9 +447,8 @@
     const badge = provenanceOf(sensor);
     row.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}, ${categoryOf(sensor)}${badge ? `, ${badge}` : ""}${sensor.favorite ? ", favorite" : ""}`);
     const meta = [formatTemperature(sensor.temperature_f), formatHumidity(sensor.humidity)].filter(Boolean).join(" · ");
-    const badgeMarkup = badge ? `<span class="provenance-badge" title="${explainProvenance(sensor, badge)}">${badge}</span>` : "";
     row.innerHTML = `<span class="sensor-badge">${sensor.aqi ?? "—"}</span>
-      <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small>${badgeMarkup}</span>
+      <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small>${badgeMarkup(sensor, badge)}</span>
       ${sensor.favorite ? '<span class="row-star"><svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg></span>' : ""}`;
   }
 
@@ -1372,6 +1373,7 @@
     renderSummary();
     renderLists();
     renderMapMarkers();
+    refreshSearchResults();
     setTimeout(tickAges, AGE_TICK_MS);
   }
   function escapeHtml(value) {
@@ -1380,7 +1382,7 @@
 
   function invalidatePlaceSearch(context) {
     state.placeRequests[context] = null;
-    if (context === "main") state.placeResults = [];
+    if (context === "main") { state.placeResults = []; state.placeError = undefined; }
   }
 
   function cancelMainSearch() {
@@ -1411,18 +1413,55 @@
     else renderSearchResults(payload.results || [], payload.error);
   }
 
+  function sensorResultMatches() {
+    const query = state.query.trim().toLowerCase();
+    return query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query)).slice(0, 4) : [];
+  }
+
+  const sensorResultButtons = (box) => [...box.querySelectorAll("button")].filter((button) => button.dataset.kind === "sensor");
+
+  // A sensor result shows an individual reading, so it carries the same
+  // category and degraded-only badge as the list rows.
+  function stampSensorResult(button, sensor) {
+    const badge = provenanceOf(sensor);
+    const category = categoryOf(sensor);
+    button.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}, ${category}${badge ? `, ${badge}` : ""}`);
+    button.innerHTML = `${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "—"} · ${escapeHtml(category)}${badgeMarkup(sensor, badge)}`;
+  }
+
+  // Keeps open sensor results current on publications and minute ticks, in
+  // place when the matches are unchanged so focus stays put. It never reopens
+  // dismissed results or touches a pending place search.
+  function refreshSearchResults() {
+    const box = $("#search-results");
+    if (box.hidden) return;
+    const sensors = sensorResultMatches();
+    const buttons = sensorResultButtons(box);
+    if (buttons.length === sensors.length && buttons.every((button, index) => button.dataset.id === String(sensors[index].id))) {
+      buttons.forEach((button, index) => stampSensorResult(button, sensors[index]));
+      return;
+    }
+    const active = box.contains(document.activeElement) ? document.activeElement.dataset : null;
+    const focused = active && { kind: active.kind, key: active.id ?? active.index };
+    renderSearchResults(state.placeResults, state.placeError);
+    if (!focused) return;
+    const match = [...box.querySelectorAll("button")].find((button) => button.dataset.kind === focused.kind && (button.dataset.id ?? button.dataset.index) === focused.key);
+    (!box.hidden && match ? match : $("#search")).focus();
+  }
+
   function renderSearchResults(places, error) {
     const box = $("#search-results");
     state.placeResults = places;
-    const query = state.query.trim().toLowerCase();
-    const sensors = query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query)).slice(0, 4) : [];
+    state.placeError = error;
+    const sensors = sensorResultMatches();
     if (!sensors.length && !places.length && !error) { box.hidden = true; box.innerHTML = ""; return; }
     let html = "";
-    if (sensors.length) html += '<div class="group">Sensors</div>' + sensors.map((s) => `<button data-kind="sensor" data-id="${s.id}">${escapeHtml(s.name)} · AQI ${s.aqi ?? "—"}</button>`).join("");
+    if (sensors.length) html += '<div class="group">Sensors</div>' + sensors.map((s) => `<button data-kind="sensor" data-id="${s.id}"></button>`).join("");
     if (places.length) html += '<div class="group">Places</div>' + places.map((p, i) => `<button data-kind="place" data-index="${i}">${escapeHtml(p.name)}</button>`).join("");
     if (error) html += `<div class="group">${escapeHtml(error)}</div>`;
     box.innerHTML = html;
     box.hidden = false;
+    sensorResultButtons(box).forEach((button, index) => stampSensorResult(button, sensors[index]));
     box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
       if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true, { surface: "search" }); }
       else {
