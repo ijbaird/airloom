@@ -65,6 +65,7 @@ def demo_sensors(center_lat: float, center_lon: float) -> list[Sensor]:
                 last_seen=now - (index % 6) * 45,
                 trend=trend,
                 indoor=index % 5 == 2,
+                origin="demo",
             )
         )
     # Keep the summary pleasantly varied while making demo results deterministic.
