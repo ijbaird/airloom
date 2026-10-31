@@ -9,6 +9,9 @@
     coverage: null,
     fetchedBounds: null,
     selectedId: null,
+    // A favorite row can share its id with an area reading from a different
+    // fetch; selecting that row shows the favorite's own reading.
+    selectedFavorite: false,
     previewHidden: [],
     config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", interface_scale: 1, hidden: [] },
     source: "Starting Airloom",
@@ -271,7 +274,9 @@
     state.favoriteSensors = Array.isArray(payload.favorites) ? favorites.map((favorite) => ({ ...favorite, remote_favorite: true })) : null;
     state.coverage = payload.coverage || null;
     state.fetchedBounds = publicationBounds(payload) || state.fetchedBounds;
-    state.selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
+    const selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
+    if (selectedId !== state.selectedId) state.selectedFavorite = false;
+    state.selectedId = selectedId;
     state.source = payload.source || "Demo data";
     state.stale = payload.stale;
     state.config = { ...state.config, ...(payload.config || {}) };
@@ -310,11 +315,16 @@
 
   const categoryOf = (sensor) => sensor.category || AirloomCore.bandForAQI(sensor.aqi).label;
 
-  function stampProvenance(id, label) {
+  const explainProvenance = (sensor, label) => AirloomCore.provenanceDescription(label, sensor.last_seen, nowSeconds());
+
+  // Shows the reading's badge (or hides it with no reading) and returns it.
+  function stampProvenance(id, sensor) {
+    const label = sensor ? provenanceOf(sensor) : "";
     const element = $(`#${id}`);
     element.hidden = !label;
     element.textContent = label;
-    element.title = label ? AirloomCore.PROVENANCE_DESCRIPTIONS[label] : "";
+    element.title = label ? explainProvenance(sensor, label) : "";
+    return label;
   }
 
   function renderSummary(view = mapViewport()) {
@@ -323,7 +333,7 @@
     $("#coverage-status").textContent = limited ? "Limited coverage" : "";
     const valid = view.width ? AirloomCore.summarySensors(locationFiltered(state.areaSensors), geographicBounds(view)) : [];
     const sensor = valid[Math.floor(valid.length / 2)];
-    stampProvenance("summary-provenance", sensor ? provenanceOf(sensor) : "");
+    stampProvenance("summary-provenance", sensor);
     if (!sensor) {
       $("#summary-aqi").textContent = "—";
       $("#summary-aqi").style.background = "";
@@ -418,7 +428,7 @@
     const badge = provenanceOf(sensor);
     row.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}, ${categoryOf(sensor)}${badge ? `, ${badge}` : ""}${sensor.favorite ? ", favorite" : ""}`);
     const meta = [formatTemperature(sensor.temperature_f), formatHumidity(sensor.humidity)].filter(Boolean).join(" · ");
-    const badgeMarkup = badge ? `<span class="provenance-badge" title="${AirloomCore.PROVENANCE_DESCRIPTIONS[badge]}">${badge}</span>` : "";
+    const badgeMarkup = badge ? `<span class="provenance-badge" title="${explainProvenance(sensor, badge)}">${badge}</span>` : "";
     row.innerHTML = `<span class="sensor-badge">${sensor.aqi ?? "—"}</span>
       <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small>${badgeMarkup}</span>
       ${sensor.favorite ? '<span class="row-star"><svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg></span>' : ""}`;
@@ -426,6 +436,7 @@
 
   function selectSensor(id, revealDetail = false, origin = null) {
     state.selectedId = id;
+    state.selectedFavorite = origin?.surface === "favorites-list";
     bridge({ action: "select", id });
     renderLists();
     renderMapMarkers();
@@ -444,7 +455,8 @@
   }
 
   function selectedSensor() {
-    return state.sensors.find((sensor) => sensor.id === state.selectedId);
+    const favorite = state.selectedFavorite && state.favoriteSensors?.find((sensor) => sensor.id === state.selectedId);
+    return favorite || state.sensors.find((sensor) => sensor.id === state.selectedId);
   }
 
   function positionPopup(sensor, view = mapViewport()) {
@@ -479,8 +491,7 @@
     $("#popup-aqi").style.color = sensor.foreground || "";
     $("#popup-name").textContent = sensor.name;
     $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
-    const badge = provenanceOf(sensor);
-    stampProvenance("popup-provenance", badge);
+    const badge = stampProvenance("popup-provenance", sensor);
     $("#popup-favorite").classList.toggle("active", Boolean(sensor.favorite));
     $("#popup-favorite").setAttribute("aria-pressed", String(Boolean(sensor.favorite)));
     const demo = badge === "Demo";
@@ -512,7 +523,7 @@
 
   function renderDetail() {
     const sensor = selectedSensor();
-    stampProvenance("detail-provenance", sensor ? provenanceOf(sensor) : "");
+    stampProvenance("detail-provenance", sensor);
     if (!sensor) {
       hideDetail();
       return;
@@ -1210,7 +1221,7 @@
   const formatHumidity = (humidity) => Number.isFinite(humidity) ? `${Math.round(humidity)}%` : "";
   const numberOrDash = (number) => Number.isFinite(number) ? Number(number).toFixed(1) : "—";
   function relativeTime(timestamp, now = nowSeconds()) {
-    if (!timestamp || !Number.isFinite(timestamp) || timestamp - now > AirloomCore.FUTURE_SKEW_TOLERANCE) return "Update time unavailable";
+    if (!AirloomCore.hasObservationTime(timestamp, now)) return "Update time unavailable";
     const seconds = Math.max(0, Math.round(now - timestamp));
     if (seconds < 90) return "Updated just now";
     if (seconds < 3600) return `Updated ${Math.round(seconds / 60)} min ago`;

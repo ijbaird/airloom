@@ -849,6 +849,22 @@ test("readingProvenance uses Demo > Stale > Old precedence", () => {
   assert.deepEqual(Object.keys(AirloomCore.PROVENANCE_DESCRIPTIONS), ["Demo", "Stale", "Old"]);
 });
 
+test("provenanceDescription explains unusable observation times like the age text", () => {
+  const now = 1_800_000_000;
+  const { provenanceDescription, PROVENANCE_DESCRIPTIONS } = AirloomCore;
+  for (const lastSeen of [null, undefined, NaN, "7200", 0, now + 601]) {
+    assert.equal(AirloomCore.hasObservationTime(lastSeen, now), false, `${String(lastSeen)} has no usable time`);
+    assert.equal(provenanceDescription("Old", lastSeen, now), "Update time unavailable", `${String(lastSeen)} explanation`);
+  }
+  for (const lastSeen of [now + 600, now, now - 7201]) {
+    assert.equal(AirloomCore.hasObservationTime(lastSeen, now), true, `${lastSeen} has a usable time`);
+  }
+  assert.equal(provenanceDescription("Old", now - 7201, now), PROVENANCE_DESCRIPTIONS.Old);
+  assert.equal(provenanceDescription("Demo", null, now), PROVENANCE_DESCRIPTIONS.Demo);
+  assert.equal(provenanceDescription("Stale", now + 601, now), PROVENANCE_DESCRIPTIONS.Stale);
+  assert.equal(provenanceDescription("", null, now), "");
+});
+
 function contrastRatio(hexA, hexB) {
   const luminance = (hex) => {
     const [r, g, b] = [1, 3, 5].map((index) => {

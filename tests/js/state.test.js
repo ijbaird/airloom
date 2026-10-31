@@ -1261,6 +1261,71 @@ test("missing and far-future observation times are Old on every surface", () => 
   assert.doesNotMatch(markerFor(app, 3).getAttribute("aria-label"), /Old/);
 });
 
+test("Old badge explanations match the age text for unusable observation times", () => {
+  const aged = "Last observation over 2 hours ago or unknown";
+  for (const [lastSeen, explanation] of [
+    [null, "Update time unavailable"],
+    ["soon", "Update time unavailable"],
+    [NOW_S + 601, "Update time unavailable"],
+    [NOW_S - 7201, aged],
+  ]) {
+    const app = loadApp({ nowMs: NOW_S * 1000 });
+    configureMap(app);
+    app.elements.get("sensors-panel").hidden = false;
+    receiveSensors(app, [fixtureSensor(1, { last_seen: lastSeen })]);
+    const label = `last_seen ${String(lastSeen)}`;
+
+    assert.equal(app.elements.get("summary-provenance").title, explanation, `${label}: summary`);
+    assert.match(rowFor(app, "sensor-list", 1).innerHTML, new RegExp(`class="provenance-badge" title="${explanation}">Old<`), `${label}: row`);
+    assert.equal(popupBadge(app, 1), "Old");
+    assert.equal(app.elements.get("popup-provenance").title, explanation, `${label}: popup`);
+    assert.equal(detailBadge(app, "sensor-list", 1), "Old");
+    assert.equal(app.elements.get("detail-provenance").title, explanation, `${label}: detail`);
+    if (explanation !== aged) {
+      assert.equal(app.elements.get("updated-time").textContent, explanation, `${label}: detail age text`);
+      assert.match(app.elements.get("popup-meta").textContent, /Update time unavailable/, `${label}: popup age text`);
+    }
+  }
+});
+
+test("a favorite row that shares an area id selects the favorite's own reading", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { delivery: "cache", last_seen: FRESH - 600 })],
+    favorites: [fixtureSensor(1, { aqi: 77, delivery: "network", favorite: true, last_seen: FRESH })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+
+  assert.doesNotMatch(rowFor(app, "favorites-list", 1).innerHTML, /provenance-badge/);
+  assert.equal(detailBadge(app, "favorites-list", 1), "", "the favorite row opens its own unbadged reading");
+  assert.equal(app.elements.get("aqi-number").textContent, "77");
+  assert.equal(app.elements.get("updated-time").textContent, "Updated just now");
+  assert.equal(app.elements.get("ui-status").textContent, "Sensor 1. AQI 77, Fixture.");
+
+  // A refresh keeps the selection on the favorite's reading.
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { delivery: "cache", last_seen: FRESH - 600 })],
+    favorites: [fixtureSensor(1, { aqi: 78, delivery: "network", favorite: true, last_seen: FRESH })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+  assert.equal(app.elements.get("detail-provenance").hidden, true);
+  assert.equal(app.elements.get("aqi-number").textContent, "78");
+
+  assert.match(rowFor(app, "sensor-list", 1).innerHTML, /class="provenance-badge"[^>]*>Stale</);
+  assert.equal(detailBadge(app, "sensor-list", 1), "Stale", "the area row opens the area reading");
+  assert.equal(app.elements.get("aqi-number").textContent, "21");
+  assert.equal(app.elements.get("updated-time").textContent, "Updated 11 min ago");
+  assert.equal(app.elements.get("ui-status").textContent, "Sensor 1. AQI 21, Fixture. Stale.");
+  assert.equal(popupBadge(app, 1), "Stale", "map markers keep the area reading");
+  assert.equal(app.elements.get("detail-provenance").textContent, "Stale");
+});
+
 test("in-interval cached and live readings carry no badge", () => {
   const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);

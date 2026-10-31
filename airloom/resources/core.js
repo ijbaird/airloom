@@ -98,6 +98,19 @@
     Old: "Last observation over 2 hours ago or unknown",
   };
 
+  // Whether a reading's time can be shown as an age: a real Unix time no
+  // further ahead than the skew tolerance. Anything else reads as unavailable.
+  function hasObservationTime(lastSeen, nowSeconds) {
+    return typeof lastSeen === "number" && Number.isFinite(lastSeen) && lastSeen > 0
+      && lastSeen - nowSeconds <= FUTURE_SKEW_TOLERANCE;
+  }
+
+  // An Old badge without a usable time must not claim the reading is old.
+  function provenanceDescription(label, lastSeen, nowSeconds) {
+    if (label === "Old" && !hasObservationTime(lastSeen, nowSeconds)) return "Update time unavailable";
+    return PROVENANCE_DESCRIPTIONS[label] || "";
+  }
+
   // Only degraded readings are badged, Demo > Stale > Old. A remote favorite
   // comes from its own fetch, so it never inherits the area batch's metadata.
   function readingProvenance(sensor, batch, nowSeconds) {
@@ -112,5 +125,6 @@
   return {
     splitBounds, boundsContain, nearestLongitude, bandForAQI, summarySensors, BANDS, UNAVAILABLE,
     MAX_OBSERVATION_AGE, FUTURE_SKEW_TOLERANCE, isFreshObservation, readingProvenance, PROVENANCE_DESCRIPTIONS,
+    hasObservationTime, provenanceDescription,
   };
 });

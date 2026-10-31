@@ -908,9 +908,11 @@ def fixture_rows() -> list[dict]:
                 "latitude": HOME["latitude"] + 0.004 * sensor_id, "longitude": HOME["longitude"] + 0.004,
                 "location_type": location_type, "age_s": age_s, "humidity": 50, "temperature": 70,
                 "pm1.0": 5, "pm2.5_cf_1": pm, "pm10.0": 9, "confidence": 100}
+    # Distinct PM values give the summary one median reading: with every
+    # sensor shown, AQI order is 4, 1, 2, 3, so the median is expired fixture 2.
     return [row(1, 0, 30, 150),        # fresh outdoor favorite above the threshold
-            row(2, 0, 3 * 3600, 150),  # expired outdoor favorite above the threshold
-            row(3, 1, 30, 150),        # fresh indoor favorite above the threshold
+            row(2, 0, 3 * 3600, 160),  # expired outdoor favorite above the threshold
+            row(3, 1, 30, 170),        # fresh indoor favorite above the threshold
             row(4, 0, 30, 5)]          # clean outdoor sensor
 
 
@@ -1015,9 +1017,8 @@ def scenario_cache_fallback(root: Path, geocoder: GeocoderStub):
         eval_js(sock, SENSOR_SPY_JS)
         app.publish(REFRESH_JS, "live fixture readings")
         live = app.set_filter("both", "every fixture sensor cached")
-        # The summary badges its median reading, which may be the 3 h old fixture.
-        check(live["ids"] == [1, 2, 3, 4] and live["label"] in ("", "Old"),
-              f"live readings carry no Demo or Stale label ({live['label']!r})")
+        check(live["ids"] == [1, 2, 3, 4] and live["label"] == "Old",
+              f"live readings carry no fallback label; the summary badges its expired median ({live['label']!r})")
         alerted = app.notifications()
 
         app.set_fixture(fail=True)
