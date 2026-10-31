@@ -425,16 +425,27 @@ jobs:
         run: PUBKEY_FILE="${FLATPAK_GPG_PUBLIC_KEY}" scripts/publish-flatpak-repo.sh _site repos/airloom-repo-x86_64 repos/airloom-repo-aarch64
       - name: Verify signed client installation and upgrade
         shell: bash
+        env:
+          RELEASE_ELIGIBLE: ${{ needs.release-eligibility.outputs.eligible }}
         run: |
           set -euo pipefail
           arch="${{ matrix.arch }}"
-          scripts/verify-flatpak-release.sh \
-            --bundle "dist/Airloom-${arch}.flatpak" \
-            --previous-bundle "previous/Airloom-${arch}.flatpak" \
-            --repo _site/repo \
-            --arch "${arch}" \
-            --version "${EXPECTED_VERSION}" \
+          args=(
+            --bundle "dist/Airloom-${arch}.flatpak"
+            --previous-bundle "previous/Airloom-${arch}.flatpak"
+            --repo _site/repo
+            --arch "${arch}"
+            --version "${EXPECTED_VERSION}"
             --previous-version "${PREVIOUS_VERSION}"
+          )
+          # Development fixtures are signed by the ephemeral key, which no
+          # released client trusts, so only those runs import it into the
+          # previous install. Release runs prove the upgrade with the previous
+          # install's own trust.
+          if [[ "${RELEASE_ELIGIBLE}" != "true" ]]; then
+            args+=(--import-candidate-key)
+          fi
+          scripts/verify-flatpak-release.sh "${args[@]}"
 
   publication:
     name: Coordinate stable publication

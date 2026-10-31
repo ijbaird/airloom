@@ -153,6 +153,10 @@ def step_block(job: str, step_name: str) -> str:
     return match.group(1) if match else ""
 
 
+def run_block(step: str) -> str:
+    return textwrap.dedent(step.split("        run: |\n", 1)[1])
+
+
 class ReleaseEligibilityTest(unittest.TestCase):
     def assert_denied(self, result: subprocess.CompletedProcess) -> None:
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1562,6 +1566,27 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         for step_name in ("Archive update-repo artifact", "Upload update-repo artifact"):
             self.assertNotIn("needs.release-eligibility.outputs.eligible", step_block(self.flatpak, step_name))
         self.assertNotIn("--no-gpg-verify", self.source)
+
+    def test_only_development_runs_import_the_candidate_key_into_the_previous_install(self):
+        verify = step_block(self.verify, "Verify signed client installation and upgrade")
+        self.assertIn("RELEASE_ELIGIBLE: ${{ needs.release-eligibility.outputs.eligible }}", verify)
+        self.assertEqual(self.source.count("--import-candidate-key"), 1)
+        self.assertNotIn("--import-candidate-key", self.publish_source)
+        script = run_block(verify).replace("${{ matrix.arch }}", "x86_64")
+        for eligible, expected in (("true", False), ("false", True), ("", True)):
+            with self.subTest(eligible=eligible), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stub = root / "scripts" / "verify-flatpak-release.sh"
+                stub.parent.mkdir()
+                stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGS_OUT"\n', encoding="utf-8")
+                stub.chmod(0o755)
+                env = dict(os.environ, RELEASE_ELIGIBLE=eligible, EXPECTED_VERSION="1.2.3",
+                           PREVIOUS_VERSION="1.2.2", ARGS_OUT=str(root / "args"))
+                subprocess.run(["bash", "-c", script], cwd=root, env=env, check=True)
+                args = (root / "args").read_text(encoding="utf-8").splitlines()
+                self.assertEqual("--import-candidate-key" in args, expected)
+                self.assertEqual(args[args.index("--version") + 1], "1.2.3")
+                self.assertEqual(args[args.index("--previous-bundle") + 1], "previous/Airloom-x86_64.flatpak")
 
     def test_newer_tag_after_initial_eligibility_is_rejected_at_publication(self):
         with release_checkout() as root:
