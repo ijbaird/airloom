@@ -960,6 +960,64 @@ test("retained imagery stays until the retried replacement layer fully loads", (
   assert.equal(old.hidden, true);
 });
 
+test("staggered tile failures across repeated publications never duplicate pending tiles or retry timers", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const tileCount = live.childNodes.length;
+  const [a, b, c] = live.childNodes;
+  assert.ok(c, "the viewport needs at least three tiles");
+  const baseline = app.timerDelays();
+  const posted = app.messages.length;
+  // Age ticks are 60 s; these early retries stay well below that.
+  const retryTimers = () => addedDelays(baseline, app.timerDelays()).filter((delay) => delay < 60000);
+  const copies = (src) => live.childNodes.filter((image) => image.src === src).length;
+  const assertNoAccumulation = (when) => {
+    assert.equal(live.childNodes.length, tileCount, `no extra tiles ${when}`);
+    for (const image of [a, b, c]) assert.equal(copies(image.src), 1, `one element per key ${when}`);
+  };
+
+  a.onerror();
+  assert.deepEqual(retryTimers(), [2000]);
+  receiveSensors(app, [fixtureSensor(1)]);
+  const a1 = liveTileWithSrc(app, a.src);
+  assert.notEqual(a1, a);
+  assert.equal(a1.dataset.pending, "true");
+  assert.deepEqual(retryTimers(), [], "a publication retry replaces the scheduled one");
+
+  receiveSensors(app, [fixtureSensor(1)]);
+  assert.equal(liveTileWithSrc(app, a.src), a1, "a pending replacement is not requested again");
+  assert.equal(liveTileWithSrc(app, b.src), b);
+  assert.equal(liveTileWithSrc(app, c.src), c);
+  assertNoAccumulation("after a repeated publication");
+
+  b.onerror();
+  a1.onerror();
+  assert.deepEqual(retryTimers(), [2000], "staggered failures share one layer timer");
+  receiveSensors(app, [fixtureSensor(1)]);
+  const a2 = liveTileWithSrc(app, a.src);
+  const b1 = liveTileWithSrc(app, b.src);
+  assert.ok(a2 !== a1 && b1 !== b && a2.dataset.pending === "true" && b1.dataset.pending === "true");
+  assert.equal(liveTileWithSrc(app, c.src), c, "a still-pending tile keeps its element");
+  receiveSensors(app, [fixtureSensor(1)]);
+  assert.equal(liveTileWithSrc(app, a.src), a2);
+  assert.equal(liveTileWithSrc(app, b.src), b1);
+  assertNoAccumulation("after staggered failures");
+
+  c.onerror();
+  assert.deepEqual(retryTimers(), [2000]);
+  assert.equal(app.messages.length, posted, "failures and publication retries post nothing to the bridge");
+  const beforeTimers = app.messages.length;
+  app.runTimers();
+  const c1 = liveTileWithSrc(app, c.src);
+  assert.ok(c1 !== c && c1.dataset.pending === "true");
+  assert.equal(liveTileWithSrc(app, a.src), a2);
+  assert.equal(liveTileWithSrc(app, b.src), b1);
+  assertNoAccumulation("after the timed retry");
+  assert.deepEqual(app.messages.slice(beforeTimers), [],
+    "a timed retry posts nothing to the bridge");
+});
+
 test("tile retry backoff is capped and a zoom change cancels the old layer's retry", () => {
   const app = loadApp();
   configureMap(app);
