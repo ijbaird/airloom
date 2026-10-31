@@ -12,11 +12,11 @@ Airloom includes:
 - an interactive OpenStreetMap view with color-coded sensor markers;
 - a sensor browser, search, favorites, responsive detail view, and rolling-average chart;
 - US EPA 2024 PM2.5 AQI breakpoints and the EPA's corrections for PurpleAir data (see [AQI and alerts](#aqi-and-alerts));
-- demo, cached, and stale readings labeled next to the AQI, and a "Limited coverage" note when the view extends past fetched data;
+- a badge on every degraded reading — **Demo** (generated data), **Stale** (cached readings shown after a failed refresh), or **Old** (last observation more than two hours ago, or unknown) — with live and normally cached readings left unbadged, and a "Limited coverage" note when the view extends past fetched data;
 - temperature, humidity, PM2.5, and PM10 readings;
 - local desktop notifications when a favorite crosses a chosen AQI threshold;
 - a no-account demo mode and live mode with your own PurpleAir read key;
-- keyboard navigation, screen-reader labels and announcements, an Interface size preference (100%, 125%, or 150%), and reduced motion when GNOME's animations are turned off;
+- keyboard navigation, including map panning (Tab to the map, then the arrow keys move it by a fifth of the view, Shift+arrow by three fifths, and `+`/`-` zoom), screen-reader labels and announcements, an Interface size preference (100%, 125%, or 150%), and reduced motion when GNOME's animations are turned off;
 - light/dark GNOME styling and desktop/Flatpak metadata.
 
 ## Run on Fedora
@@ -29,6 +29,8 @@ sudo dnf install python3-gobject gtk4 libadwaita webkitgtk6.0 libnotify
 ```
 
 It launches in demo mode. Open Preferences, enter your [PurpleAir API read key](https://develop.purpleair.com/), and choose automatic location or a fixed home place to load live public sensors. Place searches (in Preferences and the map's search box) are sent only when you press Enter.
+
+For UI work, `airloom/resources/index.html` also opens directly in a browser as a preview with demo data. Preferences there apply only to that tab. Settings the preview can't apply — the PurpleAir key, map radius, refresh interval, alert threshold, the confidence filter, and home location — are disabled, and Preferences explains that they (and remote place search) work only in the desktop app.
 
 ## Test
 
@@ -94,7 +96,7 @@ Airloom reports sensor-based PM2.5 AQI estimates using the US EPA 2024 breakpoin
 - Current PurpleAir CF=1 readings and indoor running averages use Barkjohn et al.'s final CF1 equations: linear below raw 570, blended from 570–611, and quadratic from 611.
 - Outdoor running averages use the published five-piece CF=ATM correction used by PurpleAir and AirNow. Applying current humidity to historical averages is an approximation.
 
-Desktop alerts operate only while Airloom is running; there is no background monitoring daemon. An alert requires a favorite to cross the configured threshold with a non-demo observation no more than two hours old. Expired observations and demo results never notify or change real alert state, and hidden or low-confidence sensors follow the same filtering rules as the display.
+Desktop alerts operate only while Airloom is running; there is no background monitoring daemon. An alert requires a favorite to cross the configured threshold with a non-demo observation no more than two hours old (and no more than 10 minutes in the future, allowing for clock skew). Expired observations and demo results never notify or change real alert state, and hidden or low-confidence sensors follow the same filtering rules as the display.
 
 ## Data and privacy
 
