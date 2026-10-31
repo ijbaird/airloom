@@ -954,7 +954,7 @@ class SigningKeyTest(unittest.TestCase):
 
 
 class ClientVerificationTest(unittest.TestCase):
-    def run_client_gate(self, **fake_overrides):
+    def run_client_gate(self, *extra_args, committed_key="production", **fake_overrides):
         with tempfile.TemporaryDirectory(prefix="airloom-client-test-") as temporary:
             root = Path(temporary)
             bin_dir = root / "bin"
@@ -968,6 +968,8 @@ class ClientVerificationTest(unittest.TestCase):
             repo.mkdir()
             correct_key = root / "correct.gpg"
             correct_key.write_bytes(b"correct-test-key")
+            production_key = root / "production.gpg"
+            production_key.write_bytes(b"production-test-key")
             summary = root / "summary.md"
             summary.touch()
             (root / "correct-home").mkdir(mode=0o700)
@@ -994,7 +996,10 @@ with open(env["FAKE_FLATPAK_LOG"], "a") as stream:
 command = next((arg for arg in args if not arg.startswith("-")), "")
 current_version = env["FAKE_CURRENT_VERSION"]
 previous_version = env["FAKE_PREVIOUS_VERSION"]
-correct_key = Path(env["FAKE_CORRECT_KEY"]).read_bytes()
+FPRS = {b"correct-test-key": "CORRECTFPR", b"wrong-test-key": "WRONGFPR", b"production-test-key": "PRODUCTIONFPR"}
+# The key that signs the repository's commits; a remote accepts them only
+# when it trusts that key or does not verify signatures.
+repo_signer = env.get("FAKE_REPO_SIGNER", "CORRECTFPR")
 
 def save():
     state_path.write_text(json.dumps(state))
@@ -1003,25 +1008,33 @@ def save():
 def option(name):
     return next((arg.split("=", 1)[1] for arg in args if arg.startswith(name + "=")), None)
 
-def key_matches(path):
-    return path is not None and Path(path).read_bytes() == correct_key
+def fingerprint(path):
+    return FPRS.get(Path(path).read_bytes(), "UNKNOWNFPR")
+
+def accepts(remote):
+    return not remote["gpg_verify"] or repo_signer in remote["keys"] or env.get("FAKE_ACCEPT_WRONG_KEY") == "1"
 
 if command == "remote-add":
     name, url = args[-2:]
-    key_ok = key_matches(option("--gpg-import"))
-    if not key_ok and env.get("FAKE_WRONG_KEY_REMOTE_ADD_SIGNATURE") == "1":
+    imported = option("--gpg-import")
+    keys = [fingerprint(imported)] if imported is not None else []
+    if repo_signer not in keys and env.get("FAKE_WRONG_KEY_REMOTE_ADD_SIGNATURE") == "1":
         print("OSTree GPG signature verification failed: wrong key", file=sys.stderr)
         sys.exit(1)
-    if not key_ok and env.get("FAKE_WRONG_KEY_REMOTE_ADD_UNRELATED") == "1":
+    if repo_signer not in keys and env.get("FAKE_WRONG_KEY_REMOTE_ADD_UNRELATED") == "1":
         print("network unreachable while fetching metadata", file=sys.stderr)
         sys.exit(1)
-    remotes[name] = {"url": url, "key_ok": key_ok}
+    remotes[name] = {"url": url, "keys": keys, "gpg_verify": True}
     save()
 elif command == "remote-modify":
     name = args[-1]
     remote = remotes[name]
     remote["url"] = option("--url") or remote["url"]
-    remote["key_ok"] = remote["key_ok"] or key_matches(option("--gpg-import"))
+    imported = option("--gpg-import")
+    if imported is not None:
+        remote["keys"] = sorted(set(remote["keys"]) | {fingerprint(imported)})
+    if "--gpg-verify" in args:
+        remote["gpg_verify"] = True
     save()
 elif command == "install":
     bundle = next((arg for arg in args if arg.endswith(".flatpak")), None)
@@ -1036,7 +1049,9 @@ elif command == "install":
         # origin remote trusts exactly those and requires signatures only
         # when there are any.
         if previous:
-            keys, signer, gpg_verify = ["PREVIOUSFPR"], "PREVIOUSFPR", True
+            trusted = env.get("FAKE_PREVIOUS_TRUSTED_KEY", "CORRECTFPR")
+            keys, signer = [trusted], trusted
+            gpg_verify = env.get("FAKE_PREVIOUS_GPG_VERIFY", "1") == "1"
             url = env.get("FAKE_PREVIOUS_BUNDLE_URL", "https://ijbaird.github.io/airloom/repo")
         else:
             signature = env.get("FAKE_CURRENT_BUNDLE_SIGNATURE", "selected")
@@ -1064,18 +1079,18 @@ elif command == "install":
         origin = env.get("FAKE_ORIGIN", "airloom-origin")
         commit = "previous-commit" if previous else "current-commit"
         state = {"version": version, "commit": commit, "origin": origin}
-        remotes[origin] = {"url": url, "key_ok": True, "keys": keys, "gpg_verify": gpg_verify}
+        remotes[origin] = {"url": url, "keys": keys, "gpg_verify": gpg_verify}
         signers = json.loads((client / "signers.json").read_text()) if (client / "signers.json").exists() else {}
         signers[commit] = signer
         (client / "signers.json").write_text(json.dumps(signers))
     else:
         remote_name = args[-2]
         remote = remotes[remote_name]
-        if not remote["key_ok"] and env.get("FAKE_ACCEPT_WRONG_KEY") != "1":
+        if not accepts(remote):
             if env.get("FAKE_WRONG_KEY_INSTALL_UNRELATED") == "1":
                 print("network unreachable while pulling commit", file=sys.stderr)
             else:
-                print("GPG signature verification failed: wrong key", file=sys.stderr)
+                print("GPG signatures found, but none are in trusted keyring", file=sys.stderr)
             sys.exit(1)
         state = {
             "version": current_version,
@@ -1085,9 +1100,11 @@ elif command == "install":
     save()
 elif command == "update":
     remote = remotes[state["origin"]]
-    if not remote["key_ok"] and env.get("FAKE_ACCEPT_WRONG_KEY") != "1":
-        print("GPG signature verification failed: wrong key", file=sys.stderr)
+    if not accepts(remote):
+        print("GPG signatures found, but none are in trusted keyring", file=sys.stderr)
         sys.exit(1)
+    if env.get("FAKE_UPDATE_ADDS_KEY"):
+        remote["keys"].append(env["FAKE_UPDATE_ADDS_KEY"])
     # FAKE_UPGRADE_RESULT models partial upgrades so the version and commit
     # checks are each exercised alone.
     result = "stale" if env.get("FAKE_STALE_UPGRADE") == "1" else env.get("FAKE_UPGRADE_RESULT", "complete")
@@ -1123,7 +1140,8 @@ else:
                 "    sys.stdout.buffer.write(b'wrong-test-key')\n"
                 "elif '--show-keys' in sys.argv:\n"
                 "    data = Path(sys.argv[-1]).read_bytes()\n"
-                "    fpr = {b'correct-test-key': 'CORRECTFPR', b'wrong-test-key': 'WRONGFPR'}[data]\n"
+                "    fpr = {b'correct-test-key': 'CORRECTFPR', b'wrong-test-key': 'WRONGFPR',\n"
+                "           b'production-test-key': 'PRODUCTIONFPR'}[data]\n"
                 "    print(f'pub:u:255:22:X:1::::::scESC:\\nfpr:::::::::{fpr}:')\n",
                 encoding="utf-8",
             )
@@ -1177,8 +1195,10 @@ else:
                 GITHUB_STEP_SUMMARY=str(summary),
                 FLATPAK_GPG_PUBLIC_KEY=str(correct_key),
                 GNUPGHOME=str(root / "correct-home"),
+                AIRLOOM_PUBLIC_KEY_FILE=str(
+                    correct_key if committed_key == "candidate" else production_key
+                ),
                 FAKE_FLATPAK_LOG=str(log),
-                FAKE_CORRECT_KEY=str(correct_key),
                 FAKE_PREVIOUS_BUNDLE=str(previous),
                 FAKE_CURRENT_VERSION="1.2.3",
                 FAKE_PREVIOUS_VERSION="1.2.2",
@@ -1199,6 +1219,7 @@ else:
                     "1.2.3",
                     "--previous-version",
                     "1.2.2",
+                    *extra_args,
                 ],
                 cwd=PROJECT_ROOT,
                 env=env,
@@ -1374,6 +1395,59 @@ else:
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("unrelated reason", result.stderr)
         self.assertNotIn("wrong_key_rejected", summary)
+
+    def remote_modifications(self, entries):
+        return [e["args"] for e in entries if "remote-modify" in e["args"]]
+
+    def test_production_upgrade_redirects_only_the_previous_origin_url(self):
+        result, entries, summary = self.run_client_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (modify,) = self.remote_modifications(entries)
+        self.assertEqual(modify[:2], ["remote-modify", "--user"])
+        self.assertEqual(modify[-1], "airloom-origin")
+        self.assertEqual([a for a in modify[2:-1] if a.startswith("--")], [modify[2]])
+        self.assertRegex(modify[2], r"^--url=file:///.+/repo$")
+        self.assertIn("upgrade_verified previous_version=1.2.2 version=1.2.3", summary)
+        self.assertIn("trust=preserved previous_keys=CORRECTFPR", summary)
+
+    def test_production_upgrade_rejects_a_candidate_the_previous_install_does_not_trust(self):
+        result, entries, summary = self.run_client_gate(FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation (trusting PREVIOUSFPR) rejected the candidate release; "
+                      "a signing-key rotation needs a reviewed client migration", result.stderr)
+        self.assertIn("bundle_verified", summary)
+        self.assertIn("repository_install_verified", summary)
+        self.assertNotIn("upgrade_verified", summary)
+        self.assertFalse(any(a.startswith("--gpg-import") for m in self.remote_modifications(entries) for a in m))
+
+    def test_previous_origin_must_require_signatures_before_the_upgrade(self):
+        result, entries, summary = self.run_client_gate(FAKE_PREVIOUS_GPG_VERIFY="0")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation origin airloom-origin does not require GPG signatures", result.stderr)
+        self.assertFalse(any("update" in e["args"] for e in entries))
+
+    def test_production_upgrade_must_leave_previous_trust_unchanged(self):
+        result, _, summary = self.run_client_gate(FAKE_UPDATE_ADDS_KEY="OTHERFPR")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation trust changed from CORRECTFPR to CORRECTFPR OTHERFPR", result.stderr)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_development_option_imports_the_candidate_key_into_the_previous_install(self):
+        result, entries, summary = self.run_client_gate(
+            "--import-candidate-key", FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (modify,) = self.remote_modifications(entries)
+        self.assertTrue(any(a.startswith("--gpg-import=") and a.endswith("correct.gpg") for a in modify))
+        self.assertTrue(any(a.startswith("--url=file://") for a in modify))
+        self.assertIn("trust=candidate-key-imported previous_keys=PREVIOUSFPR", summary)
+
+    def test_development_option_refuses_the_committed_production_key(self):
+        result, entries, summary = self.run_client_gate("--import-candidate-key", committed_key="candidate")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--import-candidate-key is development-only and refuses the committed "
+                      "production key CORRECTFPR", result.stderr)
+        self.assertEqual(entries, [])
+        self.assertEqual(summary, "")
 
 
 class ReleaseWorkflowContractTest(unittest.TestCase):

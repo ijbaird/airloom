@@ -2,23 +2,38 @@
 # Verify signed Airloom client installation and upgrade paths in disposable
 # per-user Flatpak installations. The real Flatpak commands run in CI; local
 # regression tests replace only that external command boundary.
+#
+# The upgrade check runs in one of two modes:
+# - production (default): the previous release's origin is redirected to the
+#   candidate repository and nothing else changes, so the update succeeds only
+#   if the keys that release already trusts accept the candidate, and its trust
+#   must be unchanged afterwards. A signing-key rotation fails here.
+# - --import-candidate-key (development only): the candidate key is imported
+#   into the previous origin first, for disposable keys that no released
+#   client trusts. It refuses the committed production key.
 set -euo pipefail
 
 app_id="ai.stealthvision.Airloom"
 expected_repo_url="${FLATPAK_REPO_URL:-https://ijbaird.github.io/airloom/repo}"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 bundle=""
 previous_bundle=""
 repo=""
 arch=""
 version=""
 previous_version=""
+import_candidate_key=0
 
 usage() {
-  echo "usage: verify-flatpak-release.sh --bundle FILE --previous-bundle FILE --repo DIR --arch ARCH --version X.Y.Z --previous-version X.Y.Z" >&2
+  echo "usage: verify-flatpak-release.sh --bundle FILE --previous-bundle FILE --repo DIR --arch ARCH --version X.Y.Z --previous-version X.Y.Z [--import-candidate-key]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --import-candidate-key)
+      import_candidate_key=1
+      shift
+      ;;
     --bundle|--previous-bundle|--repo|--arch|--version|--previous-version)
       [[ $# -ge 2 ]] || { usage; exit 2; }
       case "$1" in
@@ -167,16 +182,33 @@ verify_previous_upgrade() (
   assert_version "${previous_version}" "previous installation"
   local origin old_commit new_commit
   origin="$(installed_origin)"
-  local previous_url
+  local previous_url previous_keys current_keys trust
   previous_url="$(remote_url "${origin}")"
   [[ "${previous_url}" == "${expected_repo_url}" ]] || fail "previous installation origin URL ${previous_url} does not match ${expected_repo_url}"
+  remote_requires_signatures "${origin}" || fail "previous installation origin ${origin} does not require GPG signatures"
+  previous_keys="$(remote_trusted_keys "${origin}")"
   old_commit="$(installed_commit)"
-  flatpak remote-modify --user --gpg-verify --gpg-import="${public_key}" --url="${repo_url}" "${origin}"
-  flatpak update --user --noninteractive --no-deps --arch="${arch}" "${app_id}"
+  # Only the URL moves to the candidate repository; signature policy stays as
+  # the previous release shipped it.
+  if [[ "${import_candidate_key}" == "1" ]]; then
+    trust="candidate-key-imported"
+    flatpak remote-modify --user --gpg-import="${public_key}" --url="${repo_url}" "${origin}"
+  else
+    trust="preserved"
+    flatpak remote-modify --user --url="${repo_url}" "${origin}"
+  fi
+  flatpak update --user --noninteractive --no-deps --arch="${arch}" "${app_id}" \
+    || fail "previous installation (trusting ${previous_keys:-none}) rejected the candidate release; a signing-key rotation needs a reviewed client migration"
+  if [[ "${trust}" == "preserved" ]]; then
+    current_keys="$(remote_trusted_keys "${origin}")"
+    [[ "${current_keys}" == "${previous_keys}" ]] \
+      || fail "previous installation trust changed from ${previous_keys:-none} to ${current_keys:-none}"
+    remote_requires_signatures "${origin}" || fail "previous installation origin ${origin} stopped requiring GPG signatures"
+  fi
   assert_version "${version}" "upgrade"
   new_commit="$(installed_commit)"
   [[ -n "${new_commit}" && "${new_commit}" != "${old_commit}" ]] || fail "upgrade did not reach a new commit"
-  evidence "upgrade_verified previous_version=${previous_version} version=${version} previous_commit=${old_commit} current_commit=${new_commit}"
+  evidence "upgrade_verified previous_version=${previous_version} version=${version} previous_commit=${old_commit} current_commit=${new_commit} trust=${trust} previous_keys=${previous_keys:-none}"
 )
 
 verify_wrong_key_rejection() (
@@ -204,6 +236,14 @@ verify_wrong_key_rejection() (
 
 expected_key="$(key_fingerprint "${public_key}")"
 [[ -n "${expected_key}" ]] || fail "no key fingerprint found in ${public_key}"
+if [[ "${import_candidate_key}" == "1" ]]; then
+  committed_key_file="${AIRLOOM_PUBLIC_KEY_FILE:-${project_dir}/packaging/airloom-flatpak.gpg}"
+  [[ -s "${committed_key_file}" ]] || fail "committed production key not found: ${committed_key_file}"
+  committed_key="$(key_fingerprint "${committed_key_file}")"
+  [[ -n "${committed_key}" ]] || fail "no key fingerprint found in ${committed_key_file}"
+  [[ "${committed_key}" != "${expected_key}" ]] \
+    || fail "--import-candidate-key is development-only and refuses the committed production key ${committed_key}"
+fi
 
 verify_bundle
 verify_repository_install
