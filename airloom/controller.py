@@ -495,6 +495,8 @@ class ApplicationController:
         )
         if not decision.publish:
             return decision
+        # A published refresh supersedes any first paint still being read.
+        self._requests.invalidate("cached-startup")
         request = outcome.request
         if request.force and (request.bounds, request.center) == self._forced_target:
             self._forced_target = None
@@ -526,9 +528,23 @@ class ApplicationController:
     def wants_cached_startup(self) -> bool:
         return not self._stopped and not self.sensors and bool(self.config.get("api_key"))
 
-    def apply_cached_startup(self, sensors: list[Sensor], bounds: Bounds) -> bool:
-        """First paint from cached rows; the following refresh replaces it."""
-        if not sensors or not self.wants_cached_startup():
+    def begin_cached_startup(self) -> RequestToken | None:
+        """Authorize one first-paint cache read, or None when none is wanted."""
+        if not self.wants_cached_startup():
+            return None
+        return self._requests.begin("cached-startup", generation=self._generation)
+
+    def apply_cached_startup(
+        self, token: RequestToken, sensors: list[Sensor], bounds: Bounds
+    ) -> bool:
+        """First paint from cached rows; the following refresh replaces it.
+
+        Only the current read under unchanged configuration may paint, and
+        never after a refresh has published.
+        """
+        current = self._requests.is_current(token) and token.generation == self._generation
+        self._requests.finish(token)
+        if not current or not sensors or not self.wants_cached_startup():
             return False
         favorites = set(self.config.get("favorites", []))
         for sensor in sensors:
@@ -712,14 +728,6 @@ class ApplicationController:
             credential_generation=self._credential_generation,
         )
 
-    def cached_trend(self, plan: TrendPlan, cached: list) -> TrendUpdate:
-        sensor = self._sensor(plan.sensor_id)
-        changed = bool(cached) and sensor is not None and sensor.trend != cached
-        if changed:
-            sensor.trend = cached
-        self._requests.finish(plan.token)
-        return TrendUpdate("loaded" if cached else "unavailable", cached, sensor_changed=changed)
-
     def track_trend(self, plan: TrendPlan) -> None:
         self.trend_inflight[plan.sensor_id] = (
             plan.token,
@@ -758,7 +766,10 @@ class ApplicationController:
         token: RequestToken,
         trend: list | None,
         failed: bool,
+        *,
+        cached: bool = False,
     ) -> TrendUpdate | None:
+        """Settle trend work; a ``cached`` result is never stored again."""
         inflight = self.trend_inflight.get(sensor_id)
         sensor = self._sensor(sensor_id)
         owns_inflight = inflight is not None and inflight[0] == token
@@ -778,9 +789,12 @@ class ApplicationController:
         if not authorized:
             return None
         status = "error" if failed else "loaded" if trend else "unavailable"
-        if status == "loaded":
+        loaded = status == "loaded"
+        # A cache hit identical to the reading's trend needs no republish.
+        changed = loaded and (not cached or sensor.trend != trend)
+        if loaded:
             sensor.trend = trend
-        return TrendUpdate(status, trend, store=status == "loaded", sensor_changed=status == "loaded")
+        return TrendUpdate(status, trend, store=loaded and not cached, sensor_changed=changed)
 
     # -- Preference transactions --------------------------------------------
     # Each builds a candidate from committed configuration, persists it, and

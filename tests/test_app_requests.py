@@ -3,11 +3,13 @@ from __future__ import annotations
 import errno
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
+import time
 import types
 import unittest
 from copy import deepcopy
@@ -29,7 +31,7 @@ except (ImportError, ValueError):
 
 from airloom import geocode as geocode_module
 from airloom.app import AirloomApplication
-from airloom.cache import CacheError
+from airloom.cache import CacheError, SensorCache
 from airloom.controller import ApplicationController
 from airloom.geocode import Place
 from airloom.models import Sensor
@@ -184,6 +186,9 @@ class ApplicationRequestTestCase(unittest.TestCase):
         app._worker_lock = threading.Lock()
         app._active_workers = 0
         app._cache_closed = False
+        app._active_kinds = {}
+        app._coalesced_jobs = {}
+        app._coalesced_running = set()
         app._debug_port = None
         app._auto_refresh_id = None
         app.refreshing = False
@@ -458,6 +463,8 @@ class TrendRequestTest(ApplicationRequestTestCase):
             threads.threads[0].run()
             try:
                 idles.run(0)
+                threads.threads[1].run()
+                idles.run(1)
             except Exception as exc:
                 self.fail(f"trend cache write escaped: {exc}")
 
@@ -580,6 +587,82 @@ class TrendRequestTest(ApplicationRequestTestCase):
             self.trend_events(app)[-1]["request_id"],
             self.trend_events(app)[0]["request_id"],
         )
+
+    def test_trend_admission_is_bounded_and_refusal_is_terminal(self):
+        app = self.make_app(sensors=[make_sensor(i, last_seen=1000 + i) for i in range(1, 6)])
+        threads = ThreadQueue()
+        client_type = mock.Mock()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module, "PurpleAirClient", client_type),
+        ):
+            for sensor_id in range(1, 6):
+                app._ensure_trend(sensor_id)
+
+        self.assertEqual(len(threads.threads), app_module.TREND_WORKER_LIMIT)
+        refused = [p for p in self.trend_events(app) if p["sensor_id"] == 5]
+        # A refused admission is terminal, so the panel offers Retry.
+        self.assertEqual(refused[-1]["status"], "error")
+        self.assertNotIn(5, app._trend_inflight)
+        client_type.assert_not_called()
+
+
+MAIN_LOOP_BLOCK_BOUND = 0.25  # seconds; the production busy timeout is 5.0
+
+
+class MainLoopCacheTest(ApplicationRequestTestCase):
+    def test_cache_lock_never_blocks_the_main_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.db"
+            cache = SensorCache(path)  # production busy_timeout=5.0
+            self.addCleanup(cache.close)
+            cache.store_trend(1, [{"label": "Now", "aqi": 42}])
+            reader = self.make_app(
+                sensors=[make_sensor(1, last_seen=1234), make_sensor(2, last_seen=99)]
+            )
+            startup = self.make_app()
+            reader.cache = startup.cache = cache
+            idles = IdleQueue()
+            blocker = sqlite3.connect(path)
+            self.addCleanup(blocker.close)
+            blocker.execute("BEGIN EXCLUSIVE")
+            client_type = mock.Mock()
+            with (
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                mock.patch.object(app_module, "PurpleAirClient", client_type),
+            ):
+                plan = reader.controller.begin_trend(2)
+                reader.controller.track_trend(plan)
+                for label, call in (
+                    ("trend read", lambda: reader._ensure_trend(1)),
+                    (
+                        "trend write",
+                        lambda: reader._finish_trend(
+                            2, 99, plan.token, [{"label": "Now", "aqi": 7}], False
+                        ),
+                    ),
+                    ("startup paint", startup._paint_cached_home),
+                ):
+                    started = time.monotonic()
+                    call()
+                    self.assertLess(
+                        time.monotonic() - started, MAIN_LOOP_BLOCK_BOUND, label
+                    )
+                blocker.rollback()
+                deadline = time.monotonic() + 10
+                while (
+                    reader._active_workers or startup._active_workers
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                for index in range(len(idles.callbacks)):
+                    idles.run(index)
+            self.assertEqual(reader._active_workers + startup._active_workers, 0)
+            client_type.assert_not_called()
+            loaded = [p for p in self.trend_events(reader) if p["sensor_id"] == 1]
+            self.assertEqual(loaded[-1]["status"], "loaded")
+            self.assertEqual(loaded[-1]["trend"], [{"label": "Now", "aqi": 42}])
+            self.assertEqual(cache.get_trend(2, 600), [{"label": "Now", "aqi": 7}])
 
 
 class PlaceSearchRequestTest(ApplicationRequestTestCase):
@@ -1418,6 +1501,14 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
                         marker.write("close\n")
                     super().close()
 
+                def sensors_in(self, bounds):
+                    block("startup-cache")
+                    return super().sensors_in(bounds)
+
+                def store_trend(self, sensor_id, trend):
+                    block("trend-cache")
+                    super().store_trend(sensor_id, trend)
+
             lock = threading.Lock()
             started = []
             all_started = threading.Event()
@@ -1426,7 +1517,7 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
             def block(name):
                 with lock:
                     started.append(name)
-                    if len(started) == 5:
+                    if len(started) == 7:
                         all_started.set()
                 if not release.wait(5):
                     raise RuntimeError(f"{name} was not released")
@@ -1470,12 +1561,17 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
             app._worker_lock = threading.Lock()
             app._active_workers = 0
             app._cache_closed = False
+            app._active_kinds = {}
+            app._coalesced_jobs = {}
+            app._coalesced_running = set()
             app._shutting_down = False
             app._debug_port = None
             app._auto_refresh_id = None
             app.refreshing = False
             app.pending_fetch = None
+            app._paint_cached_home()
             app.sensors = [h.make_sensor(1)]
+            app._queue_trend_write(1, [])
             app._trend_inflight = {}
             app._home_name_generation = 0
             app._view_name_generation = 0
@@ -1523,12 +1619,20 @@ class ShutdownLifecycleTest(ApplicationRequestTestCase):
             lines = marker.read_text(encoding="utf-8").splitlines() if marker.exists() else []
 
         diagnostic = f"stdout={result.stdout!r}\nstderr={result.stderr!r}\nmarkers={lines!r}"
-        self.assertEqual(len(lines), 6, diagnostic)
+        self.assertEqual(len(lines), 8, diagnostic)
         self.assertEqual(lines.count("close"), 1, diagnostic)
         self.assertEqual(lines[-1], "close", diagnostic)
         self.assertEqual(
             set(lines[:-1]),
-            {"refresh", "trend", "place-search", "home-label", "view-label"},
+            {
+                "refresh",
+                "trend",
+                "place-search",
+                "home-label",
+                "view-label",
+                "startup-cache",
+                "trend-cache",
+            },
             diagnostic,
         )
         self.assertEqual(result.returncode, 0, diagnostic)

@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -25,6 +26,11 @@ except (ImportError, ValueError):
         import gi_stub
     gi_stub.install()
     from airloom import app as app_module
+
+try:
+    from tests.test_app_requests import IdleQueue, ThreadQueue
+except ImportError:
+    from test_app_requests import IdleQueue, ThreadQueue
 
 from airloom import controller as controller_module
 from airloom.app import AirloomApplication
@@ -214,6 +220,12 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app.cache = cache
         app.requests = app_module.RequestRegistry()
         app.controller = app._new_controller()
+        app._worker_lock = threading.Lock()
+        app._active_workers = 0
+        app._cache_closed = False
+        app._active_kinds = {}
+        app._coalesced_jobs = {}
+        app._coalesced_running = set()
         app.sensors = []
         app._area_ids = set()
         app._monitoring_ids = set()
@@ -277,8 +289,15 @@ class ApplicationAdapterTestCase(unittest.TestCase):
 class CachedStartupTest(ApplicationAdapterTestCase):
     def test_cached_startup_is_real_cache_delivery_but_not_stale_fallback(self):
         app = self.make_app(cache=FakeCache([make_row(7)]))
+        threads, idles = ThreadQueue(), IdleQueue()
 
-        app._paint_cached_home()
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+        ):
+            app._paint_cached_home()
+            threads.threads[0].run()
+            idles.run(0)
 
         payload = self.sensor_payloads(app)[0]
         self.assertIs(payload.get("stale"), False)
@@ -287,6 +306,29 @@ class CachedStartupTest(ApplicationAdapterTestCase):
         self.assertEqual(payload["items"][0]["delivery"], "cache")
         self.assertFalse(payload["items"][0]["remote_favorite"])
         self.assertIs(payload["coverage"]["capped"], False)
+
+    def test_refresh_published_first_wins_over_late_cached_paint(self):
+        # An empty live publication leaves wants_cached_startup true, so only
+        # the cached-startup token can keep the late paint out.
+        for case, live in (("readings", [make_sensor(9)]), ("empty", [])):
+            with self.subTest(case=case):
+                app = self.make_app(cache=FakeCache([make_row(7)]))
+                threads, idles = ThreadQueue(), IdleQueue()
+
+                with (
+                    mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                    mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                ):
+                    app._paint_cached_home()
+                    threads.threads[0].run()
+                    app._finish_refresh(self.make_outcome(app, list(live)))
+                    idles.run(0)
+
+                self.assertEqual(len(self.sensor_payloads(app)), 1)
+                self.assertEqual(
+                    [sensor.sensor_id for sensor in app.sensors],
+                    [sensor.sensor_id for sensor in live],
+                )
 
 
 class PresentationPayloadTest(ApplicationAdapterTestCase):
