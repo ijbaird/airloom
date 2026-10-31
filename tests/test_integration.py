@@ -10,6 +10,7 @@ regressions without launching Airloom.
 import errno
 import importlib.machinery
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -516,6 +517,20 @@ class UiRegressionScriptContractTest(unittest.TestCase):
                     mock.patch.object(self.script, "eval_js", return_value={"width": inner}):
                 with self.assertRaises(AssertionError):
                     self.script.measure_window_frame("sock")
+
+    def test_trend_terminal_state_rejects_loading_and_pending_retry(self):
+        terminal = self.script.terminal_trend
+        self.assertIsNone(terminal({"retryHidden": True, "retryDisabled": False,
+                                    "chartText": "Loading trend…", "rows": []}))
+        self.assertIsNone(terminal({"retryHidden": False, "retryDisabled": False,
+                                    "chartText": "Trend unavailable", "rows": []}))
+        loaded = {"retryHidden": True, "retryDisabled": False, "chartText": "", "rows": [["Now", 21]]}
+        self.assertIs(terminal(loaded), loaded)
+
+    def test_trend_retry_uses_a_real_fixture_failure(self):
+        self.assertIn("trend-retry", self.script.STANDALONE_SCENARIOS)
+        self.assertNotIn("trend-retry", self.script.APP_SCENARIOS)
+        self.assertNotIn("1000000", inspect.getsource(self.script.scenario_trend_retry))
 
     def test_caller_snapshot_detects_any_change(self):
         target = self.root / "airloom"

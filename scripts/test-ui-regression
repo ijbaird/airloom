@@ -578,46 +578,6 @@ def scenario_filters(app: DebugApp):
     check(True, "cycling back to Outdoor restores the original visible sensors")
 
 
-def scenario_trend_retry(app: DebugApp):
-    print("— trend retry asks the backend again —")
-    sock = app.sock_path
-    check(request(sock, "state")["selectedId"] is not None, "a sensor is selected")
-    eval_js(sock, "document.querySelector('#detail-card').hidden = false")
-    # The debug state does not expose readings, so read last_seen from the
-    # sensor list the backend published and replay it with an error status.
-    eval_js(sock, """(() => {
-      if (!window.__trendSpy) {
-        window.__trendSpy = [];
-        const receive = window.Airloom.receive;
-        window.Airloom.receive = (event, payload) => {
-          if (event === "sensors") window.__lastSensors = payload;
-          if (event === "trend") window.__trendSpy.push(payload);
-          return receive(event, payload);
-        };
-      }
-      return "spy";
-    })()""")
-    eval_js(sock, "document.querySelector('#footer-refresh').click()")
-    wait_for(lambda: eval_js(sock, "Boolean(window.__lastSensors)"), 15, "a sensors payload")
-    eval_js(sock, """(() => {
-      const id = window.Airloom.debugState().selectedId;
-      const sensor = window.__lastSensors.items.find((s) => s.id === id);
-      window.__trendSpy.length = 0;
-      window.Airloom.receive("trend", { sensor_id: id, request_id: 1000000, status: "error",
-        reading_last_seen: sensor.last_seen, trend: [] });
-      return "error";
-    })()""")
-    check(eval_js(sock, "document.querySelector('#trend-retry').hidden") is False, "a failed trend offers Retry")
-    eval_js(sock, "document.querySelector('#trend-retry').click()")
-    status = wait_for(lambda: eval_js(sock, """(() => {
-      const spy = window.__trendSpy;
-      return spy.length ? spy[spy.length - 1].status : null;
-    })()"""), 10, "the backend's retried trend")
-    check(status in ("loaded", "unavailable"), f"Retry produced a fresh backend trend ({status})")
-    check(eval_js(sock, "document.querySelector('#trend-retry').hidden") is True, "Retry disappears after recovery")
-    eval_js(sock, "document.querySelector('#close-detail').click()")
-
-
 RESIZE_PROBE_JS = """
 (() => {
   const popup = document.querySelector("#map-popup");
@@ -903,17 +863,19 @@ PUBLICATION_JS = """
 
 
 def fixture_rows() -> list[dict]:
-    def row(sensor_id, location_type, age_s, pm):
+    def row(sensor_id, location_type, age_s, pm, **averages):
         return {"sensor_index": sensor_id, "name": f"Fixture {sensor_id}",
                 "latitude": HOME["latitude"] + 0.004 * sensor_id, "longitude": HOME["longitude"] + 0.004,
                 "location_type": location_type, "age_s": age_s, "humidity": 50, "temperature": 70,
-                "pm1.0": 5, "pm2.5_cf_1": pm, "pm10.0": 9, "confidence": 100}
+                "pm1.0": 5, "pm2.5_cf_1": pm, "pm10.0": 9, "confidence": 100, **averages}
     # Distinct PM values give the summary one median reading: with every
     # sensor shown, AQI order is 4, 1, 2, 3, so the median is expired fixture 2.
     return [row(1, 0, 30, 150),        # fresh outdoor favorite above the threshold
             row(2, 0, 3 * 3600, 160),  # expired outdoor favorite above the threshold
             row(3, 1, 30, 170),        # fresh indoor favorite above the threshold
-            row(4, 0, 30, 5)]          # clean outdoor sensor
+            row(4, 0, 30, 5, **{       # clean outdoor sensor with a rolling-average trend
+                "pm2.5_10minute": 6, "pm2.5_30minute": 7, "pm2.5_60minute": 8,
+                "pm2.5_6hour": 10, "pm2.5_24hour": 12, "pm2.5_1week": 14})]
 
 
 class FixtureApp(DebugApp):
@@ -1040,6 +1002,65 @@ def scenario_cache_fallback(root: Path, geocoder: GeocoderStub):
         check(app.notifications() == alerted, "cached fallback raises no repeat alerts")
         check(app.alert_states() == {"900000": False, "1": True, "3": True},
               f"alert state survives the fallback ({app.alert_states()})")
+    finally:
+        app.stop()
+
+
+TREND_PROBE_JS = """
+(() => {
+  const retry = document.querySelector("#trend-retry");
+  return { retryHidden: retry.hidden, retryDisabled: retry.disabled,
+    chartText: document.querySelector("#chart").textContent,
+    rows: [...document.querySelectorAll("#trend-values tr[data-window]")].map(
+      (tr) => [tr.dataset.window, Number(tr.querySelector("td").textContent)]) };
+})()
+"""
+
+
+def terminal_trend(probe: dict) -> dict | None:
+    """The probe once the chart has settled: Retry hidden, no longer loading,
+    and either plotted values or an unavailable message."""
+    if not probe["retryHidden"] or "Loading" in probe["chartText"]:
+        return None
+    if probe["rows"] or "Trend unavailable" in probe["chartText"]:
+        return probe
+    return None
+
+
+def scenario_trend_retry(root: Path, geocoder: GeocoderStub):
+    print("— trend retry recovers from a real backend failure —")
+    if str(PROJECT) not in sys.path:
+        sys.path.insert(0, str(PROJECT))
+    from airloom.purpleair import trend_from_values
+
+    app = FixtureApp(root, "trend-retry", geocoder, fail=False)
+    try:
+        app.start().wait_ready()
+        sock = app.sock_path
+        eval_js(sock, SENSOR_SPY_JS)
+        app.publish(REFRESH_JS, "live fixture readings")
+
+        # The selected reading's own trend fetch meets the outage, so the
+        # error carries the backend's real request identity.
+        app.set_fixture(fail=True)
+        eval_js(sock, """document.querySelector('#sensor-list .sensor-row[data-id="4"]').click()""")
+        failed = wait_for(lambda: (lambda p: p if not p["retryHidden"] and "Trend unavailable" in p["chartText"]
+                                   else None)(eval_js(sock, TREND_PROBE_JS)),
+                          20, "the failed trend fetch to offer Retry")
+        check(failed["rows"] == [] and not failed["retryDisabled"],
+              f"a failed trend fetch shows no values and an enabled Retry ({failed['chartText']!r})")
+
+        app.set_fixture(fail=False)
+        eval_js(sock, "document.querySelector('#trend-retry').click()")
+        settled = wait_for(lambda: terminal_trend(eval_js(sock, TREND_PROBE_JS)), 20,
+                           "the retried trend to render a terminal state")
+        row4 = next(row for row in fixture_rows() if row["sensor_index"] == 4)
+        expected = [[point["label"], point["aqi"]]
+                    for point in trend_from_values({**row4, "last_seen": 0})]
+        check(settled["rows"] == expected,
+              f"Retry renders the fixture's rolling-average values ({settled['rows']})")
+        check("<svg" in eval_js(sock, "document.querySelector('#chart').innerHTML"),
+              "the recovered trend is drawn as a chart")
     finally:
         app.stop()
 
@@ -1382,7 +1403,6 @@ APP_SCENARIOS = {
     "motion": scenario_interrupted_motion,
     "focus": scenario_keyboard_focus,
     "filters": scenario_filters,
-    "trend-retry": scenario_trend_retry,
     "resize": scenario_resize,
     "shell-recovery": scenario_shell_recovery,  # reloads the page; keep last
 }
@@ -1391,6 +1411,7 @@ STANDALONE_SCENARIOS = {
     "reduced-motion": scenario_reduced_motion,
     "alerts": scenario_alerts,
     "cache-fallback": scenario_cache_fallback,
+    "trend-retry": scenario_trend_retry,
     "stripped-debug": scenario_stripped_debug,
 }
 ALL_SCENARIOS = [*APP_SCENARIOS, *STANDALONE_SCENARIOS]
