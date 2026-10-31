@@ -865,16 +865,16 @@ class ReverseLabelRequestTest(ApplicationRequestTestCase):
             mock.patch.object(app_module.threading, "Thread", new=threads.factory),
             mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
             mock.patch.object(
-                app_module, "reverse_geocode", side_effect=["A home", "B home"]
-            ),
+                app_module, "reverse_geocode", return_value="B home"
+            ) as reverse_geocode,
         ):
             app._on_location_fix(10.0, 20.0, 50.0)
             app._on_location_fix(30.0, 40.0, 50.0)
+            self.assertEqual(len(threads.threads), 1)
             threads.threads[0].run()
-            threads.threads[1].run()
-            idles.run(1)
             idles.run(0)
 
+        self.assertEqual(reverse_geocode.call_args_list, [mock.call(30.0, 40.0)])
         self.assertEqual(app.store.data["location_name"], "B home")
         self.assertEqual(
             (app.store.data["latitude"], app.store.data["longitude"]),
@@ -886,6 +886,91 @@ class ReverseLabelRequestTest(ApplicationRequestTestCase):
             if event == "config"
         ]
         self.assertEqual(labels, ["B home"])
+
+    def test_superseded_label_never_reaches_geocoder(self):
+        app = self.make_app()
+        threads = ThreadQueue()
+        idles = IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "reverse_geocode") as reverse_geocode,
+        ):
+            app._start_view_label(10.0, 20.0)
+            app.controller.shutdown()
+            threads.threads[0].run()
+
+        reverse_geocode.assert_not_called()
+        self.assertEqual(idles.callbacks, [])
+
+        app = self.make_app()
+        threads = ThreadQueue()
+        idles = IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "reverse_geocode") as reverse_geocode,
+        ):
+            app._on_location_fix(30.0, 40.0, 50.0)
+            app.requests.invalidate("home-label")
+            threads.threads[0].run()
+
+        reverse_geocode.assert_not_called()
+        self.assertEqual(idles.callbacks, [])
+
+    def test_label_superseded_during_throttle_wait_never_sends(self):
+        app = self.make_app()
+        app.current_view = (None, (10.0, 20.0))
+        threads = ThreadQueue()
+        idles = IdleQueue()
+        client = geocode_module.Geocoder(
+            clock=lambda: 100.0,
+            sleep=lambda _seconds: app.requests.invalidate("view-label"),
+        )
+        client._last_request = 100.0
+        base_url = geocode_module._base_url()
+
+        with (
+            mock.patch.object(geocode_module, "_default_geocoder", client),
+            mock.patch.object(geocode_module, "_default_base_url", base_url),
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(geocode_module.urllib.request, "urlopen") as urlopen,
+        ):
+            app._start_view_label(10.0, 20.0)
+            threads.threads[0].run()
+
+        urlopen.assert_not_called()
+        self.assertEqual(idles.callbacks, [])
+
+    def test_queued_view_labels_coalesce_to_newest_target(self):
+        app = self.make_app()
+        app.current_view = (None, (12.0, 22.0))
+        threads = ThreadQueue()
+        idles = IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(
+                app_module, "reverse_geocode", return_value="Newest view"
+            ) as reverse_geocode,
+        ):
+            app._start_view_label(10.0, 20.0)
+            app._start_view_label(11.0, 21.0)
+            app._start_view_label(12.0, 22.0)
+            self.assertEqual(len(threads.threads), 1)
+            threads.threads[0].run()
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+
+        self.assertEqual(reverse_geocode.call_args_list, [mock.call(12.0, 22.0)])
+        self.assertEqual(
+            [payload for event, payload in app.sent if event == "view-name"],
+            [{"name": "Newest view"}],
+        )
 
     def test_view_label_requires_matching_coordinates_as_well_as_generation(self):
         app = self.make_app()

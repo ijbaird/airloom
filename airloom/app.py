@@ -113,8 +113,10 @@ def _install_place_search_admission() -> None:
     public search flow nevertheless exposes two adapter admission points:
     ``_request`` after its search-lock wait and ``_throttle`` after any sleep.
     Wrapping those points preserves its cache, throttling, and transport code.
-    Unannotated users of the shared client, including reverse geocoding, retain
-    the original behavior.
+    Annotated callers, place search and the reverse-label workers (via
+    ``_reverse_name``), share these admission points; a reverse request has no
+    search lock, so it is checked before its throttle and after any sleep.
+    Unannotated users of the shared client retain the original behavior.
     """
     client = geocode_module._default_client()
     with _place_search_install_lock:
@@ -1004,11 +1006,37 @@ class AirloomApplication(Adw.Application):
         self._home_name_generation += 1
         generation = self._home_name_generation
         token = self.requests.begin("home-label", generation)
-        self._start_worker(
-            self._reverse_label_worker,
-            args=(float(latitude), float(longitude), generation, token),
+        # Only the newest queued fix is worth labelling; older targets are
+        # replaced before they reach the geocoder.
+        self._submit_coalesced(
+            "home-label",
+            None,
+            (float(latitude), float(longitude), generation, token),
+            lambda job: self._reverse_label_worker(*job),
             name="airloom-revgeo",
         )
+
+    def _reverse_name(
+        self, latitude: float, longitude: float, token: RequestToken
+    ) -> str | None:
+        """Reverse-geocode for ``token``, or ``None`` once it is superseded.
+
+        The token is checked before any geocoder I/O and again at the shared
+        client's admission points, including after its throttle wait.
+        """
+        if self._shutting_down or not self.requests.is_current(token):
+            return None
+        _install_place_search_admission()
+        _place_search_admission.is_current = lambda: self.requests.is_current(token)
+        try:
+            return reverse_geocode(latitude, longitude)
+        except _PlaceSearchSuperseded:
+            return None
+        except GeocodeError as exc:
+            print(f"Airloom: {exc}", file=sys.stderr)
+            return f"{latitude:.2f}, {longitude:.2f}"
+        finally:
+            _place_search_admission.is_current = None
 
     def _reverse_label_worker(
         self,
@@ -1017,11 +1045,9 @@ class AirloomApplication(Adw.Application):
         generation: int,
         token: RequestToken,
     ) -> None:
-        try:
-            name = reverse_geocode(latitude, longitude)
-        except GeocodeError as exc:
-            print(f"Airloom: {exc}", file=sys.stderr)
-            name = f"{latitude:.2f}, {longitude:.2f}"
+        name = self._reverse_name(latitude, longitude, token)
+        if name is None:
+            return
         GLib.idle_add(
             self._apply_location_name,
             name,
@@ -1157,9 +1183,12 @@ class AirloomApplication(Adw.Application):
         self._view_name_generation += 1
         generation = self._view_name_generation
         token = self.requests.begin("view-label", generation)
-        self._start_worker(
-            self._view_label_worker,
-            args=(latitude, longitude, generation, token),
+        # Panning queues many centers; only the newest one is labelled.
+        self._submit_coalesced(
+            "view-label",
+            None,
+            (latitude, longitude, generation, token),
+            lambda job: self._view_label_worker(*job),
             name="airloom-viewgeo",
         )
 
@@ -1170,11 +1199,9 @@ class AirloomApplication(Adw.Application):
         generation: int,
         token: RequestToken,
     ) -> None:
-        try:
-            name = reverse_geocode(latitude, longitude)
-        except GeocodeError as exc:
-            print(f"Airloom: {exc}", file=sys.stderr)
-            name = f"{latitude:.2f}, {longitude:.2f}"
+        name = self._reverse_name(latitude, longitude, token)
+        if name is None:
+            return
         GLib.idle_add(
             self._apply_view_name, name, latitude, longitude, generation, token
         )
