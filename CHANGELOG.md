@@ -4,26 +4,31 @@ All notable changes to Airloom are documented here. The project follows semantic
 
 ## 0.14.0 — 2026-10-31
 
-- Bad data no longer looks fresh or "Good". A PurpleAir response with short
-  or incomplete rows is rejected whole, leaving the previous cache intact.
-  True/false values in numeric fields are treated as invalid, and
-  observation times more than 10 minutes in the future are treated as
-  missing. Observations more than two hours old, or with no usable time,
-  never trigger alerts and are labeled "Old".
-- Readings carry a badge only when degraded: Demo (generated data), Stale
-  (cached readings shown after a failed refresh), or Old. Each reading gets
-  its own badge on the map popup, sensor lists, sensor search results, the
-  detail card, and screen-reader names and announcements. Live readings and
-  readings served from the normal cache interval are no longer labeled
-  "Cached".
+- Malformed data is handled more strictly. A PurpleAir response with short
+  or field-incomplete rows is rejected whole, leaving the previous cache
+  intact. Invalid PM measurements, including true/false values, show as
+  unavailable. A reading timestamped more than 10 minutes in the future
+  keeps its measured AQI and category, but its time is discarded, so it is
+  never treated as fresh, never alerts, and counts as Old under the badge
+  rule below; times up to 10 minutes ahead are accepted as clock skew. Observations more than two
+  hours old, or with no known time, never trigger alerts.
+- Each reading now carries its own badge, by one rule: Demo for
+  generated data; otherwise Stale when a failed refresh fell back to
+  cached data; otherwise Old when its observation is more than two hours
+  old, more than 10 minutes in the future, or of unknown time; otherwise no
+  badge. Fresh live readings and fresh readings from the normal cache are
+  no longer labeled "Cached". The badge appears on the map popup, sensor
+  lists, sensor search results, the detail card, and screen-reader names
+  and announcements. Visible ages update every minute, so a reading turns
+  Old without a refetch.
 - Alerts are no longer lost when a desktop notification fails: the alert
   stays pending and is retried. If alert state can't be saved, the same
   crossing isn't announced again in that session.
 - A manual Refresh stays forced until it completes, even when an automatic
   refresh or an unchanged view arrives first. Removing or changing the
   PurpleAir key stops queued paid trend requests, and results still in
-  flight for the old key are discarded. An offline favorite no longer discards cached area coverage,
-  which had caused repeated billed fetches. Trend and startup cache work
+  flight for the old key are discarded. An offline favorite no longer
+  discards cached area coverage, which had caused repeated billed fetches. Trend and startup cache work
   runs off the main thread, so a locked cache database no longer freezes
   the window, and failed cache writes roll back. Area labels are briefly
   cached, so repeat lookups don't contact Nominatim again.
@@ -35,7 +40,8 @@ All notable changes to Airloom are documented here. The project follows semantic
   each point and include a screen-reader table of the values. Focus stays
   in the hidden-sensors list while it updates, and Escape cancels a pending
   place search. Narrow and scaled windows fit long names and three-digit AQI
-  values in both light and dark styles.
+  values in both light and dark styles, and the fixed home place search
+  field in Preferences now matches the other fields.
 - Map tiles that fail to load are retried automatically, and immediately on
   Refresh. When Airloom reloads its map page after a problem, it keeps the
   area you were viewing instead of returning home.

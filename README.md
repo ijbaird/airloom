@@ -12,7 +12,7 @@ Airloom includes:
 - an interactive OpenStreetMap view with color-coded sensor markers;
 - a sensor browser, search, favorites, responsive detail view, and rolling-average chart;
 - US EPA 2024 PM2.5 AQI breakpoints and the EPA's corrections for PurpleAir data (see [AQI and alerts](#aqi-and-alerts));
-- a badge on every degraded reading — **Demo** (generated data), **Stale** (cached readings shown after a failed refresh), or **Old** (last observation more than two hours ago, or unknown) — with live and normally cached readings left unbadged, and a "Limited coverage" note when the view extends past fetched data;
+- a per-reading badge by one rule — **Demo** for generated data; otherwise **Stale** when a failed refresh fell back to cached data; otherwise **Old** when the observation is more than two hours old, more than 10 minutes in the future, or of unknown time; otherwise none, so fresh live and fresh normally cached readings are unbadged — and a "Limited coverage" note when the view extends past fetched data;
 - temperature, humidity, PM2.5, and PM10 readings;
 - local desktop notifications when a favorite crosses a chosen AQI threshold;
 - a no-account demo mode and live mode with your own PurpleAir read key;

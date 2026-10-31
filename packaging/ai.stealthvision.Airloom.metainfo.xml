@@ -31,9 +31,9 @@
       <description>
         <p>A data-trust, reliability, and accessibility release:</p>
         <ul>
-          <li>Incomplete PurpleAir responses are rejected whole, invalid or future-dated values are never shown as fresh or Good, and observations more than two hours old never alert.</li>
-          <li>Only degraded readings are labeled, each with its own Demo, Stale, or Old badge on every surface; ordinary cached readings are no longer labeled "Cached".</li>
-          <li>Alerts survive a failed notification without repeating, manual Refresh is never downgraded, key changes stop queued paid requests, and a locked cache no longer freezes the window.</li>
+          <li>Incomplete PurpleAir responses are rejected whole and invalid PM measurements show as unavailable. Readings timestamped more than ten minutes in the future or more than two hours in the past are never treated as fresh and never alert.</li>
+          <li>Each reading gets its own badge on every surface: Demo for generated data, otherwise Stale after a failed refresh falls back to cached data, otherwise Old when its time is more than two hours old, more than ten minutes ahead, or unknown. Fresh readings, including normally cached ones, are no longer labeled "Cached", and ages update every minute.</li>
+          <li>Alerts survive a failed notification without repeating, manual Refresh is never downgraded, key changes stop queued paid trend requests, and a locked cache no longer freezes the window.</li>
           <li>Text on AQI colors meets WCAG contrast with every color unchanged, the map pans from the keyboard, trend values are readable by screen readers, and narrow or scaled windows fit long names.</li>
           <li>Upgrade verification keeps the signing trust existing installs already have.</li>
         </ul>
