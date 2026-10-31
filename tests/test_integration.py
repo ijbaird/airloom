@@ -7,6 +7,7 @@ child-only cleanup, stripped release tree) so `make check` catches
 regressions without launching Airloom.
 """
 
+import errno
 import importlib.machinery
 import importlib.util
 import io
@@ -473,6 +474,21 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         gone.wait()
         self.assertEqual(self.script.proc_bytes(gone.pid, "cmdline"), b"")
         self.assertIn(b"python", self.script.proc_bytes(os.getpid(), "cmdline").lower())
+
+    def test_proc_reads_treat_a_process_reaped_mid_read_as_gone(self):
+        reaped = ProcessLookupError(errno.ESRCH, "No such process")
+        with mock.patch.object(self.script.Path, "read_bytes", side_effect=reaped):
+            self.assertEqual(self.script.proc_bytes(12345, "cmdline"), b"")
+
+    def test_proc_read_errors_other_than_a_vanished_process_propagate(self):
+        # A live owned descendant that cannot be read must not silently
+        # drop out of ownership selection.
+        for error in (PermissionError(errno.EACCES, "Permission denied"), OSError(errno.EIO, "I/O error")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(self.script.Path, "read_bytes", side_effect=error):
+                with self.assertRaises(type(error)) as raised:
+                    self.script.proc_bytes(12345, "cmdline")
+                self.assertEqual(raised.exception.errno, error.errno)
 
     def test_viewport_width_excludes_the_window_frame_before_scaling(self):
         # Under a compositor (mutter) the webview spans the whole window; under
