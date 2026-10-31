@@ -215,7 +215,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 /* Disabled (browser preview only): muted text on the dialog surface keeps
    at least 4.5:1 in both themes, unlike muted text on --soft. */
 .form-grid input:not([type="checkbox"]):not([type="radio"]):disabled, .form-grid select:disabled { border-style: dashed; background: var(--panel-solid); color: var(--muted); -webkit-text-fill-color: var(--muted); opacity: 1; cursor: not-allowed; }
-.form-grid fieldset:disabled label { color: var(--muted); cursor: not-allowed; }
+/* WebKitGTK paints a native (appearance: auto) select itself, ignoring the
+   colors above, so the disabled select draws its own muted chevron. */
+.form-grid select:disabled { appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: right calc(15px * var(--interface-scale)) center, right calc(10px * var(--interface-scale)) center; background-size: calc(5px * var(--interface-scale)) calc(5px * var(--interface-scale)); background-repeat: no-repeat; }
+.form-grid fieldset:disabled label, .form-grid .checkbox:has(input:disabled) { color: var(--muted); cursor: not-allowed; }
 .form-grid input[type="checkbox"]:disabled, .form-grid fieldset:disabled input { cursor: not-allowed; }
 .form-grid input:focus, .form-grid select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(22,128,92,.13); }
 .checkbox { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: calc(7px * var(--interface-scale)); color: var(--muted); font-size: calc(11px * var(--interface-scale)); }

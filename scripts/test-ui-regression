@@ -1424,15 +1424,22 @@ PREVIEW_ACTIONS_JS = r"""
   };
   const look = (element) => {
     const style = getComputedStyle(element);
-    return { color: style.color, background: style.backgroundColor, border: style.borderStyle + " " + style.borderColor,
-             cursor: style.cursor, opacity: style.opacity, contrast: contrast(element) };
+    return { color: style.color, background: style.backgroundColor, borderStyle: style.borderStyle,
+             appearance: style.appearance || style.webkitAppearance, cursor: style.cursor, opacity: style.opacity,
+             contrast: contrast(element) };
   };
-  const homeLabel = document.querySelector("#home-fieldset label");
+  const checkboxLabel = (name) => form.elements[name].closest("label");
   out.disabledLook = {
     radius: look(form.elements.radius_km),
+    alert: look(form.elements.alert_threshold),
+    homeInput: look(document.querySelector("#home-place-input")),
     refresh: look(form.elements.refresh_minutes),
-    homeLabel: look(homeLabel),
-    enabled: look(form.elements.heatmap_threshold_km),
+    homeLabel: look(document.querySelector("#home-fieldset label")),
+    confidenceLabel: look(checkboxLabel("confidence_filter").querySelector("span")),
+    confidenceRow: look(checkboxLabel("confidence_filter")),
+    enabledNumber: look(form.elements.heatmap_threshold_km),
+    enabledSelect: look(form.elements.interface_scale),
+    enabledRadioLabel: look(form.querySelector("fieldset:not(#home-fieldset) label")),
   };
   form.requestSubmit(document.querySelector("#save-settings"));
   out.settingsOpen = document.querySelector("#settings-dialog").open;
@@ -1447,7 +1454,8 @@ def layout_child(cases: list[dict]) -> int:
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("WebKit", "6.0")
-    from gi.repository import GLib, Gtk, WebKit
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf, GLib, Gtk, WebKit
 
     sys.path.insert(0, str(PROJECT))
     from airloom.demo import demo_sensors
@@ -1478,6 +1486,37 @@ def layout_child(cases: list[dict]) -> int:
         if "error" in box:
             raise RuntimeError(box["error"])
         return box["value"]
+
+    def rendered_background(webview, selector: str) -> list[int]:
+        point = json.loads(run_js(webview, """(() => {
+          const element = document.querySelector(%s);
+          element.scrollIntoView({block: "center"});
+          const rect = element.getBoundingClientRect();
+          return JSON.stringify({x: rect.left + 5, y: rect.top + rect.height / 2, width: innerWidth});
+        })()""" % json.dumps(selector)))
+        pump(0.2)
+        loop = GLib.MainLoop()
+        box = {}
+
+        def done(view, result, _data=None):
+            try:
+                box["texture"] = view.get_snapshot_finish(result)
+            except GLib.Error as exc:
+                box["error"] = str(exc)
+            loop.quit()
+
+        webview.get_snapshot(WebKit.SnapshotRegion.VISIBLE, WebKit.SnapshotOptions.NONE, None, done, None)
+        loop.run()
+        if "error" in box:
+            raise RuntimeError(box["error"])
+        loader = GdkPixbuf.PixbufLoader()
+        loader.write(box["texture"].save_to_png_bytes().get_data())
+        loader.close()
+        pixbuf = loader.get_pixbuf()
+        ratio = pixbuf.get_width() / point["width"]
+        x, y = int(point["x"] * ratio), int(point["y"] * ratio)
+        offset = y * pixbuf.get_rowstride() + x * pixbuf.get_n_channels()
+        return list(pixbuf.get_pixels()[offset:offset + 3])
 
     # Callers pass one case per process: a second WebView created in the
     # same process was never given a size under a headless compositor.
@@ -1547,7 +1586,17 @@ def layout_child(cases: list[dict]) -> int:
             measured = json.loads(run_js(webview, LAYOUT_MEASURE_JS))
             print(json.dumps({**case, "state": name, "outcome": outcome, **measured}), flush=True)
         if mode == "preview":
+            # Computed style alone can't prove a native control renders it:
+            # sample the painted background of each Preferences field.
+            run_js(webview, 'window.Airloom.receive("open-settings"); "ok"')
+            pump(0.3)
+            rendered = {name: rendered_background(webview, selector) for name, selector in (
+                ("radius", "[name=radius_km]"), ("refresh", "[name=refresh_minutes]"),
+                ("enabledSelect", "[name=interface_scale]"))}
+            run_js(webview, 'document.querySelector("#settings-dialog").close(); "ok"')
+            pump(0.2)
             actions = json.loads(run_js(webview, PREVIEW_ACTIONS_JS))
+            actions["rendered"] = rendered
             print(json.dumps({**case, "state": "preview-actions", "actions": actions}), flush=True)
         window.set_child(None)
         pump(0.1)
@@ -1611,17 +1660,32 @@ def scenario_layouts(root: Path):
             theme = row.get("theme", "light")
             expect(actions["dark"] is (theme == "dark"), f"{label}: page renders the {theme} color scheme")
             look = actions["disabledLook"]
-            enabled = look["enabled"]
-            for name in ("radius", "refresh"):
-                field = look[name]
-                expect((field["color"], field["background"], field["border"]) != (enabled["color"], enabled["background"], enabled["border"]),
-                       f"{label}: disabled {name} looks different from an enabled field ({field} vs {enabled})")
+            for name, enabled_name in (("radius", "enabledNumber"), ("alert", "enabledNumber"),
+                                       ("homeInput", "enabledNumber"), ("refresh", "enabledSelect")):
+                field, enabled = look[name], look[enabled_name]
+                for prop in ("background", "borderStyle", "color"):
+                    expect(field[prop] != enabled[prop],
+                           f"{label}: disabled {name} {prop} differs from enabled {enabled_name} ({field[prop]} vs {enabled[prop]})")
                 expect(field["opacity"] == "1", f"{label}: disabled {name} is not faded by opacity ({field['opacity']})")
-            for name in ("radius", "refresh", "homeLabel"):
-                field = look[name]
-                expect(field["cursor"] == "not-allowed", f"{label}: disabled {name} shows a not-allowed cursor ({field['cursor']})")
-                expect(field["contrast"] >= 4.5, f"{label}: disabled {name} text stays legible in {theme} ({field['contrast']}:1)")
-            expect(enabled["cursor"] != "not-allowed", f"{label}: enabled fields keep their cursor")
+            # A native (appearance: auto) menulist ignores author colors and borders.
+            expect(look["refresh"]["appearance"] == "none",
+                   f"{label}: disabled select drops native painting so its style renders ({look['refresh']['appearance']})")
+            rendered = actions["rendered"]
+            expect(max(abs(a - b) for a, b in zip(rendered["refresh"], rendered["radius"])) <= 3,
+                   f"{label}: disabled select renders the disabled-field background ({rendered['refresh']} vs {rendered['radius']})")
+            expect(max(abs(a - b) for a, b in zip(rendered["radius"], rendered["enabledSelect"])) >= 6,
+                   f"{label}: disabled fields render unlike the enabled select ({rendered['radius']} vs {rendered['enabledSelect']})")
+            expect(look["confidenceLabel"]["color"] == look["homeLabel"]["color"] != look["enabledRadioLabel"]["color"],
+                   f"{label}: disabled confidence label is muted like the disabled home labels "
+                   f"({look['confidenceLabel']['color']} vs enabled {look['enabledRadioLabel']['color']})")
+            expect(look["confidenceRow"]["cursor"] == "not-allowed",
+                   f"{label}: disabled confidence row shows a not-allowed cursor ({look['confidenceRow']['cursor']})")
+            for name in ("radius", "alert", "homeInput", "refresh", "homeLabel"):
+                expect(look[name]["cursor"] == "not-allowed", f"{label}: disabled {name} shows a not-allowed cursor ({look[name]['cursor']})")
+            for name in ("radius", "alert", "homeInput", "refresh", "homeLabel", "confidenceLabel"):
+                expect(look[name]["contrast"] >= 4.5, f"{label}: disabled {name} text stays legible in {theme} ({look[name]['contrast']}:1)")
+            for name in ("enabledNumber", "enabledSelect"):
+                expect(look[name]["cursor"] != "not-allowed", f"{label}: {name} keeps its cursor")
             continue
         expected_css = "1" if row["mode"] == "desktop" else ("%g" % row["scale"])
         expect(row["cssScale"] == expected_css and float(row["configuredScale"]) == row["scale"],

@@ -2066,7 +2066,12 @@ test("disabled Preferences controls have a muted, not-allowed style distinct fro
     assert.equal(cssDeclaration(selector, "background"), "var(--panel-solid)", selector);
     assert.equal(cssDeclaration(selector, "opacity"), "1", selector);
   }
-  assert.equal(cssDeclaration(".form-grid fieldset:disabled label", "cursor"), "not-allowed");
+  // WebKitGTK's native select painting ignores author colors.
+  assert.equal(cssDeclaration(".form-grid select:disabled", "appearance"), "none");
+  for (const selector of [".form-grid fieldset:disabled label", ".form-grid .checkbox:has(input:disabled)"]) {
+    assert.equal(cssDeclaration(selector, "cursor"), "not-allowed", selector);
+    assert.equal(cssDeclaration(selector, "color"), "var(--muted)", selector);
+  }
   assert.equal(cssDeclaration(".form-grid select", "background"), "var(--soft)");
 });
 
