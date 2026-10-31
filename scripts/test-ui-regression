@@ -63,6 +63,12 @@ GEOCODER_RESPONSES = {
     "canceltown": (2.5, [{"display_name": "Canceltown, Oregon", "lat": "44.2", "lon": "-121.2"}]),
     "blockertown": (3.0, [{"display_name": "Blockertown, Oregon", "lat": "44.1", "lon": "-121.1"}]),
     "queuedhome": (0.0, [{"display_name": "Queuedhome, Oregon", "lat": "44.3", "lon": "-121.3"}]),
+    # Sentinels mark when an earlier search has been settled (see
+    # scenario_search). Each check needs its own query: the app caches results
+    # by query, and a cache hit would skip the serialized geocoder path.
+    "sentineltown": (0.0, [{"display_name": "Sentineltown, Oregon", "lat": "44.4", "lon": "-121.4"}]),
+    "sentinelcity": (0.0, [{"display_name": "Sentinelcity, Oregon", "lat": "44.6", "lon": "-121.6"}]),
+    "sentinelville": (0.0, [{"display_name": "Sentinelville, Oregon", "lat": "44.7", "lon": "-121.7"}]),
 }
 
 
@@ -110,7 +116,9 @@ CLOCK = time.monotonic
 SLEEP = time.sleep
 
 
-def wait_for(probe, timeout_s: float, what: str):
+def wait_for(probe, timeout_s: float, what: str, retry=(OSError, ConnectionError, AssertionError)):
+    """Poll probe until it returns a value other than None or False. Errors in
+    `retry` count as not ready yet; any other error propagates at once."""
     deadline = CLOCK() + timeout_s
     last_error = None
     while CLOCK() < deadline:
@@ -120,9 +128,9 @@ def wait_for(probe, timeout_s: float, what: str):
                 return value
         except AppExited:
             raise
-        except (OSError, ConnectionError, AssertionError) as exc:
+        except retry as exc:
             last_error = exc
-        SLEEP(0.2)
+        SLEEP(0.2)  # sleep-ok: polling cadence
     raise AssertionError(f"timed out after {timeout_s}s waiting for {what} (last error: {last_error})")
 
 
@@ -140,10 +148,12 @@ def near(center: dict, place: dict, tolerance: float = 0.01) -> bool:
 # ------------------------------------------------------------ geocoder stub
 
 class GeocoderStub:
-    """Loopback Nominatim stand-in that records every query it receives."""
+    """Loopback Nominatim stand-in that records every query it receives and
+    every search it has finished answering."""
 
     def __init__(self):
         self.queries: list[str] = []
+        self.done: list[str] = []
         self._lock = threading.Lock()
         stub = self
 
@@ -158,13 +168,17 @@ class GeocoderStub:
                     with stub._lock:
                         stub.queries.append(query)
                     delay, body = GEOCODER_RESPONSES.get(query.lower(), (0.0, []))
-                    time.sleep(delay)
+                    time.sleep(delay)  # sleep-ok: simulated server delay
                 data = json.dumps(body).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                self.wfile.flush()
+                if not parsed.path.endswith("/reverse"):
+                    with stub._lock:
+                        stub.done.append(query)
 
             def log_message(self, *_args):
                 pass
@@ -186,6 +200,12 @@ class GeocoderStub:
     def received(self, query: str) -> bool:
         with self._lock:
             return query in self.queries
+
+    def completed(self, query: str) -> bool:
+        """The response to `query` has been written and flushed. The client
+        may read it before this is recorded, so poll rather than assert."""
+        with self._lock:
+            return query in self.done
 
 
 # --------------------------------------------------------- owned processes
@@ -385,6 +405,25 @@ SEARCH_RESULTS_TEXT_JS = """
 })()
 """
 
+# Records every text the results box shows from now on, so a result that is
+# rendered and then replaced before the next probe still counts as shown.
+# MutationObserver callbacks run as microtasks, ahead of any later probe.
+WATCH_SEARCH_RESULTS_JS = """
+(() => {
+  const box = document.querySelector("#search-results");
+  window.__searchResultsSeen = [];
+  if (!window.__searchResultsObserver) {
+    window.__searchResultsObserver = new MutationObserver(() => {
+      window.__searchResultsSeen.push(box.hidden ? "" : box.textContent);
+    });
+    window.__searchResultsObserver.observe(box, { attributes: true, childList: true, subtree: true, characterData: true });
+  }
+  return "watching";
+})()
+"""
+
+SEARCH_RESULTS_SEEN_JS = "window.__searchResultsSeen.join(' | ')"
+
 
 def location_js(place: dict) -> str:
     return '(() => { window.Airloom.receive("location", %s); return "sent"; })()' % json.dumps(
@@ -475,22 +514,44 @@ def scenario_save(app: DebugApp):
     check(True, "retrying after the failure saves and closes Preferences")
 
 
+def search_behind(sock: str, geocoder: GeocoderStub, earlier: str, sentinel: str) -> None:
+    """Return once the earlier search's result has been delivered or dropped.
+
+    Python drops a superseded or canceled result without telling the page,
+    so the drop itself is not observable. Instead: the earlier worker held the
+    geocoder's search lock for its whole request, and once the stub has
+    answered it only parses, releases the lock and queues its GLib idle. The
+    sentinel is submitted after that answer and still needs its own worker,
+    the same search lock, the request throttle and a loopback round trip
+    before it queues its idle. Equal-priority GLib idles run FIFO, so by the
+    time the sentinel's results render, the earlier result was delivered or
+    dropped first.
+    """
+    wait_for(lambda: geocoder.completed(earlier), 10, f"the {earlier} response to complete")
+    eval_js(sock, type_and_submit("#search", sentinel))
+    wait_for(lambda: sentinel.capitalize() in eval_js(sock, SEARCH_RESULTS_TEXT_JS), 15,
+             f"the later {sentinel} results")
+
+
 def scenario_search(app: DebugApp, geocoder: GeocoderStub):
     print("— delayed, out-of-order, and canceled place search —")
     sock = app.sock_path
+    eval_js(sock, WATCH_SEARCH_RESULTS_JS)
     eval_js(sock, type_and_submit("#search", "slowtown"))
     wait_for(lambda: geocoder.received("slowtown"), 10, "the slow search to reach the geocoder")
     eval_js(sock, type_and_submit("#search", "fasttown"))
     wait_for(lambda: "Fasttown" in eval_js(sock, SEARCH_RESULTS_TEXT_JS), 15, "the newer search results")
-    time.sleep(3.5)  # the delayed older response has now completed
-    text = eval_js(sock, SEARCH_RESULTS_TEXT_JS)
-    check("Fasttown" in text and "Slowtown" not in text, "a delayed older search never replaces newer results")
+    search_behind(sock, geocoder, "slowtown", "sentineltown")
+    seen = eval_js(sock, SEARCH_RESULTS_SEEN_JS)
+    check("Fasttown" in seen and "Slowtown" not in seen, "a delayed older search never replaces newer results")
 
+    eval_js(sock, CLEAR_SEARCH_JS)
+    eval_js(sock, WATCH_SEARCH_RESULTS_JS)
     eval_js(sock, type_and_submit("#search", "canceltown"))
     wait_for(lambda: geocoder.received("canceltown"), 10, "the canceled search to reach the geocoder")
     eval_js(sock, CLEAR_SEARCH_JS)
-    time.sleep(3.5)
-    check("Canceltown" not in eval_js(sock, SEARCH_RESULTS_TEXT_JS), "a canceled search never shows its results")
+    search_behind(sock, geocoder, "canceltown", "sentinelcity")
+    check("Canceltown" not in eval_js(sock, SEARCH_RESULTS_SEEN_JS), "a canceled search never shows its results")
     eval_js(sock, CLEAR_SEARCH_JS)
 
     print("— closing Preferences cancels a queued home search before the network —")
@@ -505,7 +566,14 @@ def scenario_search(app: DebugApp, geocoder: GeocoderStub):
     })()""")
     eval_js(sock, type_and_submit("#home-place-input", "queuedhome"))
     eval_js(sock, "document.querySelector('#cancel-settings').click()")
-    time.sleep(5)
+    # The queued home worker has waited on the geocoder's search lock since
+    # before blockertown finished, so it is admitted or rejected as soon as
+    # blockertown releases the lock. The sentinel is submitted only after
+    # that, and renders only after its own trip through the same lock, so a
+    # wrongly admitted home search would already have reached the stub.
+    wait_for(lambda: geocoder.completed("blockertown"), 10, "the blocking search to complete")
+    eval_js(sock, type_and_submit("#search", "sentinelville"))
+    wait_for(lambda: "Sentinelville" in eval_js(sock, SEARCH_RESULTS_TEXT_JS), 15, "the later sentinel results")
     check(not geocoder.received("queuedhome"), "the queued home search never reached the geocoder")
     eval_js(sock, CLEAR_SEARCH_JS)
 
@@ -518,8 +586,8 @@ def scenario_interrupted_motion(app: DebugApp):
     request(sock, "pinch", phase="begin", scale=1.0, x=100, y=100)
     request(sock, "pinch", phase="change", scale=1.4, x=100, y=100)
     request(sock, "pinch", phase="end")
-    time.sleep(2)
-    state = request(sock, "state")
+    state = wait_for(lambda: (lambda state: state if state["navigationIdle"] else None)(request(sock, "state")),
+                     10, "the interrupted fly and pinch to settle")
     check(not near(state["center"], FLY_TARGET, 0.5), "an interrupted fly never reaches its target")
     check(state["viewportScale"] == 1, "native pinch does not change WebKit page scale")
     eval_js(sock, location_js(AWAY))
@@ -528,8 +596,9 @@ def scenario_interrupted_motion(app: DebugApp):
     zoom = request(sock, "state")["zoom"]
     eval_js(sock, "document.querySelector('#zoom-in').click()")
     eval_js(sock, f"window.Airloom.debugZoomTo({zoom - 1})")
-    time.sleep(1.5)
-    check(abs(request(sock, "state")["zoom"] - (zoom - 1)) < 1e-6,
+    state = wait_for(lambda: (lambda state: state if state["navigationIdle"] else None)(request(sock, "state")),
+                     10, "the interrupted zoom to settle")
+    check(abs(state["zoom"] - (zoom - 1)) < 1e-6,
           "a direct zoom cancels the running zoom animation")
     eval_js(sock, f"window.Airloom.debugZoomTo({start['zoom']})")
 
@@ -583,7 +652,7 @@ def scenario_filters(app: DebugApp):
     check(True, "cycling back to Outdoor restores the original visible sensors")
 
 
-RESIZE_PROBE_JS = """
+RESIZE_PROBE_JS = r"""
 (() => {
   const popup = document.querySelector("#map-popup");
   const search = document.querySelector(".search-overlay").getBoundingClientRect();
@@ -1095,7 +1164,9 @@ class FixtureApp(DebugApp):
         eval_js(self.sock_path, action_js)
         wait_for(lambda: eval_js(self.sock_path, SENSOR_SPY_JS) > before
                  and request(self.sock_path, "state") is not None, 20, what)
-        time.sleep(0.5)  # let alert persistence and toasts settle
+        # No settling wait: _finish_refresh sends the sensors, its errors and
+        # alert persistence in one main-loop callback, and the eval that
+        # observed the new count was queued after that callback returned.
         return eval_js(self.sock_path, PUBLICATION_JS)
 
     def notifications(self) -> list[int]:
@@ -1273,7 +1344,11 @@ def scenario_stripped_debug(root: Path, geocoder: GeocoderStub):
     app = DebugApp(root, "stripped", geocoder.url, project=stripped, debug_socket=False, private_bus=True)
     try:
         app.start()
-        time.sleep(8)
+        # Retry nothing: enumeration errors other than a vanished process must
+        # fail the scenario rather than read as "not started yet".
+        wait_for(lambda: any(b"WebKitWebProcess" in proc_bytes(pid, "cmdline")
+                             for pid in descendants(app.process.pid)), 30, "the stripped app's web process",
+                 retry=())
         check(app.process.poll() is None, "the app keeps running without the debug module")
         caller_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
         app_pids = [pid for pid in descendants(app.process.pid)
@@ -1381,6 +1456,25 @@ LAYOUT_MEASURE_JS = r"""
     escaped: escaped.slice(0, 12),
   });
 })()
+"""
+
+# Changes while the page is still laying out after a state change.
+LAYOUT_SIGNATURE_JS = """
+(() => {
+  const rect = (selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return [r.left, r.top, r.width, r.height].map(Math.round);
+  };
+  return JSON.stringify([document.documentElement.scrollWidth,
+    ...[".search-overlay", ".summary-chip", ".detail-card", ".map-popup", ".sensors-panel", ".settings-dialog",
+        ".shell-status"].map(rect)]);
+})()
+"""
+
+HOME_PLACE_RESULTS_SHOWN_JS = """
+String(document.querySelectorAll("#home-place-results button").length > 0)
 """
 
 LAYOUT_STATES_JS = {
@@ -1648,7 +1742,7 @@ def layout_child(cases: list[dict]) -> int:
           const rect = element.getBoundingClientRect();
           return JSON.stringify({x: rect.left + 5, y: rect.top + rect.height / 2, width: innerWidth});
         })()""" % json.dumps(selector)))
-        pump(0.2)
+        pump(0.2)  # sleep-ok: lets WebKit paint the scrolled frame; painting is not observable from the page
         loop = GLib.MainLoop()
         box = {}
 
@@ -1671,6 +1765,21 @@ def layout_child(cases: list[dict]) -> int:
         x, y = int(point["x"] * ratio), int(point["y"] * ratio)
         offset = y * pixbuf.get_rowstride() + x * pixbuf.get_n_channels()
         return list(pixbuf.get_pixels()[offset:offset + 3])
+
+    def settle_layout(webview, ready_js: str | None = None) -> bool:
+        """Wait (at most 5 s) for ready_js, if given, to report true and for
+        two consecutive layout signatures to match."""
+        deadline = time.monotonic() + 5
+        previous = None
+        while time.monotonic() < deadline:
+            pump(0.05)  # sleep-ok: polling cadence
+            if ready_js is not None and run_js(webview, ready_js) != "true":
+                continue
+            current = run_js(webview, LAYOUT_SIGNATURE_JS)
+            if current == previous:
+                return True
+            previous = current
+        return False
 
     # Callers pass one case per process: a second WebView created in the
     # same process was never given a size under a headless compositor.
@@ -1722,7 +1831,7 @@ def layout_child(cases: list[dict]) -> int:
         webview.load_uri(entry)
         deadline = time.monotonic() + 30
         while True:
-            pump(0.2)
+            pump(0.2)  # sleep-ok: polling cadence
             try:
                 ready = run_js(webview, "String(Boolean(window.Airloom && window.Airloom.debugState().sensorCount > 0 && document.querySelectorAll('.map-marker').length))")
             except RuntimeError:
@@ -1736,41 +1845,54 @@ def layout_child(cases: list[dict]) -> int:
                     detail = str(exc)
                 print(json.dumps({**case, "error": f"page never became ready: {detail}"}), flush=True)
                 return 1
+
+        def settled(what: str) -> bool:
+            if settle_layout(webview):
+                return True
+            print(json.dumps({**case, "error": f"layout never settled {what}"}), flush=True)
+            return False
+
         if mode == "preview":
             run_js(webview, "window.Airloom.receive('config', {interface_scale: %s}); 'ok'" % scale)
-        pump(0.3)
+        if not settled("after loading"):
+            return 1
         # The page reports its own theme as "theme"; keep the requested one apart.
         requested = {**case, "case_theme": case["theme"]}
         for name, script in LAYOUT_STATES_JS.items():
             outcome = run_js(webview, script)
-            pump(0.3)
+            if not settled(f"in the {name} state"):
+                return 1
             measured = json.loads(run_js(webview, LAYOUT_MEASURE_JS))
             print(json.dumps({**requested, "state": name, "outcome": outcome, **measured}), flush=True)
         home_row = json.loads(run_js(webview, HOME_PLACE_ROW_JS))
-        pump(0.2)
         print(json.dumps({**requested, "state": "home-place-row", "homeRow": home_row}), flush=True)
         if mode == "desktop":
             run_js(webview, HOME_PLACE_SEARCH_JS)
-            pump(0.5)
+            # A missing reply leaves the results hidden; the measurement reports it.
+            settled_search = settle_layout(webview, HOME_PLACE_RESULTS_SHOWN_JS)
             search = json.loads(run_js(webview, HOME_PLACE_SEARCH_MEASURE_JS))
+            if not settled_search and search["resultsShown"]:
+                print(json.dumps({**case, "error": "layout never settled with the home search results"}), flush=True)
+                return 1
             run_js(webview, 'document.querySelector("#settings-dialog").close(); "ok"')
-            pump(0.2)
             print(json.dumps({**requested, "state": "home-place-search", "homeSearch": search}), flush=True)
         if mode == "preview":
             # Computed style alone can't prove a native control renders it:
             # sample the painted background of each Preferences field.
             run_js(webview, 'window.Airloom.receive("open-settings"); "ok"')
-            pump(0.3)
+            if not settled("with Preferences open"):
+                return 1
             rendered = {name: rendered_background(webview, selector) for name, selector in (
                 ("radius", "[name=radius_km]"), ("refresh", "[name=refresh_minutes]"),
                 ("enabledSelect", "[name=interface_scale]"))}
             run_js(webview, 'document.querySelector("#settings-dialog").close(); "ok"')
-            pump(0.2)
+            if not settled("after closing Preferences"):
+                return 1
             actions = json.loads(run_js(webview, PREVIEW_ACTIONS_JS))
             actions["rendered"] = rendered
             print(json.dumps({**requested, "state": "preview-actions", "actions": actions}), flush=True)
         window.set_child(None)
-        pump(0.1)
+        pump(0.1)  # sleep-ok: lets GTK drop the view; nothing is measured after it
     window.destroy()
     return 0
 
@@ -1939,7 +2061,7 @@ def start_sentinel(root: Path) -> subprocess.Popen:
     project = root / "sentinel-app"
     (project / "airloom").mkdir(parents=True)
     (project / "airloom" / "__init__.py").write_text("", encoding="utf-8")
-    (project / "airloom" / "__main__.py").write_text("import time\nwhile True:\n    time.sleep(1)\n",
+    (project / "airloom" / "__main__.py").write_text("import time\nwhile True:\n    time.sleep(1)\n",  # sleep-ok: keeps the look-alike alive until stopped
                                                      encoding="utf-8")
     return subprocess.Popen([sys.executable, "-m", "airloom"], cwd=project, start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

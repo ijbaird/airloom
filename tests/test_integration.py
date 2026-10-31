@@ -23,6 +23,7 @@ import threading
 import time
 import unittest
 import urllib.request
+import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -703,7 +704,6 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         stripped.mkdir()
         with mock.patch.object(self.script, "DebugApp", FakeApp), \
                 mock.patch.object(self.script, "make_stripped_tree", return_value=stripped), \
-                mock.patch.object(self.script.time, "sleep"), \
                 mock.patch.object(self.script.Path, "read_text", side_effect=error), \
                 redirect_stdout(io.StringIO()):
             with self.assertRaises(PermissionError):
@@ -750,6 +750,29 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         self.assertIn("trend-retry", self.script.STANDALONE_SCENARIOS)
         self.assertNotIn("trend-retry", self.script.APP_SCENARIOS)
         self.assertNotIn("1000000", inspect.getsource(self.script.scenario_trend_retry))
+
+    def test_fixed_sleeps_are_justified(self):
+        unjustified = [
+            f"{number}: {line.strip()}"
+            for number, line in enumerate(SCRIPT.read_text(encoding="utf-8").splitlines(), 1)
+            if any(call in line for call in ("time.sleep(", "SLEEP(", "pump("))
+            and not line.lstrip().startswith("def pump(") and "# sleep-ok:" not in line
+        ]
+        self.assertFalse(unjustified, "unjustified sleep: " + "\n".join(unjustified))
+
+    def test_script_compiles_without_syntax_warnings(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            compile(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT), "exec")
+
+    def test_geocoder_stub_records_completion_after_the_response(self):
+        with self.script.GeocoderStub() as stub:
+            with urllib.request.urlopen(f"{stub.url}/search?q=fasttown", timeout=5) as response:
+                response.read()
+            # The handler records completion after flushing, so the client can
+            # read the response first: poll rather than assert at once.
+            self.script.wait_for(lambda: stub.completed("fasttown"), 5, "the stub to record completion")
+            self.assertFalse(stub.completed("slowtown"))
 
     def test_caller_snapshot_detects_any_change(self):
         target = self.root / "airloom"
