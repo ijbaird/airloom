@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.server
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -1620,6 +1622,133 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
                 self.assertEqual(args[args.index("--version") + 1], "1.2.3")
                 self.assertEqual(args[args.index("--previous-bundle") + 1], "previous/Airloom-x86_64.flatpak")
 
+    def select_previous_release(self, tags, releases, *, eligible="false", version="0.14.0"):
+        """Run the workflow's selection step against a fake releases API.
+
+        releases maps a tag to its release JSON, or to an HTTP status code;
+        tags absent from it answer 404 like an unpublished tag.
+        """
+        script = run_block(step_block(self.verify, "Select previous supported release"))
+        requests = []
+
+        class FakeReleases(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, self.headers.get("Authorization")))
+                tag = self.path.rsplit("/", 1)[-1]
+                release = releases.get(tag, 404) if self.path.startswith(
+                    "/repos/ijbaird/airloom/releases/tags/") else 404
+                status = release if isinstance(release, int) else 200
+                body = b"" if isinstance(release, int) else json.dumps(release).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeReleases)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with release_checkout(tags=tags, package=version) as root:
+                github_env = root / "github-env"
+                env = dict(
+                    os.environ,
+                    RELEASE_ELIGIBLE=eligible,
+                    ARCH="x86_64",
+                    GITHUB_ENV=str(github_env),
+                    GITHUB_API_URL=f"http://127.0.0.1:{server.server_address[1]}",
+                    GITHUB_REPOSITORY="ijbaird/airloom",
+                    GITHUB_TOKEN="fake-token",
+                )
+                result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
+                                        capture_output=True, text=True)
+                written = github_env.read_text(encoding="utf-8") if github_env.exists() else ""
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        return result, written, requests
+
+    @staticmethod
+    def published(tag, *assets, draft=False):
+        return {"tag_name": tag, "draft": draft,
+                "assets": [{"name": name, "state": "uploaded"} for name in assets]}
+
+    def test_previous_release_selection_skips_an_unpublished_failed_tag(self):
+        # Failed-tag recovery: v0.14.0 was tagged but nothing was published,
+        # and the fixed 0.14.0 commit must still pass PR/main verification.
+        result, written, requests = self.select_previous_release(
+            ("v0.12.3", "v0.13.0", "v0.14.0"),
+            {
+                "v0.12.3": self.published("v0.12.3", "Airloom-x86_64.flatpak"),
+                "v0.13.0": self.published("v0.13.0", "Airloom-x86_64.flatpak"),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PREVIOUS_TAG=v0.13.0\n", written)
+        self.assertIn("PREVIOUS_VERSION=0.13.0\n", written)
+        self.assertIn("skipping v0.14.0", result.stderr)
+        self.assertEqual([path for path, _ in requests], [
+            "/repos/ijbaird/airloom/releases/tags/v0.14.0",
+            "/repos/ijbaird/airloom/releases/tags/v0.13.0",
+        ])
+        self.assertTrue(all(auth == "Bearer fake-token" for _, auth in requests))
+
+    def test_previous_release_selection_skips_drafts_and_releases_without_the_arch_bundle(self):
+        result, written, _ = self.select_previous_release(
+            ("v0.12.3", "v0.13.0", "v0.14.0"),
+            {
+                "v0.12.3": self.published("v0.12.3", "Airloom-x86_64.flatpak"),
+                "v0.13.0": self.published("v0.13.0", "Airloom-aarch64.flatpak"),
+                "v0.14.0": self.published("v0.14.0", "Airloom-x86_64.flatpak", draft=True),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PREVIOUS_TAG=v0.12.3\n", written)
+
+    def test_development_runs_still_upgrade_from_a_published_equal_version_release(self):
+        result, written, _ = self.select_previous_release(
+            ("v0.13.0", "v0.14.0"),
+            {
+                "v0.13.0": self.published("v0.13.0", "Airloom-x86_64.flatpak"),
+                "v0.14.0": self.published("v0.14.0", "Airloom-x86_64.flatpak"),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PREVIOUS_TAG=v0.14.0\n", written)
+
+    def test_release_runs_never_upgrade_from_the_release_being_built(self):
+        result, written, _ = self.select_previous_release(
+            ("v0.13.0", "v0.14.0"),
+            {
+                "v0.13.0": self.published("v0.13.0", "Airloom-x86_64.flatpak"),
+                "v0.14.0": self.published("v0.14.0", "Airloom-x86_64.flatpak"),
+            },
+            eligible="true",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PREVIOUS_TAG=v0.13.0\n", written)
+
+    def test_previous_release_selection_denies_without_a_published_candidate(self):
+        result, written, _ = self.select_previous_release(("v0.13.0", "v0.14.0"), {})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("no published previous release with Airloom-x86_64.flatpak", result.stderr)
+        self.assertNotIn("PREVIOUS_TAG", written)
+
+    def test_previous_release_selection_fails_closed_when_the_api_errors(self):
+        # Only a 404 means "not published"; any other answer must not quietly
+        # fall back to an older release.
+        result, written, requests = self.select_previous_release(
+            ("v0.13.0", "v0.14.0"),
+            {"v0.13.0": self.published("v0.13.0", "Airloom-x86_64.flatpak"), "v0.14.0": 500},
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("v0.14.0", result.stderr)
+        self.assertNotIn("PREVIOUS_TAG", written)
+        self.assertEqual(len(requests), 1)
+
     def test_newer_tag_after_initial_eligibility_is_rejected_at_publication(self):
         with release_checkout() as root:
             initial = check_release(root, "refs/tags/v1.2.3")
@@ -1866,8 +1995,13 @@ class ReleaseDocumentationTest(unittest.TestCase):
             "git tag -d vX.Y.Z",
             "never move or delete the tag",
             "next patch version",
+            "upgrades from the newest published release",
         ):
             self.assertIn(expected, section)
+
+    def test_release_guide_explains_previous_release_selection(self):
+        text = RELEASE_GUIDE.read_text(encoding="utf-8")
+        self.assertIn("published (non-draft) GitHub release that includes that architecture's bundle", text)
 
     def test_release_guide_states_the_signing_key_rotation_policy(self):
         text = RELEASE_GUIDE.read_text(encoding="utf-8")

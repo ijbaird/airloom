@@ -344,21 +344,31 @@ jobs:
       # This mirrors publish-repo's fetch, so PR runs exercise that path too.
       - name: Refresh release tags
         run: git fetch --force --tags origin
+      # Only a published (non-draft) release with this arch's bundle counts:
+      # a failed tag that published nothing must not be the upgrade source
+      # while its fix goes through PR and main verification.
       - name: Select previous supported release
         shell: bash
         env:
           RELEASE_ELIGIBLE: ${{ needs.release-eligibility.outputs.eligible }}
+          ARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           current_version="$(python3 -c 'from airloom import __version__; print(__version__)')"
           export CURRENT_VERSION="${current_version}"
           previous_tag="$(python3 - <<'PY'
+          import json
           import os
           import re
           import subprocess
+          import sys
+          import urllib.error
+          import urllib.request
 
           pattern = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
           current = tuple(int(part) for part in os.environ["CURRENT_VERSION"].split("."))
+          asset = f"Airloom-{os.environ['ARCH']}.flatpak"
           candidates = []
           for tag in subprocess.check_output(["git", "tag", "--list", "v*"], text=True).splitlines():
               match = pattern.fullmatch(tag)
@@ -369,9 +379,37 @@ jobs:
                   candidate == current and os.environ["RELEASE_ELIGIBLE"] != "true"
               ):
                   candidates.append((candidate, tag))
-          if not candidates:
-              raise SystemExit("no previous supported release tag found")
-          print(max(candidates)[1])
+
+          def published_with_asset(tag):
+              request = urllib.request.Request(
+                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/{tag}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      release = json.load(response)
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return False
+                  raise SystemExit(f"cannot check whether {tag} is published: HTTP {error.code}")
+              except (OSError, ValueError) as error:
+                  raise SystemExit(f"cannot check whether {tag} is published: {error}")
+              return not release.get("draft", True) and any(
+                  item.get("name") == asset and item.get("state") == "uploaded"
+                  for item in release.get("assets", [])
+              )
+
+          for _, tag in sorted(candidates, reverse=True):
+              if published_with_asset(tag):
+                  print(tag)
+                  break
+              print(f"skipping {tag}: no published release with {asset}", file=sys.stderr)
+          else:
+              raise SystemExit(f"no published previous release with {asset} found")
           PY
           )"
           {
