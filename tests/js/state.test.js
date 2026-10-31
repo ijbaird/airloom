@@ -1721,6 +1721,40 @@ test("a selected favorite accepts trend events for its own reading, not the area
   assert.match(app.elements.get("chart").innerHTML, /Trend not loaded/);
 });
 
+test("a selected favorite ignores area trend events and older requests for its own reading", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app, { has_api_key: true });
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { last_seen: FRESH })],
+    favorites: [fixtureSensor(1, { aqi: 77, favorite: true, last_seen: FRESH - 600 })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    config: { has_api_key: true },
+  });
+  rowFor(app, "favorites-list", 1).click();
+  const trend = (requestId, readingLastSeen, now) => app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: requestId,
+    status: "loaded",
+    reading_last_seen: readingLastSeen,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: now }],
+  });
+
+  // The area's reading loads while the favorite stays selected.
+  trend(1, FRESH, 60);
+  assert.equal(app.elements.get("aqi-number").textContent, "77");
+  assert.match(app.elements.get("chart").innerHTML, /Trend not loaded/);
+
+  trend(3, FRESH - 600, 48);
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+  trend(2, FRESH - 600, 70);
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points", "an older request cannot replace a newer one");
+
+  rowFor(app, "sensor-list", 1).click();
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 20 points", "the area keeps its own event");
+});
+
 test("relative ages tick every minute without refetching", () => {
   const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);
