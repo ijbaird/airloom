@@ -753,6 +753,41 @@ class DurabilityTest(StoreThreadsTestCase):
                 ],
             )
 
+    def test_leaf_mkdir_failure_still_syncs_the_ancestors_it_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "new" / "airloom" / "config.json"
+            settings, errors = self.collecting_store(path)
+            real_mkdir = Path.mkdir
+            denied = []
+
+            def mkdir(directory, *args, **kwargs):
+                # The leaf fails once, after its parent "new" was created.
+                if directory == path.parent and (root / "new").is_dir() and not denied:
+                    denied.append(directory)
+                    raise PermissionError(errno.EACCES, "Permission denied", str(directory))
+                return real_mkdir(directory, *args, **kwargs)
+
+            with mock.patch.object(Path, "mkdir", mkdir):
+                with self.assertRaises(PermissionError):
+                    settings.save()
+            self.assertTrue((root / "new").is_dir())
+            self.assertFalse(path.parent.exists())
+
+            synced = []
+            real_sync = store._fsync_directory
+
+            def sync(directory):
+                real_sync(directory)
+                synced.append(directory)
+
+            with mock.patch("airloom.store._fsync_directory", side_effect=sync):
+                settings.save()
+                self.assertTrue(settings.flush(5))
+            # "new" is only reachable after a crash once root's entry is synced.
+            self.assertEqual(synced, [root, root / "new", path.parent])
+            self.assertEqual(errors, [])
+
 
 class VanishedDirectoryTest(StoreThreadsTestCase):
     def record_syncs(self, fail=lambda directory: False):

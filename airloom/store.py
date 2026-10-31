@@ -55,22 +55,22 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _make_directories(directory: Path, mode: int = 0o700) -> list[Path]:
+def _make_directories(directory: Path, created: list[Path], mode: int = 0o700) -> None:
     """``directory.mkdir(parents=True, exist_ok=True, mode=mode)``, with the
-    same system calls, returning the directories it created, outermost first."""
+    same system calls, appending each directory it creates to ``created``,
+    outermost first, as it goes: a later failure keeps the earlier ones."""
     try:
         directory.mkdir(mode=mode)
     except FileNotFoundError:
         if directory.parent == directory:
             raise
-        created = _make_directories(directory.parent, mode=0o777)
+        _make_directories(directory.parent, created, mode=0o777)
         directory.mkdir(mode=mode)
-        return [*created, directory]
     except OSError:
         if not directory.is_dir():
             raise
-        return []
-    return [directory]
+        return
+    created.append(directory)
 
 
 def _default_config_dir() -> Path:
@@ -217,8 +217,10 @@ class Store:
         return confirmed
 
     def _write(self, data: dict) -> None:
-        created = _make_directories(self.path.parent)
-        if created:
+        created: list[Path] = []
+        try:
+            _make_directories(self.path.parent, created)
+        finally:
             # Each new directory is only reachable after a crash once the
             # entry in its parent is synced, even if this write then fails.
             self._mark_unconfirmed([d.parent for d in created])
