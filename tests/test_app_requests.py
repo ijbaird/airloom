@@ -751,6 +751,34 @@ class TrendRequestTest(ApplicationRequestTestCase):
         self.assertEqual(app.cache.stored, [])
         self.assertNotIn(1, app.controller.trend_unsettled)
 
+    def test_shutdown_releases_a_held_trend_without_waiting_for_its_settlement(self):
+        trend = [{"label": "Now", "aqi": 50}]
+        app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+        threads, idles = ThreadQueue(), IdleQueue()
+        client = mock.Mock()
+        client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "PurpleAirClient", return_value=client),
+            mock.patch.object(app_module, "trend_from_values", return_value=trend),
+        ):
+            app._ensure_trend(1)
+            threads.threads[0].run()
+            idles.run(0)
+            writer = threads.threads[1]
+            self.assertIn(1, app.controller.trend_unsettled)
+
+            app._on_shutdown()
+            self.assertEqual(app.controller.trend_unsettled, {})
+            # The writer drains, but its settlement idle never runs.
+            writer.run()
+
+        self.assertEqual(app._active_workers, 0)
+        self.assertEqual(app.cache.close_calls, 1)
+        self.assertEqual(app.controller.trend_unsettled, {})
+
     def test_obsolete_cache_read_error_sends_no_live_fetch_toast(self):
         app = self.make_app(sensors=[make_sensor(last_seen=1234)])
         app.cache.get_trend = mock.Mock(side_effect=CacheError("cache read failed"))

@@ -854,6 +854,33 @@ class TrendDecisionTest(unittest.TestCase):
         self.assertNotIn(1, h.controller.trend_unsettled)
         self.assertEqual(h.controller.begin_trend(1).kind, "remote")
 
+    def test_adopting_readings_keeps_only_holds_for_readings_still_present(self):
+        trend = [{"label": "Now", "aqi": 9}]
+        h = Harness()
+        h.finish(h.controller.refresh(), [reading(1, last_seen=100), reading(2, last_seen=100),
+                                          reading(3, last_seen=100)])
+        generation = h.controller.credential_generation
+        for sensor_id in (1, 2, 3):
+            h.controller.hold_trend(sensor_id, 100, generation, trend)
+
+        # 1 keeps its exact reading, 2 has a newer one, 3 is gone; nobody
+        # reselects 2 or 3, so only adoption can release their holds.
+        h.finish(h.controller.refresh(force=True),
+                 [reading(1, last_seen=100), reading(2, last_seen=200)])
+
+        self.assertEqual(set(h.controller.trend_unsettled), {1})
+        served = h.controller.begin_trend(1)
+        self.assertEqual((served.kind, served.status, served.trend), ("local", "loaded", trend))
+
+    def test_shutdown_releases_every_hold(self):
+        h = Harness()
+        h.controller.sensors = [reading(1, last_seen=100)]
+        h.controller.hold_trend(1, 100, h.controller.credential_generation, [{"label": "Now"}])
+
+        h.controller.shutdown()
+
+        self.assertEqual(h.controller.trend_unsettled, {})
+
 
 class CachedStartupDecisionTest(unittest.TestCase):
     def test_home_paint_is_bound_to_the_home_target(self):

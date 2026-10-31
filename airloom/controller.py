@@ -277,6 +277,8 @@ class ApplicationController:
         self.active_fetch = None
         self.refreshing = False
         self._forced_target = None
+        # Nothing reselects after shutdown, and write settlements never run.
+        self.trend_unsettled.clear()
         self._requests.invalidate()
         self._generation += 1
 
@@ -536,6 +538,7 @@ class ApplicationController:
                 sensor.sensor_id, (outcome.origin, outcome.delivery)
             )
         self.sensors = outcome.sensors
+        self._release_superseded_trends()
         self.area_ids = set(outcome.area_ids)
         self.monitoring_ids = set(outcome.monitoring_ids)
         self.last_source = outcome.source
@@ -595,6 +598,7 @@ class ApplicationController:
             sensor.origin = "live"
             sensor.delivery = "cache"
         self.sensors = sensors
+        self._release_superseded_trends()
         self.area_ids = {sensor.sensor_id for sensor in sensors}
         self.monitoring_ids = set()
         self.last_origin = "live"
@@ -852,6 +856,13 @@ class ApplicationController:
     ) -> None:
         """Keep an accepted trend authoritative until its queued write settles."""
         self.trend_unsettled[sensor_id] = (reading_last_seen, generation, trend)
+
+    def _release_superseded_trends(self) -> None:
+        """Keep only holds whose exact reading is in the adopted collection."""
+        present = {(sensor.sensor_id, sensor.last_seen) for sensor in self.sensors}
+        for sensor_id, held in list(self.trend_unsettled.items()):
+            if (sensor_id, held[0]) not in present:
+                del self.trend_unsettled[sensor_id]
 
     def settle_trend(self, sensor_id: int, reading_last_seen: int | None, generation: int) -> None:
         """A write settled (stored, skipped, or failed); release its hold only."""
