@@ -53,22 +53,24 @@ class Geocoder:
         self._last_request = None
         self._throttle_lock = threading.Lock()
         self._cache = OrderedDict()
+        self._reverse_cache = OrderedDict()
         self._cache_lock = threading.Lock()
         self._search_lock = threading.Lock()
+        self._reverse_lock = threading.Lock()
 
     def search(self, query: str, limit: int = 5, timeout: int = 10) -> list[Place]:
         query = query.strip()
         if not query:
             return []
         key = (query, limit)
-        cached = self._cached(key)
+        cached = self._cached(key, self._cache)
         if cached is not None:
-            return cached
+            return list(cached)
         with self._search_lock:
             # A concurrent miss may have populated this key while we waited.
-            cached = self._cached(key)
+            cached = self._cached(key, self._cache)
             if cached is not None:
-                return cached
+                return list(cached)
             payload = self._request(
                 self.search_url,
                 {"q": query, "format": "jsonv2", "limit": str(limit)},
@@ -80,7 +82,7 @@ class Geocoder:
             for row in payload:
                 if isinstance(row, dict) and (place := _place_from(row)):
                     places.append(place)
-            self._store_cached(key, places)
+            self._store_cached(key, tuple(places), self._cache)
             return places
 
     def reverse(self, latitude: float, longitude: float, timeout: int = 10) -> str:
@@ -88,45 +90,53 @@ class Geocoder:
         if coordinates is None:
             raise GeocodeError("Invalid geocoder coordinates.")
         latitude, longitude = coordinates
+        lat, lon = f"{latitude:.6f}", f"{longitude:.6f}"
         # Zoom 14 resolves small towns (village/town keys) that city-level zoom
-        # collapses into their county; the key preference below still favors the
-        # town/city name over broader divisions for urban areas.
-        payload = self._request(
-            self.reverse_url,
-            {"lat": f"{latitude:.6f}", "lon": f"{longitude:.6f}", "format": "jsonv2", "zoom": "14"},
-            timeout,
-        )
-        if isinstance(payload, dict):
-            address = payload.get("address")
-            if isinstance(address, dict):
-                for key in ("village", "town", "city", "municipality", "county", "state"):
-                    value = address.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return value.strip()[:80]
-            name = payload.get("name") or payload.get("display_name")
-            if isinstance(name, str) and name.strip():
-                return name.split(",")[0].strip()[:80]
-        return f"{latitude:.2f}, {longitude:.2f}"
+        # collapses into their county; the key preference in _label_from still
+        # favors the town/city name over broader divisions for urban areas.
+        zoom = "14"
+        # Key on exactly what is sent, so equal requests share one label.
+        key = (self.reverse_url, lat, lon, zoom)
+        cached = self._cached(key, self._reverse_cache)
+        if cached is not None:
+            return cached
+        with self._reverse_lock:
+            # A concurrent miss may have populated this key while we waited.
+            cached = self._cached(key, self._reverse_cache)
+            if cached is not None:
+                return cached
+            payload = self._request(
+                self.reverse_url,
+                {"lat": lat, "lon": lon, "format": "jsonv2", "zoom": zoom},
+                timeout,
+            )
+            fallback = f"{latitude:.2f}, {longitude:.2f}"
+            if not isinstance(payload, dict):
+                # Malformed responses fall back to coordinates but are retried.
+                return fallback
+            label = _label_from(payload) or fallback
+            self._store_cached(key, label, self._reverse_cache)
+            return label
 
-    def _cached(self, key):
+    def _cached(self, key, cache: OrderedDict):
         now = self._clock()
         with self._cache_lock:
-            entry = self._cache.get(key)
+            entry = cache.get(key)
             if entry is None:
                 return None
-            cached_at, places = entry
+            cached_at, value = entry
             if now - cached_at >= _CACHE_TTL:
-                del self._cache[key]
+                del cache[key]
                 return None
-            self._cache.move_to_end(key)
-            return list(places)
+            cache.move_to_end(key)
+            return value
 
-    def _store_cached(self, key, places):
+    def _store_cached(self, key, value, cache: OrderedDict):
         with self._cache_lock:
-            self._cache[key] = (self._clock(), tuple(places))
-            self._cache.move_to_end(key)
-            while len(self._cache) > _CACHE_MAXSIZE:
-                self._cache.popitem(last=False)
+            cache[key] = (self._clock(), value)
+            cache.move_to_end(key)
+            while len(cache) > _CACHE_MAXSIZE:
+                cache.popitem(last=False)
 
     def _request(self, url: str, params: dict, timeout: int):
         self._throttle()
@@ -201,6 +211,19 @@ def _coordinates(latitude: float, longitude: float) -> tuple[float, float] | Non
     if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
         return None
     return latitude, longitude
+
+
+def _label_from(payload: dict) -> str | None:
+    address = payload.get("address")
+    if isinstance(address, dict):
+        for key in ("village", "town", "city", "municipality", "county", "state"):
+            value = address.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:80]
+    name = payload.get("name") or payload.get("display_name")
+    if isinstance(name, str) and name.strip():
+        return name.split(",")[0].strip()[:80]
+    return None
 
 
 def _place_from(row: dict) -> Place | None:

@@ -60,6 +60,25 @@ class EntrySignalingLock:
         return self._lock.__exit__(*exc)
 
 
+def record_network_path(client):
+    """Wrap _request/_throttle on the instance, as app.py's adapters do."""
+    events = []
+    original_request = client._request
+    original_throttle = client._throttle
+
+    def request(url, params, timeout):
+        events.append("request")
+        return original_request(url, params, timeout)
+
+    def throttle():
+        original_throttle()
+        events.append("throttle")
+
+    client._request = request
+    client._throttle = throttle
+    return events
+
+
 def make_geocoder(**kwargs):
     timing = FakeTiming()
     client = geocode.Geocoder(clock=timing.clock, sleep=timing.sleep, **kwargs)
@@ -69,6 +88,9 @@ def make_geocoder(**kwargs):
 class GeocodeTest(unittest.TestCase):
     def setUp(self):
         geocode._last_request = 0.0  # defeat the throttle between tests
+        # A fresh module client per test, so its reverse cache cannot leak.
+        geocode._default_geocoder = None
+        self.addCleanup(setattr, geocode, "_default_geocoder", None)
 
     def test_search_parses_places_and_shortens_names(self):
         payload = [
@@ -435,6 +457,258 @@ class GeocoderTest(unittest.TestCase):
             self.assertEqual(
                 client.search("non-list"), [Place("Recovered place", 1.0, 2.0)])
         self.assertEqual(spy.call_count, 2)
+
+
+class ReverseCacheTest(unittest.TestCase):
+    payload = {"address": {"city": "Stubville"}}
+
+    def test_repeated_reverse_uses_cache_without_request_or_throttle(self):
+        client, timing = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response(self.payload)
+        ) as spy:
+            first = client.reverse(45, -122)
+            second = client.reverse(45, -122)
+        self.assertEqual([first, second], ["Stubville", "Stubville"])
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(timing.sleeps, [])
+
+    def test_reverse_miss_goes_through_request_and_throttle_once(self):
+        client, _ = make_geocoder()
+        events = record_network_path(client)
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response(self.payload)
+        ) as spy:
+            self.assertEqual(client.reverse(45, -122), "Stubville")
+            self.assertEqual(events, ["request", "throttle"])
+            self.assertEqual(client.reverse(45, -122), "Stubville")
+        self.assertEqual(events, ["request", "throttle"])
+        self.assertEqual(spy.call_count, 1)
+
+    def test_reverse_key_is_the_rounded_query_sent(self):
+        client, _ = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response(self.payload)
+        ) as spy:
+            client.reverse(45.0000001, -122)
+            client.reverse(45.0000004, -122)
+            self.assertEqual(spy.call_count, 1)
+            client.reverse(45.000001, -122)
+        self.assertEqual(spy.call_count, 2)
+        self.assertIn("lat=45.000001", spy.call_args[0][0].full_url)
+
+    def test_reverse_key_includes_endpoint(self):
+        client, _ = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response(self.payload)
+        ) as spy:
+            client.reverse(45, -122)
+            client.reverse_url = "https://other.example.test/reverse"
+            client.reverse(45, -122)
+        self.assertEqual(spy.call_count, 2)
+        self.assertTrue(
+            spy.call_args[0][0].full_url.startswith("https://other.example.test/reverse?")
+        )
+
+    def test_reverse_cache_expires_and_is_bounded(self):
+        client, timing = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response(self.payload)
+        ) as spy:
+            client.reverse(45, -122)
+            timing.advance(301)
+            client.reverse(45, -122)
+        self.assertEqual(spy.call_count, 2)
+
+        client, _ = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response(self.payload)
+        ) as spy:
+            for index in range(65):
+                client.reverse(index, -122)
+            client.reverse(0, -122)
+        self.assertEqual(spy.call_count, 66)
+
+    def test_reverse_failures_and_malformed_payloads_are_not_cached(self):
+        client, _ = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request,
+            "urlopen",
+            side_effect=[OSError("boom"), fake_response(self.payload)],
+        ) as spy:
+            with self.assertRaises(GeocodeError):
+                client.reverse(45, -122)
+            self.assertEqual(client.reverse(45, -122), "Stubville")
+        self.assertEqual(spy.call_count, 2)
+
+        client, _ = make_geocoder()
+        with mock.patch.object(
+            geocode.urllib.request,
+            "urlopen",
+            side_effect=[fake_response([]), fake_response(self.payload)],
+        ) as spy:
+            self.assertEqual(client.reverse(45, -122), "45.00, -122.00")
+            self.assertEqual(client.reverse(45, -122), "Stubville")
+        self.assertEqual(spy.call_count, 2)
+
+    def test_adapter_cancellation_caches_nothing_and_a_retry_succeeds(self):
+        class LookupCancelled(Exception):
+            pass
+
+        client, _ = make_geocoder()
+        events = record_network_path(client)
+        admitted_throttle = client._throttle
+        cancel = [True]
+
+        def cancelling_throttle():
+            # As app.py's adapter may, after any throttle wait.
+            admitted_throttle()
+            if cancel[0]:
+                cancel[0] = False
+                raise LookupCancelled()
+
+        client._throttle = cancelling_throttle
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response(self.payload)
+        ) as spy:
+            with self.assertRaises(LookupCancelled):
+                client.reverse(45, -122)
+            self.assertEqual(spy.call_count, 0)
+            self.assertEqual(len(client._reverse_cache), 0)
+            self.assertEqual(client.reverse(45, -122), "Stubville")
+            self.assertEqual(client.reverse(45, -122), "Stubville")
+        self.assertEqual(events, ["request", "throttle", "request", "throttle"])
+        self.assertEqual(spy.call_count, 1)
+
+    def test_empty_dict_fallback_is_cached(self):
+        client, _ = make_geocoder()
+        events = record_network_path(client)
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", return_value=fake_response({})
+        ) as spy:
+            self.assertEqual(client.reverse(45, -122), "45.00, -122.00")
+            self.assertEqual(client.reverse(45, -122), "45.00, -122.00")
+        self.assertEqual(events, ["request", "throttle"])
+        self.assertEqual(spy.call_count, 1)
+
+    def test_concurrent_identical_reverse_misses_share_one_request(self):
+        payload = {"address": {"city": "Shared"}}
+        client, _ = make_geocoder()
+        client._reverse_lock = EntrySignalingLock(client._reverse_lock)
+        events = record_network_path(client)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_done = threading.Event()
+        call_lock = threading.Lock()
+        calls = []
+        results = []
+        errors = []
+
+        def controlled_urlopen(request, timeout=None):
+            with call_lock:
+                calls.append(request.full_url)
+                call_number = len(calls)
+            if call_number == 1:
+                first_started.set()
+                if not release_first.wait(5):
+                    raise TimeoutError("timed out releasing the first request")
+            return fake_response(payload)
+
+        def run(is_second=False):
+            try:
+                results.append(client.reverse(45, -122))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                if is_second:
+                    second_done.set()
+
+        first_thread = threading.Thread(target=run)
+        second_thread = threading.Thread(target=run, args=(True,))
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", side_effect=controlled_urlopen
+        ):
+            first_thread.start()
+            entered_request = first_started.wait(2)
+            second_thread.start()
+            # Release the leader only once the second lookup is provably
+            # inside reverse() and blocked behind the in-flight miss.
+            second_waiting = client._reverse_lock.second_waiting.wait(5)
+            second_finished_early = second_done.is_set()
+            release_first.set()
+            first_thread.join(5)
+            second_thread.join(5)
+
+        self.assertTrue(entered_request, "first lookup did not reach the request")
+        self.assertTrue(second_waiting, "second lookup never reached the reverse lock")
+        self.assertFalse(second_finished_early, "second lookup bypassed the in-flight miss")
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, ["Shared", "Shared"])
+        self.assertEqual(len(calls), 1)
+        # Only the leader's lookup takes the network path; the waiter does not.
+        self.assertEqual(events, ["request", "throttle"])
+
+    def test_failed_reverse_leader_unblocks_waiter_for_retry_and_later_cache(self):
+        payload = {"address": {"city": "Recovered"}}
+        client, _ = make_geocoder()
+        client._reverse_lock = EntrySignalingLock(client._reverse_lock)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        call_lock = threading.Lock()
+        calls = []
+        first_errors = []
+        second_results = []
+        second_errors = []
+
+        def controlled_urlopen(request, timeout=None):
+            with call_lock:
+                calls.append(request.full_url)
+                call_number = len(calls)
+            if call_number == 1:
+                first_started.set()
+                if not release_first.wait(5):
+                    raise TimeoutError("timed out releasing the failed request")
+                raise OSError("leader failed")
+            return fake_response(payload)
+
+        def fail_first():
+            try:
+                client.reverse(45, -122)
+            except BaseException as error:
+                first_errors.append(error)
+
+        def retry_second():
+            try:
+                second_results.append(client.reverse(45, -122))
+            except BaseException as error:
+                second_errors.append(error)
+
+        first_thread = threading.Thread(target=fail_first)
+        second_thread = threading.Thread(target=retry_second)
+        with mock.patch.object(
+            geocode.urllib.request, "urlopen", side_effect=controlled_urlopen
+        ):
+            first_thread.start()
+            entered_request = first_started.wait(2)
+            second_thread.start()
+            second_waiting = client._reverse_lock.second_waiting.wait(5)
+            release_first.set()
+            first_thread.join(5)
+            second_thread.join(5)
+            cached = client.reverse(45, -122)
+
+        self.assertTrue(entered_request, "failed lookup did not reach the request")
+        self.assertTrue(second_waiting, "second lookup never reached the reverse lock")
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(len(first_errors), 1)
+        self.assertIsInstance(first_errors[0], GeocodeError)
+        self.assertEqual(second_errors, [])
+        self.assertEqual(second_results, ["Recovered"])
+        self.assertEqual(cached, "Recovered")
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

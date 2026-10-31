@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from .models import Sensor, passes_confidence
+from .models import (
+    MAX_OBSERVATION_AGE,
+    Sensor,
+    is_fresh_observation,
+    passes_confidence,
+)
 
 
-MAX_ALERT_OBSERVATION_AGE = 2 * 3600
+MAX_ALERT_OBSERVATION_AGE = MAX_OBSERVATION_AGE
 
 
 def visible_sensors(
@@ -58,8 +63,7 @@ def alert_transitions(
             key not in favorite_keys
             or sensor.origin == "demo"
             or sensor.aqi is None
-            or sensor.last_seen is None
-            or now - sensor.last_seen > MAX_ALERT_OBSERVATION_AGE
+            or not is_fresh_observation(sensor.last_seen, now)
         ):
             continue
 
