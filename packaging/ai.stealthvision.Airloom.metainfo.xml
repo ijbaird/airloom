@@ -15,18 +15,30 @@
   <screenshots>
     <screenshot type="default">
       <caption>Color-coded sensor readings on the map with the area summary and AQI legend</caption>
-      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.13.0/packaging/screenshots/map.png</image>
+      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.14.0/packaging/screenshots/map.png</image>
     </screenshot>
     <screenshot>
       <caption>Sensor details with a rolling-average trend chart and current conditions</caption>
-      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.13.0/packaging/screenshots/sensor-detail.png</image>
+      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.14.0/packaging/screenshots/sensor-detail.png</image>
     </screenshot>
     <screenshot>
       <caption>Preferences for the PurpleAir key, home location, alerts, refresh interval, and interface size</caption>
-      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.13.0/packaging/screenshots/preferences.png</image>
+      <image type="source" width="1280" height="800">https://raw.githubusercontent.com/ijbaird/airloom/v0.14.0/packaging/screenshots/preferences.png</image>
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.14.0" date="2026-10-31">
+      <description>
+        <p>A data-trust, reliability, and accessibility release:</p>
+        <ul>
+          <li>Incomplete PurpleAir responses are rejected whole, invalid or future-dated values are never shown as fresh or Good, and observations more than two hours old never alert.</li>
+          <li>Only degraded readings are labeled, each with its own Demo, Stale, or Old badge on every surface; ordinary cached readings are no longer labeled "Cached".</li>
+          <li>Alerts survive a failed notification without repeating, manual Refresh is never downgraded, key changes stop queued paid requests, and a locked cache no longer freezes the window.</li>
+          <li>Text on AQI colors meets WCAG contrast with every color unchanged, the map pans from the keyboard, trend values are readable by screen readers, and narrow or scaled windows fit long names.</li>
+          <li>Upgrade verification keeps the signing trust existing installs already have.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.13.0" date="2026-10-30">
       <description>
         <p>A correctness, reliability, and accessibility release:</p>
