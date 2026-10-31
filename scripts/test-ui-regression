@@ -1388,6 +1388,52 @@ PREVIEW_ACTIONS_JS = r"""
     .every((control) => control.disabled);
   const note = document.querySelector("#preview-settings-note");
   out.noteVisible = !note.hidden && note.getClientRects().length > 0;
+  out.dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  // Disabled controls must look disabled yet stay legible: compare a disabled
+  // field with an enabled field of the same kind, and measure text contrast
+  // against the first opaque background behind it.
+  const rgba = (value) => {
+    const parts = value.match(/[\d.]+/g).map(Number);
+    return [parts[0], parts[1], parts[2], parts.length > 3 ? parts[3] : 1];
+  };
+  const backdrop = (element) => {
+    const layers = [];
+    for (let node = element; node; node = node.parentElement) {
+      const layer = rgba(getComputedStyle(node).backgroundColor);
+      if (layer[3] > 0) layers.push(layer);
+      if (layer[3] >= 1) break;
+    }
+    let color = out.dark ? [0, 0, 0] : [255, 255, 255];
+    for (const [r, g, b, a] of layers.reverse()) color = [r, g, b].map((channel, i) => channel * a + color[i] * (1 - a));
+    return color;
+  };
+  const luminance = (rgb) => {
+    const [r, g, b] = rgb.map((channel) => {
+      const c = channel / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const contrast = (element) => {
+    const style = getComputedStyle(element);
+    const [r, g, b, a] = rgba(style.webkitTextFillColor || style.color);
+    const back = backdrop(element);
+    const text = [r, g, b].map((channel, i) => channel * a + back[i] * (1 - a));
+    const [light, dark] = [luminance(text), luminance(back)].sort((x, y) => y - x);
+    return Math.round((light + 0.05) / (dark + 0.05) * 100) / 100;
+  };
+  const look = (element) => {
+    const style = getComputedStyle(element);
+    return { color: style.color, background: style.backgroundColor, border: style.borderStyle + " " + style.borderColor,
+             cursor: style.cursor, opacity: style.opacity, contrast: contrast(element) };
+  };
+  const homeLabel = document.querySelector("#home-fieldset label");
+  out.disabledLook = {
+    radius: look(form.elements.radius_km),
+    refresh: look(form.elements.refresh_minutes),
+    homeLabel: look(homeLabel),
+    enabled: look(form.elements.heatmap_threshold_km),
+  };
   form.requestSubmit(document.querySelector("#save-settings"));
   out.settingsOpen = document.querySelector("#settings-dialog").open;
   out.saveStatus = document.querySelector("#ui-status").textContent;
@@ -1435,6 +1481,14 @@ def layout_child(cases: list[dict]) -> int:
 
     # Callers pass one case per process: a second WebView created in the
     # same process was never given a size under a headless compositor.
+    # WebKitGTK derives prefers-color-scheme from GTK, which otherwise follows
+    # the host's portal preference; pin it so "light" cases really are light.
+    dark = any(case.get("theme") == "dark" for case in cases)
+    settings = Gtk.Settings.get_default()
+    if settings.find_property("gtk-interface-color-scheme"):
+        scheme = Gtk.InterfaceColorScheme.DARK if dark else Gtk.InterfaceColorScheme.LIGHT
+        settings.set_property("gtk-interface-color-scheme", scheme)
+    settings.set_property("gtk-application-prefer-dark-theme", dark)
     window = Gtk.Window(title="Airloom layout probe")
     window.set_default_size(1400, 900)
     window.present()
@@ -1509,6 +1563,8 @@ def scenario_layouts(root: Path):
         for width, height in LAYOUT_SIZES
         for scale in SCALES
     ]
+    # One dark-theme preview case covers the color-scheme-dependent checks.
+    cases.append({"mode": "preview", "width": 1280, "height": 800, "scale": 1.0, "theme": "dark"})
     env = {**os.environ, "XDG_CONFIG_HOME": str(root / "layout-config"),
            "XDG_CACHE_HOME": str(root / "layout-cache"), "NO_AT_BRIDGE": "1"}
     rows = []
@@ -1541,7 +1597,8 @@ def scenario_layouts(root: Path):
             problems.append(message)
 
     for row in rows:
-        label = f"{row['mode']} {row['width']}px at {row['scale']}x [{row['state']}]"
+        theme_label = " dark" if row.get("theme") == "dark" else ""
+        label = f"{row['mode']} {row['width']}px at {row['scale']}x{theme_label} [{row['state']}]"
         if row["state"] == "preview-actions":
             actions = row["actions"]
             expect("refreshed locally" in actions["refresh"], f"{label}: preview Refresh works without a bridge")
@@ -1551,6 +1608,20 @@ def scenario_layouts(root: Path):
             expect(actions["unsupportedDisabled"] is True,
                    f"{label}: preview disables radius, refresh, alert, confidence and home settings")
             expect(actions["noteVisible"] is True, f"{label}: preview explains its disabled settings")
+            theme = row.get("theme", "light")
+            expect(actions["dark"] is (theme == "dark"), f"{label}: page renders the {theme} color scheme")
+            look = actions["disabledLook"]
+            enabled = look["enabled"]
+            for name in ("radius", "refresh"):
+                field = look[name]
+                expect((field["color"], field["background"], field["border"]) != (enabled["color"], enabled["background"], enabled["border"]),
+                       f"{label}: disabled {name} looks different from an enabled field ({field} vs {enabled})")
+                expect(field["opacity"] == "1", f"{label}: disabled {name} is not faded by opacity ({field['opacity']})")
+            for name in ("radius", "refresh", "homeLabel"):
+                field = look[name]
+                expect(field["cursor"] == "not-allowed", f"{label}: disabled {name} shows a not-allowed cursor ({field['cursor']})")
+                expect(field["contrast"] >= 4.5, f"{label}: disabled {name} text stays legible in {theme} ({field['contrast']}:1)")
+            expect(enabled["cursor"] != "not-allowed", f"{label}: enabled fields keep their cursor")
             continue
         expected_css = "1" if row["mode"] == "desktop" else ("%g" % row["scale"])
         expect(row["cssScale"] == expected_css and float(row["configuredScale"]) == row["scale"],

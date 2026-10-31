@@ -2058,6 +2058,18 @@ test("preview disables unimplemented settings with a visible explanation", () =>
   assert.equal(desktop.elements.get("preview-settings-note").hidden, true);
 });
 
+test("disabled Preferences controls have a muted, not-allowed style distinct from enabled ones", () => {
+  for (const selector of ['.form-grid input:not([type="checkbox"]):not([type="radio"]):disabled', ".form-grid select:disabled"]) {
+    assert.equal(cssDeclaration(selector, "cursor"), "not-allowed", selector);
+    assert.equal(cssDeclaration(selector, "color"), "var(--muted)", selector);
+    // --muted on --soft (the enabled background) is under 4.5:1 in the light theme.
+    assert.equal(cssDeclaration(selector, "background"), "var(--panel-solid)", selector);
+    assert.equal(cssDeclaration(selector, "opacity"), "1", selector);
+  }
+  assert.equal(cssDeclaration(".form-grid fieldset:disabled label", "cursor"), "not-allowed");
+  assert.equal(cssDeclaration(".form-grid select", "background"), "var(--soft)");
+});
+
 test("preview Save ignores unimplemented settings", () => {
   const app = loadApp({ preview: true });
   app.runTimers();
