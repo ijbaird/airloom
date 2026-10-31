@@ -829,17 +829,23 @@ def scenario_reduced_motion(root: Path, geocoder: GeocoderStub):
         app.stop()
 
 
+# Offline tests swap in fake libX11/libXtst libraries through this seam.
+X11_LIBRARY = ctypes.CDLL
+X11_REQUIREMENT = "keyboard-map needs an X11 display with XTEST (libXtst)"
+
+
 class X11Input:
     """Real pointer and key input through the X server's XTEST extension."""
 
     def __init__(self):
+        self.dpy = None
         if not os.environ.get("DISPLAY"):
-            raise AssertionError("keyboard-map needs an X11 display with XTEST (libXtst)")
+            raise AssertionError(X11_REQUIREMENT)
         try:
-            self.xlib = ctypes.CDLL("libX11.so.6")
-            self.xtst = ctypes.CDLL("libXtst.so.6")
+            self.xlib = X11_LIBRARY("libX11.so.6")
+            self.xtst = X11_LIBRARY("libXtst.so.6")
         except OSError as exc:
-            raise AssertionError(f"keyboard-map needs an X11 display with XTEST (libXtst): {exc}") from exc
+            raise AssertionError(f"{X11_REQUIREMENT}: {exc}") from exc
         self.xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
         self.xlib.XOpenDisplay.restype = ctypes.c_void_p
         self.xlib.XStringToKeysym.argtypes = [ctypes.c_char_p]
@@ -848,12 +854,29 @@ class X11Input:
         self.xlib.XKeysymToKeycode.restype = ctypes.c_ubyte
         self.xlib.XFlush.argtypes = [ctypes.c_void_p]
         self.xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        int_out = ctypes.POINTER(ctypes.c_int)
+        self.xtst.XTestQueryExtension.argtypes = [ctypes.c_void_p, int_out, int_out, int_out, int_out]
+        self.xtst.XTestQueryExtension.restype = ctypes.c_int
         self.xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
         self.xtst.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
         self.xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        for fake in (self.xtst.XTestFakeKeyEvent, self.xtst.XTestFakeMotionEvent, self.xtst.XTestFakeButtonEvent):
+            fake.restype = ctypes.c_int
         self.dpy = self.xlib.XOpenDisplay(None)
         if not self.dpy:
-            raise AssertionError(f"keyboard-map needs an X11 display with XTEST (libXtst): cannot open {os.environ['DISPLAY']}")
+            raise AssertionError(f"{X11_REQUIREMENT}: cannot open {os.environ['DISPLAY']}")
+        # libXtst loading proves nothing about the server; ask it for XTEST.
+        event_base, error_base, major, minor = (ctypes.c_int() for _ in range(4))
+        if not self.xtst.XTestQueryExtension(self.dpy, ctypes.byref(event_base), ctypes.byref(error_base),
+                                             ctypes.byref(major), ctypes.byref(minor)):
+            self.close()
+            raise AssertionError(f"{X11_REQUIREMENT}: the X server on {os.environ['DISPLAY']} lacks the XTEST "
+                                 "extension (Xvfb provides it unless started with -tst or -extension XTEST)")
+
+    @staticmethod
+    def _checked(kind: str, status: int):
+        if not status:
+            raise AssertionError(f"XTEST rejected the fake {kind} event")
 
     def _keycode(self, name: str) -> int:
         keysym = self.xlib.XStringToKeysym(name.encode("ascii"))
@@ -863,27 +886,30 @@ class X11Input:
         return keycode
 
     def _press(self, keycode: int, down: bool):
-        self.xtst.XTestFakeKeyEvent(self.dpy, keycode, 1 if down else 0, 0)
+        self._checked("key", self.xtst.XTestFakeKeyEvent(self.dpy, keycode, 1 if down else 0, 0))
 
     def key(self, name: str, shift: bool = False):
         keycode = self._keycode(name)
         shift_code = self._keycode("Shift_L") if shift else None
         if shift_code:
             self._press(shift_code, True)
-        self._press(keycode, True)
-        self._press(keycode, False)
-        if shift_code:
-            self._press(shift_code, False)
-        self.xlib.XFlush(self.dpy)
+        try:
+            self._press(keycode, True)
+            self._press(keycode, False)
+        finally:
+            # Never leave Shift held down on the server, even after a rejected key.
+            if shift_code:
+                self._press(shift_code, False)
+            self.xlib.XFlush(self.dpy)
 
     def move(self, x: int, y: int):
-        self.xtst.XTestFakeMotionEvent(self.dpy, -1, x, y, 0)
+        self._checked("motion", self.xtst.XTestFakeMotionEvent(self.dpy, -1, x, y, 0))
         self.xlib.XFlush(self.dpy)
 
     def click(self, x: int, y: int):
         self.move(x, y)
-        self.xtst.XTestFakeButtonEvent(self.dpy, 1, 1, 0)
-        self.xtst.XTestFakeButtonEvent(self.dpy, 1, 0, 0)
+        self._checked("button", self.xtst.XTestFakeButtonEvent(self.dpy, 1, 1, 0))
+        self._checked("button", self.xtst.XTestFakeButtonEvent(self.dpy, 1, 0, 0))
         self.xlib.XFlush(self.dpy)
 
     def close(self):

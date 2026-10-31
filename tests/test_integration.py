@@ -113,6 +113,53 @@ server.close()
 '''
 
 
+class FakeX11:
+    """Stands in for libX11 and libXtst behind the script's X11_LIBRARY seam.
+
+    Records the display calls and injected events, and can simulate a server
+    without XTEST, an unopenable display, or a rejected fake event.
+    """
+
+    DISPLAY = 0x5EED
+    KEYCODES = {"Shift_L": 50, "Tab": 23, "x": 53}
+
+    def __init__(self, *, xtest=True, open_display=True, reject=None, reject_keycode=None):
+        self.xtest = xtest
+        self.open_display = open_display
+        self.reject = reject
+        self.reject_keycode = reject_keycode
+        self.events = []
+        self.closed = []
+
+    def load(self, name):
+        fake = self
+
+        class Library:
+            pass
+
+        library = Library()
+        if name == "libX11.so.6":
+            library.XOpenDisplay = lambda _name: fake.DISPLAY if fake.open_display else None
+            library.XCloseDisplay = lambda display: fake.closed.append(display) or 0
+            library.XStringToKeysym = lambda name: 0xFF00 + fake.KEYCODES[name.decode()] if name.decode() in fake.KEYCODES else 0
+            library.XKeysymToKeycode = lambda _display, keysym: keysym - 0xFF00
+            library.XFlush = lambda _display: fake.events.append(("flush",)) or 1
+        elif name == "libXtst.so.6":
+            library.XTestQueryExtension = lambda *_args: 1 if fake.xtest else 0
+            library.XTestFakeKeyEvent = lambda _d, keycode, press, _delay: fake._event(("key", keycode, press))
+            library.XTestFakeMotionEvent = lambda _d, _screen, x, y, _delay: fake._event(("motion", x, y))
+            library.XTestFakeButtonEvent = lambda _d, button, press, _delay: fake._event(("button", button, press))
+        else:
+            raise OSError(f"{name}: not faked")
+        return library
+
+    def _event(self, event):
+        if event[0] == self.reject and self.reject_keycode in (None, event[1]):
+            return 0
+        self.events.append(event)
+        return 1
+
+
 def process_gone(pid: int, timeout: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -144,6 +191,104 @@ class UiRegressionScriptContractTest(unittest.TestCase):
             os.environ.pop("DISPLAY", None)
             with self.assertRaisesRegex(AssertionError, "X11 display with XTEST"):
                 self.script.X11Input()
+
+    def test_keyboard_map_scenario_fails_on_a_display_without_xtest_and_closes_it(self):
+        fake = FakeX11(xtest=False)
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+            with self.assertRaisesRegex(AssertionError, r"XTEST.*Xvfb"):
+                self.script.X11Input()
+        self.assertEqual(fake.closed, [FakeX11.DISPLAY])
+
+    def test_keyboard_map_scenario_fails_when_the_display_cannot_open(self):
+        fake = FakeX11(open_display=False)
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+            with self.assertRaisesRegex(AssertionError, "X11 display with XTEST.*cannot open :99"):
+                self.script.X11Input()
+        self.assertEqual(fake.closed, [])
+
+    def test_keyboard_map_scenario_fails_when_libxtst_is_missing(self):
+        def load(name):
+            raise OSError(f"{name}: cannot open shared object file")
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", load):
+            with self.assertRaisesRegex(AssertionError, "X11 display with XTEST"):
+                self.script.X11Input()
+
+    def test_x11_input_sends_exactly_the_requested_real_events(self):
+        fake = FakeX11()
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+            x11 = self.script.X11Input()
+        x11.key("Tab", shift=True)
+        x11.key("x")
+        x11.click(10, 20)
+        x11.close()
+        x11.close()
+        shift, tab, x = FakeX11.KEYCODES["Shift_L"], FakeX11.KEYCODES["Tab"], FakeX11.KEYCODES["x"]
+        self.assertEqual(fake.events, [
+            ("key", shift, 1), ("key", tab, 1), ("key", tab, 0), ("key", shift, 0), ("flush",),
+            ("key", x, 1), ("key", x, 0), ("flush",),
+            ("motion", 10, 20), ("flush",), ("button", 1, 1), ("button", 1, 0), ("flush",),
+        ])
+        self.assertEqual(fake.closed, [FakeX11.DISPLAY])
+
+    def test_x11_input_raises_when_the_server_rejects_an_injected_event(self):
+        for kind, act in (("key", lambda x11: x11.key("Tab")),
+                          ("motion", lambda x11: x11.move(1, 2)),
+                          ("button", lambda x11: x11.click(1, 2))):
+            with self.subTest(kind=kind):
+                fake = FakeX11(reject=kind)
+                with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                        mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+                    x11 = self.script.X11Input()
+                with self.assertRaisesRegex(AssertionError, f"XTEST rejected the fake {kind} event"):
+                    act(x11)
+                x11.close()
+
+    def test_x11_input_releases_shift_when_a_shifted_key_is_rejected(self):
+        fake = FakeX11(reject="key", reject_keycode=FakeX11.KEYCODES["Tab"])
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+            x11 = self.script.X11Input()
+        with self.assertRaisesRegex(AssertionError, "XTEST rejected the fake key event"):
+            x11.key("Tab", shift=True)
+        x11.close()
+        shift = FakeX11.KEYCODES["Shift_L"]
+        self.assertEqual(fake.events[-2:], [("key", shift, 0), ("flush",)])
+
+    def test_keyboard_map_scenario_closes_the_display_when_it_fails_midway(self):
+        fake = FakeX11()
+        stopped = []
+
+        class StubApp:
+            sock_path = "unused.sock"
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                return self
+
+            def wait_ready(self):
+                pass
+
+            def stop(self):
+                stopped.append(True)
+
+        def page_origin(_sock, _x11):
+            raise AssertionError("pointer never arrived")
+
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load), \
+                mock.patch.object(self.script, "DebugApp", StubApp), \
+                mock.patch.object(self.script, "page_origin", page_origin), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(AssertionError, "pointer never arrived"):
+                self.script.scenario_keyboard_map(self.root, mock.Mock(url="http://127.0.0.1:9"))
+        self.assertEqual(fake.closed, [FakeX11.DISPLAY])
+        self.assertEqual(stopped, [True])
 
     def test_layouts_cover_the_reported_scaled_widths_at_every_scale(self):
         self.assertEqual(self.script.SCALES, (1.0, 1.25, 1.5))
