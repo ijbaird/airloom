@@ -1859,3 +1859,64 @@ test("the largest safe sensor id round-trips Python to JS to Python exactly", ()
   const trend = result.events.find(([event]) => event === "trend")[1];
   assert.equal(trend.sensor_id, SAFE_MAX);
 });
+
+// Shell recovery (W2): restore-view adopts only a canonical viewport. The
+// vm timeout bounds each delivery, so a payload that hangs rendering fails
+// the test instead of stalling the suite.
+function deliverRestoreView(app, payload) {
+  app.context.__restorePayload = payload;
+  vm.runInContext('Airloom.receive("restore-view", __restorePayload)', app.context, { timeout: 2000 });
+}
+
+function mapView(app) {
+  const { center, zoom } = app.context.Airloom.debugState();
+  return { lat: center.lat, lon: center.lon, zoom };
+}
+
+test("restore-view ignores malformed payloads without throwing or navigating", () => {
+  const malformed = [
+    null,
+    "15,-20",
+    [15, -20, 9],
+    42,
+    { lat: Number.NaN, lon: -20, zoom: 9 },
+    { lat: 15, lon: Number.POSITIVE_INFINITY, zoom: 9 },
+    { lat: 0, lon: 1e308, zoom: 9 },
+    { lat: 95, lon: -20, zoom: 9 },
+    { lat: 15, lon: -20, zoom: 2 },
+    { lat: 15, lon: -20, zoom: 18 },
+    { lat: 15, lon: -20, zoom: 9.5 },
+    { lat: 15, lon: -20, zoom: "9" },
+    { lat: null, lon: -20, zoom: 9 },
+    { lat: "15", lon: -20, zoom: 9 },
+    { lat: true, lon: -20, zoom: 9 },
+    { lon: -20, zoom: 9 },
+    { lat: 15, zoom: 9 },
+    { lat: 15, lon: -20 },
+  ];
+  for (const payload of malformed) {
+    const app = loadApp();
+    configureMap(app);
+    const before = mapView(app);
+    assert.doesNotThrow(() => deliverRestoreView(app, payload), `payload ${JSON.stringify(payload)}`);
+    assert.deepEqual(mapView(app), before, `payload ${JSON.stringify(payload)} moved the map`);
+    app.runTimers();
+    assert.deepEqual(app.messages.filter((message) => message.action === "view-changed"), []);
+  }
+});
+
+test("restore-view adopts a valid viewport without echoing view-changed", () => {
+  const app = loadApp();
+  configureMap(app);
+  deliverRestoreView(app, { lat: 15, lon: -20, zoom: 9 });
+  assert.deepEqual(mapView(app), { lat: 15, lon: -20, zoom: 9 });
+
+  deliverRestoreView(app, { lat: 89, lon: 180, zoom: null });
+  const clamped = mapView(app);
+  closeTo(clamped.lat, 85.0511);
+  closeTo(clamped.lon, -180);
+  assert.equal(clamped.zoom, 9);
+
+  app.runTimers();
+  assert.deepEqual(app.messages.filter((message) => message.action === "view-changed"), []);
+});

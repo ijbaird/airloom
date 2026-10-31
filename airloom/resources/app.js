@@ -201,11 +201,16 @@
 
   // Shell recovery: adopt the controller's viewport so the reloaded page and
   // Python target one view before the refresh that follows ready.
+  // Anything but a canonical center and an integer zoom (or null) is ignored
+  // whole, so a malformed payload can never move or hang the map.
   function restoreView(payload) {
-    const lat = Number(payload.lat), lon = Number(payload.lon), zoom = Number(payload.zoom);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-    state.center = { lat, lon };
-    if (payload.zoom !== null && Number.isFinite(zoom)) state.zoom = Math.max(3, Math.min(17, zoom));
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+    const { lat, lon, zoom } = payload;
+    if (typeof lat !== "number" || !(lat >= -90 && lat <= 90)) return;
+    if (typeof lon !== "number" || !(lon >= -180 && lon <= 180)) return;
+    if (zoom !== null && !(Number.isInteger(zoom) && zoom >= 3 && zoom <= 17)) return;
+    state.center = { lat: clampLat(lat), lon: wrapLon(lon) };
+    if (zoom !== null) state.zoom = zoom;
     state.positioned = true;
     renderMap();
   }
