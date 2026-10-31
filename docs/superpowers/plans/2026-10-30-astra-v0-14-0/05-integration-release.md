@@ -54,7 +54,7 @@
   - workspace owned by uid 1001;
   - one `docker exec` per step.
   Expect all three scripts to PASS with no skips.
-- [ ] **Step 3:** If W4's verifier changed after its pre-tag replay was recorded, re-run W4's production-mode replay and negative replay. Expect PASS and FAIL respectively.
+- [ ] **Step 3:** Re-run W4's production-mode replay and negative replay (04-release.md Task 7) against the integrated HEAD, unconditionally. Expect PASS and FAIL respectively. (Pre-flight ruling: the integrated code is what ships.)
 - [ ] **Step 4:** Record the results in the integration ledger.
 
 ### Task 3: Astra re-verification
