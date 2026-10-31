@@ -501,6 +501,40 @@ class PreferenceTransactionTest(unittest.TestCase):
                 self.assertEqual(h.config, before)
                 self.assertEqual(h.saves, [])
 
+    def test_malformed_home_fields_are_rejected_in_auto_mode_too(self):
+        cases = (
+            ("location_name", {"x": 1}), ("location_name", 7), ("home_lat", "NaN"),
+            ("home_lat", True), ("home_lon", "inf"), ("home_lon", []),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                h = Harness(home_mode="auto")
+                before = deepcopy(h.config)
+                result = h.controller.save_settings(
+                    {**self.SETTINGS, "home_mode": "auto", field: value}
+                )
+                self.assertEqual(result.status, "invalid")
+                self.assertIn(field, result.error)
+                self.assertEqual(h.config, before)
+                self.assertEqual(h.saves, [])
+
+    def test_auto_mode_saves_with_well_formed_or_absent_home_fields(self):
+        payloads = (
+            {**self.SETTINGS, "home_mode": "auto", "home_lat": "10.5", "home_lon": "-20.25",
+             "location_name": "Somewhere"},
+            {key: value for key, value in self.SETTINGS.items()
+             if key not in ("home_lat", "home_lon", "location_name")} | {"home_mode": "auto"},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                h = Harness(home_mode="auto")
+                before = {k: h.config[k] for k in ("latitude", "longitude", "location_name")}
+                result = h.controller.save_settings(payload)
+                self.assertEqual(result.status, "success")
+                self.assertEqual(
+                    {k: h.config[k] for k in ("latitude", "longitude", "location_name")}, before
+                )
+
     def test_form_numeric_strings_still_save(self):
         h = Harness(home_mode="auto")
         result = h.controller.save_settings({

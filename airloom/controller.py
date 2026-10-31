@@ -840,15 +840,19 @@ class ApplicationController:
             updates["interface_scale"] = float(scale)
         minutes = _whole_number(message["refresh_minutes"], "refresh_minutes")
         updates["refresh_minutes"] = minutes if minutes in REFRESH_MINUTES else 2
+        # The form sends its home fields in every mode, so validate whatever
+        # arrives; only fixed mode requires and applies them.
+        coordinates = {}
+        for field, limit in (("home_lat", 90), ("home_lon", 180)):
+            if home_mode == "fixed" or field in message:
+                coordinates[field] = _finite_number(message[field], field)
+                if not -limit <= coordinates[field] <= limit:
+                    raise ValueError("Coordinates are outside their valid range.")
+        name = message.get("location_name")
+        if name is not None and not isinstance(name, str):
+            raise ValueError("location_name must be text or null.")
         if home_mode == "fixed":
-            latitude = _finite_number(message["home_lat"], "home_lat")
-            longitude = _finite_number(message["home_lon"], "home_lon")
-            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-                raise ValueError("Coordinates are outside their valid range.")
-            name = message.get("location_name")
-            if name is not None and not isinstance(name, str):
-                raise ValueError("location_name must be text or null.")
-            updates["latitude"] = latitude
-            updates["longitude"] = longitude
+            updates["latitude"] = coordinates["home_lat"]
+            updates["longitude"] = coordinates["home_lon"]
             updates["location_name"] = (name or "Custom location")[:80]
         return updates

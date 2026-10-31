@@ -1044,31 +1044,35 @@ class TransactionalActionTest(ApplicationRequestTestCase):
         )
 
     def test_malformed_settings_payload_gets_matching_error_result(self):
-        app = self.make_app()
-        message = {
-            **self.settings_message(), "radius_km": "NaN", "confidence_filter": "false",
-        }
+        malformed = (
+            {"radius_km": "NaN", "confidence_filter": "false"},
+            {"home_mode": "auto", "location_name": {"x": 1}},
+        )
+        for changes in malformed:
+            with self.subTest(changes=changes):
+                app = self.make_app()
+                message = {**self.settings_message(), **changes}
 
-        app._on_script_message(
-            None, ScriptMessage({"action": "save-settings", **message})
-        )
+                app._on_script_message(
+                    None, ScriptMessage({"action": "save-settings", **message})
+                )
 
-        results = [
-            payload
-            for event, payload in app.sent
-            if event == "settings-save-result"
-        ]
-        self.assertEqual(
-            results,
-            [{"request_id": "settings-17", "status": "error", "error": mock.ANY}],
-        )
-        self.assertEqual(app.store.saves, 0)
-        self.assertEqual(
-            [payload for event, payload in app.sent if event == "config"], []
-        )
-        self.assertEqual(
-            [payload for event, payload in app.sent if event == "error"], []
-        )
+                results = [
+                    payload
+                    for event, payload in app.sent
+                    if event == "settings-save-result"
+                ]
+                self.assertEqual(
+                    results,
+                    [{"request_id": "settings-17", "status": "error", "error": mock.ANY}],
+                )
+                self.assertEqual(app.store.saves, 0)
+                self.assertEqual(
+                    [payload for event, payload in app.sent if event == "config"], []
+                )
+                self.assertEqual(
+                    [payload for event, payload in app.sent if event == "error"], []
+                )
 
     def test_unhide_permission_and_space_failures_are_actionable_and_unchanged(self):
         failures = (
