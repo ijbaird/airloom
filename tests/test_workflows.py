@@ -189,6 +189,7 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("webkitgtk6.0", ui_job)
         self.assertIn("gobject-introspection", ui_job)
         self.assertIn("xorg-x11-server-Xvfb", ui_job)
+        self.assertIn("libXtst", ui_job)
         self.assertIn("xvfb-run", ui_job)
         self.assertIn("scripts/test-heatmap", ui_job)
         self.assertIn("scripts/test-save-refresh", ui_job)

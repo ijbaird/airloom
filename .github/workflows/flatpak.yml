@@ -57,7 +57,7 @@ jobs:
       # git-core must precede checkout: without git, actions/checkout falls
       # back to a REST tarball with no .git to verify.
       - name: Install headless WebKit dependencies
-        run: dnf install -y git-core python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon util-linux shadow-utils
+        run: dnf install -y git-core python3-gobject gobject-introspection gtk4 libadwaita webkitgtk6.0 libnotify xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon util-linux shadow-utils libXtst
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
