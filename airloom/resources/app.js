@@ -524,7 +524,8 @@
     $("#sensor-name").textContent = sensor.name;
     $("#detail-indoor").hidden = !sensor.indoor;
     $("#aqi-number").textContent = sensor.aqi ?? "—";
-    $("#aqi-number").style.color = sensor.color;
+    $("#aqi-number").style.background = sensor.color || AirloomCore.UNAVAILABLE.color;
+    $("#aqi-number").style.color = sensor.foreground || AirloomCore.UNAVAILABLE.foreground;
     $("#aqi-category").textContent = sensor.category;
     $("#temperature").textContent = formatTemperature(sensor.temperature_f) || "—";
     $("#humidity").textContent = formatHumidity(sensor.humidity) || "—";

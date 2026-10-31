@@ -53,11 +53,11 @@
     { pm_low: 0.0, pm_high: 9.0, aqi_low: 0, aqi_high: 50, label: "Good", color: "#35b779", foreground: "#08271b", guidance: "Air quality is satisfactory. It is a good time to be outside." },
     { pm_low: 9.1, pm_high: 35.4, aqi_low: 51, aqi_high: 100, label: "Moderate", color: "#f6c945", foreground: "#332400", guidance: "Unusually sensitive people may want to reduce prolonged outdoor exertion." },
     { pm_low: 35.5, pm_high: 55.4, aqi_low: 101, aqi_high: 150, label: "Unhealthy for sensitive groups", color: "#f39c3d", foreground: "#341900", guidance: "Sensitive groups should reduce prolonged or heavy outdoor exertion." },
-    { pm_low: 55.5, pm_high: 125.4, aqi_low: 151, aqi_high: 200, label: "Unhealthy", color: "#e65b65", foreground: "#ffffff", guidance: "Everyone should reduce prolonged exertion; sensitive groups should avoid it." },
-    { pm_low: 125.5, pm_high: 225.4, aqi_low: 201, aqi_high: 300, label: "Very unhealthy", color: "#9b6bc3", foreground: "#ffffff", guidance: "Avoid prolonged outdoor exertion. Sensitive groups should remain indoors." },
+    { pm_low: 55.5, pm_high: 125.4, aqi_low: 151, aqi_high: 200, label: "Unhealthy", color: "#e65b65", foreground: "#2a0509", guidance: "Everyone should reduce prolonged exertion; sensitive groups should avoid it." },
+    { pm_low: 125.5, pm_high: 225.4, aqi_low: 201, aqi_high: 300, label: "Very unhealthy", color: "#9b6bc3", foreground: "#12061c", guidance: "Avoid prolonged outdoor exertion. Sensitive groups should remain indoors." },
     { pm_low: 225.5, pm_high: 325.4, aqi_low: 301, aqi_high: 500, label: "Hazardous", color: "#7e394d", foreground: "#ffffff", guidance: "Avoid outdoor activity and keep indoor air as clean as possible." },
   ];
-  const UNAVAILABLE = { pm_low: 0, pm_high: 0, aqi_low: 0, aqi_high: 0, label: "Unavailable", color: "#7d8590", foreground: "#ffffff", guidance: "No recent sensor reading is available." };
+  const UNAVAILABLE = { pm_low: 0, pm_high: 0, aqi_low: 0, aqi_high: 0, label: "Unavailable", color: "#7d8590", foreground: "#0b0e11", guidance: "No recent sensor reading is available." };
 
   function bandForAQI(aqi) {
     if (!Number.isFinite(aqi)) return UNAVAILABLE;
@@ -81,5 +81,5 @@
     }).sort((a, b) => a.aqi - b.aqi);
   }
 
-  return { splitBounds, boundsContain, nearestLongitude, bandForAQI, summarySensors };
+  return { splitBounds, boundsContain, nearestLongitude, bandForAQI, summarySensors, BANDS, UNAVAILABLE };
 });

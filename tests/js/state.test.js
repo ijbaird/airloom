@@ -878,6 +878,22 @@ test("status and error feedback expose live regions", () => {
   assert.equal(errors.getAttribute("aria-live"), "assertive");
 });
 
+test("detail AQI sits on a band-colored badge with the band foreground", () => {
+  const app = loadApp();
+  configureMap(app);
+  const band = app.context.AirloomCore.bandForAQI(250);
+  receiveSensors(app, [fixtureSensor(1, { aqi: 250, color: band.color, foreground: band.foreground })]);
+  const number = app.elements.get("aqi-number");
+  assert.equal(number.style.background, "#9b6bc3");
+  assert.equal(number.style.color, "#12061c");
+
+  const unavailable = app.context.AirloomCore.bandForAQI(null);
+  receiveSensors(app, [fixtureSensor(1, { aqi: null, color: unavailable.color, foreground: unavailable.foreground })]);
+  assert.equal(number.style.background, "#7d8590");
+  assert.equal(number.style.color, "#0b0e11");
+  assert.notEqual(cssDeclaration(".aqi-number", "border-radius"), null);
+});
+
 test("favorite controls expose synchronized pressed state", () => {
   const app = loadApp();
   configureMap(app);

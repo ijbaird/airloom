@@ -98,7 +98,7 @@ test("bandForAQI keeps unavailable and above-scale behavior compatible", () => {
     const band = AirloomCore.bandForAQI(aqi);
     assert.equal(band.label, "Unavailable");
     assert.equal(band.color, "#7d8590");
-    assert.equal(band.foreground, "#ffffff");
+    assert.equal(band.foreground, "#0b0e11");
   }
   assert.equal(AirloomCore.bandForAQI(501).label, "Hazardous");
 });
@@ -795,4 +795,69 @@ test("the direct-file legend renders all six exact AQI ranges", () => {
     ["#9b6bc3", "Very unhealthy", "201–300"],
     ["#7e394d", "Hazardous", "301–500"],
   ]);
+});
+
+test("band tables match Python exactly", () => {
+  const script = "import dataclasses, json; from airloom.aqi import BANDS, band_for_aqi; "
+    + "print(json.dumps([dataclasses.asdict(b) for b in BANDS] + [dataclasses.asdict(band_for_aqi(None))]))";
+  const output = require("node:child_process").execFileSync(
+    "python3",
+    ["-c", script],
+    { cwd: path.resolve(__dirname, "../.."), encoding: "utf8" },
+  );
+  assert.deepEqual(JSON.parse(output), [...AirloomCore.BANDS, AirloomCore.UNAVAILABLE]);
+});
+
+function contrastRatio(hexA, hexB) {
+  const luminance = (hex) => {
+    const [r, g, b] = [1, 3, 5].map((index) => {
+      const channel = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
+      return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const [lighter, darker] = [luminance(hexA), luminance(hexB)].sort((a, b) => b - a);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+test("every band foreground passes WCAG contrast in both themes", () => {
+  for (const band of [...AirloomCore.BANDS, AirloomCore.UNAVAILABLE]) {
+    const ratio = contrastRatio(band.color, band.foreground);
+    assert.ok(ratio >= 4.5, `${band.label}: ${ratio.toFixed(2)} >= 4.5`);
+  }
+
+  const css = fs.readFileSync(path.resolve(__dirname, "../../airloom/resources/app.css"), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  const [base, dark] = css.split("@media (prefers-color-scheme: dark) {");
+  assert.ok(dark, "app.css must have a dark color-scheme block");
+  const rules = (source) => [...source.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((match) => ({
+    selectors: match[1].split(",").map((value) => value.trim()),
+    body: match[2],
+  }));
+  const declaration = (body, property) => body
+    .match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+)`))?.[1].trim();
+  const rootProperties = (source) => {
+    const root = rules(source).find((rule) => rule.selectors.includes(":root"));
+    assert.ok(root, "theme must declare :root custom properties");
+    return Object.fromEntries([...root.body.matchAll(/(--[\w-]+)\s*:\s*([^;]+)/g)].map((match) => [match[1], match[2].trim()]));
+  };
+  for (const [theme, source] of [["light", base], ["dark", dark]]) {
+    const properties = rootProperties(source);
+    for (const [background, foreground] of [["--accent", "--on-accent"], ["--soft", "--ink"]]) {
+      assert.ok(properties[foreground], `${theme} ${foreground} is defined`);
+      const ratio = contrastRatio(properties[background], properties[foreground]);
+      assert.ok(ratio >= 4.5, `${theme} ${background}/${foreground}: ${ratio.toFixed(2)} >= 4.5`);
+    }
+  }
+
+  for (const selector of [".dialog-actions .primary", ".shell-status button"]) {
+    const rule = rules(base).find((candidate) => candidate.selectors.includes(selector) && declaration(candidate.body, "color"));
+    assert.equal(rule && declaration(rule.body, "color"), "var(--on-accent)", selector);
+  }
+
+  for (const selector of [".aqi-number", ".sensor-badge", ".map-marker", ".popup-aqi", ".summary-chip .summary-score"]) {
+    for (const rule of rules(dark).filter((candidate) => candidate.selectors.includes(selector))) {
+      assert.equal(declaration(rule.body, "color"), undefined, `dark ${selector} must keep the band foreground`);
+    }
+  }
 });

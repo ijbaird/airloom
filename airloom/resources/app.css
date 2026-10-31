@@ -8,6 +8,7 @@
   --line: rgba(29, 44, 36, .11);
   --soft: #eef0ea;
   --accent: #16805c;
+  --on-accent: #ffffff;
   --accent-soft: #dcefe5;
   --shadow: 0 18px 50px rgba(29, 42, 35, .14);
   --interface-scale: 1;
@@ -144,7 +145,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sensor-name { margin: calc(14px * var(--interface-scale)) 0 calc(8px * var(--interface-scale)); color: var(--muted); font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .indoor-tag { margin-left: calc(7px * var(--interface-scale)); padding: calc(2px * var(--interface-scale)) calc(7px * var(--interface-scale)); border-radius: 99px; background: var(--soft); color: var(--muted); font-size: calc(9px * var(--interface-scale)); font-weight: 800; letter-spacing: .06em; text-transform: uppercase; vertical-align: calc(2px * var(--interface-scale)); }
 .aqi-row { display: flex; align-items: center; gap: calc(15px * var(--interface-scale)); margin-bottom: calc(16px * var(--interface-scale)); }
-.aqi-number { font-size: calc(70px * var(--interface-scale)); font-weight: 780; letter-spacing: -.075em; line-height: .95; font-variant-numeric: tabular-nums; }
+.aqi-number { display: inline-grid; place-items: center; flex: none; max-width: 100%; min-width: calc(84px * var(--interface-scale)); padding: calc(6px * var(--interface-scale)) calc(14px * var(--interface-scale)); border-radius: calc(16px * var(--interface-scale)); background: var(--soft); color: var(--ink); font-size: calc(70px * var(--interface-scale)); font-weight: 780; letter-spacing: -.075em; line-height: .95; font-variant-numeric: tabular-nums; }
 .aqi-row > div { display: flex; flex-direction: column; gap: calc(4px * var(--interface-scale)); }
 .aqi-unit { color: var(--muted); font-size: calc(10px * var(--interface-scale)); font-weight: 800; letter-spacing: .11em; }
 #aqi-category { max-width: calc(158px * var(--interface-scale)); line-height: 1.2; font-size: calc(15px * var(--interface-scale)); }
@@ -185,7 +186,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .shell-status { position: fixed; z-index: 110; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; align-items: center; gap: calc(12px * var(--interface-scale)); width: max-content; max-width: calc(100vw - 32px); padding: calc(16px * var(--interface-scale)); border-radius: calc(12px * var(--interface-scale)); background: var(--panel-solid); color: var(--ink); box-shadow: var(--shadow); }
 .shell-status[hidden], .shell-status button[hidden], .settings-error[hidden] { display: none; }
 .shell-status span { min-width: 0; overflow-wrap: anywhere; }
-.shell-status button { flex: none; padding: calc(8px * var(--interface-scale)) calc(14px * var(--interface-scale)); border: 0; border-radius: calc(8px * var(--interface-scale)); background: var(--accent); color: white; cursor: pointer; font: inherit; font-weight: 700; }
+.shell-status button { flex: none; padding: calc(8px * var(--interface-scale)) calc(14px * var(--interface-scale)); border: 0; border-radius: calc(8px * var(--interface-scale)); background: var(--accent); color: var(--on-accent); cursor: pointer; font: inherit; font-weight: 700; }
 .settings-error { margin: calc(12px * var(--interface-scale)) 0 0; color: #b3261e; font-weight: 600; }
 
 .settings-dialog { width: min(calc(520px * var(--interface-scale)), calc(100vw - 32px * var(--interface-scale))); max-height: calc(100vh - 42px * var(--interface-scale)); padding: 0; border: 1px solid var(--line); border-radius: calc(18px * var(--interface-scale)); background: var(--panel-solid); color: var(--ink); box-shadow: 0 24px 80px rgba(19,31,24,.26); }
@@ -208,7 +209,7 @@ fieldset label { display: flex; align-items: center; gap: calc(5px * var(--inter
 .dialog-actions { margin-top: calc(18px * var(--interface-scale)); display: flex; justify-content: flex-end; gap: calc(8px * var(--interface-scale)); }
 .dialog-actions button { height: calc(38px * var(--interface-scale)); padding: 0 calc(16px * var(--interface-scale)); border-radius: calc(9px * var(--interface-scale)); border: 0; cursor: pointer; font-weight: 700; font-size: calc(12px * var(--interface-scale)); }
 .dialog-actions .secondary { background: var(--soft); color: var(--ink); }
-.dialog-actions .primary { background: var(--accent); color: white; }
+.dialog-actions .primary { background: var(--accent); color: var(--on-accent); }
 
 /* Effective reduced motion (GTK setting bridged by the shell, or the media query). */
 .reduce-motion *, .reduce-motion *::before, .reduce-motion *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
@@ -221,7 +222,7 @@ fieldset label { display: flex; align-items: center; gap: calc(5px * var(--inter
 }
 
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #171b19; --panel: rgba(28,33,30,.96); --panel-solid: #222824; --ink: #f0f3f0; --muted: #a4ada7; --line: rgba(232,244,236,.1); --soft: #2a312d; --accent: #54c492; --accent-soft: #213c30; --shadow: 0 20px 60px rgba(0,0,0,.42); }
+  :root { --bg: #171b19; --panel: rgba(28,33,30,.96); --panel-solid: #222824; --ink: #f0f3f0; --muted: #a4ada7; --line: rgba(232,244,236,.1); --soft: #2a312d; --accent: #54c492; --on-accent: #0b2a1d; --accent-soft: #213c30; --shadow: 0 20px 60px rgba(0,0,0,.42); }
   .tile { filter: brightness(.85) contrast(1.05); }
   .search-results button:hover, .search-results button:focus-visible { background: rgba(255,255,255,.08); }
   .summary-chip .summary-score { background: var(--soft); }

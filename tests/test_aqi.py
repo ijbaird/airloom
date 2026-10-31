@@ -1,7 +1,19 @@
 import unittest
 
 from airloom import aqi
-from airloom.aqi import aqi_from_pm25, band_for_aqi, epa_corrected_pm25, truncate_pm25
+from airloom.aqi import BANDS, aqi_from_pm25, band_for_aqi, epa_corrected_pm25, truncate_pm25
+from airloom.models import Sensor
+
+
+def _contrast(a, b):
+    """WCAG 2.x contrast ratio between two #rrggbb colors."""
+    def luminance(color):
+        channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        r, g, b = (c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    lighter, darker = sorted((luminance(a), luminance(b)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
 
 
 class AQITest(unittest.TestCase):
@@ -163,6 +175,28 @@ class AQITest(unittest.TestCase):
     def test_truncate_avoids_decimal_domain_errors_for_huge_finite_values(self):
         self.assertEqual(truncate_pm25(1e30), 1e30)
         self.assertEqual(truncate_pm25(1e308), 1e308)
+
+
+class BandContrastTest(unittest.TestCase):
+    def test_band_colors_are_unchanged(self):
+        self.assertEqual(
+            [band.color for band in BANDS],
+            ["#35b779", "#f6c945", "#f39c3d", "#e65b65", "#9b6bc3", "#7e394d"],
+        )
+        self.assertEqual(band_for_aqi(None).color, "#7d8590")
+
+    def test_band_foregrounds_meet_normal_text_contrast(self):
+        bands = [*BANDS, band_for_aqi(None)]
+        self.assertEqual(
+            [band.foreground for band in bands],
+            ["#08271b", "#332400", "#341900", "#2a0509", "#12061c", "#ffffff", "#0b0e11"],
+        )
+        for band in bands:
+            with self.subTest(band=band.label):
+                self.assertGreaterEqual(_contrast(band.color, band.foreground), 4.5)
+
+    def test_sensor_payload_uses_band_foreground(self):
+        self.assertEqual(Sensor(1, "x", 0, 0, 180, 70.0).to_dict()["foreground"], "#2a0509")
 
 
 if __name__ == "__main__":
