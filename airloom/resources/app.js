@@ -201,16 +201,17 @@
 
   // Shell recovery: adopt the controller's viewport so the reloaded page and
   // Python target one view before the refresh that follows ready.
-  // Anything but a canonical center and an integer zoom (or null) is ignored
-  // whole, so a malformed payload can never move or hang the map.
+  // Anything but a canonical center and a zoom in [3, 17] (or null) is ignored
+  // whole, so a malformed payload can never move or hang the map. A fractional
+  // zoom settles on the nearest whole level, as gestures do.
   function restoreView(payload) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
     const { lat, lon, zoom } = payload;
     if (typeof lat !== "number" || !(lat >= -90 && lat <= 90)) return;
     if (typeof lon !== "number" || !(lon >= -180 && lon <= 180)) return;
-    if (zoom !== null && !(Number.isInteger(zoom) && zoom >= 3 && zoom <= 17)) return;
+    if (zoom !== null && (typeof zoom !== "number" || !(zoom >= 3 && zoom <= 17))) return;
     state.center = { lat: clampLat(lat), lon: wrapLon(lon) };
-    if (zoom !== null) state.zoom = zoom;
+    if (zoom !== null) state.zoom = Math.round(zoom);
     state.positioned = true;
     renderMap();
   }

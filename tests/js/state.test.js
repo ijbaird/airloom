@@ -1885,7 +1885,8 @@ test("restore-view ignores malformed payloads without throwing or navigating", (
     { lat: 95, lon: -20, zoom: 9 },
     { lat: 15, lon: -20, zoom: 2 },
     { lat: 15, lon: -20, zoom: 18 },
-    { lat: 15, lon: -20, zoom: 9.5 },
+    { lat: 15, lon: -20, zoom: 2.9 },
+    { lat: 15, lon: -20, zoom: 17.2 },
     { lat: 15, lon: -20, zoom: "9" },
     { lat: null, lon: -20, zoom: 9 },
     { lat: "15", lon: -20, zoom: 9 },
@@ -1919,4 +1920,13 @@ test("restore-view adopts a valid viewport without echoing view-changed", () => 
 
   app.runTimers();
   assert.deepEqual(app.messages.filter((message) => message.action === "view-changed"), []);
+});
+
+test("restore-view rounds a fractional zoom to the nearest whole level", () => {
+  const app = loadApp();
+  configureMap(app);
+  deliverRestoreView(app, { lat: 15, lon: -20, zoom: 12.4 });
+  assert.deepEqual(mapView(app), { lat: 15, lon: -20, zoom: 12 });
+  deliverRestoreView(app, { lat: 16, lon: -21, zoom: 12.6 });
+  assert.deepEqual(mapView(app), { lat: 16, lon: -21, zoom: 13 });
 });
