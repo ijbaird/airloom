@@ -328,8 +328,8 @@ class FutureTimestampTest(unittest.TestCase):
         self.assertEqual(stamps, [None, None, NOW + 600])
 
     def test_fetch_sensors_uses_the_injected_clock(self):
-        # NOW is ahead of the real clock, so NOW + 600 survives only if the
-        # client's clock, not time.time(), decides what is in the future.
+        # The wall clock is pinned a day behind NOW, so NOW + 600 survives only
+        # if the client's clock, not time.time(), decides what is in the future.
         payload = {
             "fields": list(purpleair.MAP_FIELDS),
             "data": [map_row(1, last_seen=NOW + 600), map_row(2, last_seen=NOW + 601)],
@@ -337,7 +337,8 @@ class FutureTimestampTest(unittest.TestCase):
         with mock.patch("airloom.purpleair.urlopen", return_value=mock.MagicMock(
             __enter__=lambda s: io.StringIO(json.dumps(payload)),
             __exit__=lambda s, *a: False,
-        )):
+        )), mock.patch("airloom.purpleair.time") as wall_clock:
+            wall_clock.time.return_value = NOW - 86400
             sensors = PurpleAirClient("key", clock=lambda: NOW).fetch_sensors(bounds=self.BOUNDS)
         self.assertEqual([s.last_seen for s in sensors], [NOW + 600, None])
 
