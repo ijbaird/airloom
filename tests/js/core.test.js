@@ -822,20 +822,30 @@ test("isFreshObservation mirrors the shared Python boundary vectors", () => {
     assert.equal(AirloomCore.isFreshObservation(lastSeen, now), false, `${String(lastSeen)} is not fresh`);
   }
 
-  const ages = [0, 7200, 7201, null];
+  // The Old badge and alert eligibility share models.is_fresh_observation;
+  // compare both against the JS rule on W1's full boundary set.
+  const ages = [0, 7200, -600, 7201, -601, null];
   const script = "import json; from airloom import models, presentation; "
     + `now = ${now}; `
     + `ages = json.loads(${JSON.stringify(JSON.stringify(ages))}); `
-    + "eligible = [bool(presentation.alert_transitions([models.Sensor(1, 'x', 0, 0, 150, 60.0, last_seen=None if age is None else now - age)], "
-    + "favorites={1}, previous={}, threshold=101, now=now, origin='live')[0]) for age in ages]; "
-    + "print(json.dumps({'eligible': eligible, 'max_age': presentation.MAX_ALERT_OBSERVATION_AGE}))";
+    + "last_seen = [None if age is None else now - age for age in ages]; "
+    + "fresh = [models.is_fresh_observation(value, now) for value in last_seen]; "
+    + "eligible = [bool(presentation.alert_transitions([models.Sensor(1, 'x', 0, 0, 150, 60.0, last_seen=value)], "
+    + "favorites={1}, previous={}, threshold=101, now=now, origin='live')[0]) for value in last_seen]; "
+    + "print(json.dumps({'fresh': fresh, 'eligible': eligible, 'max_age': models.MAX_OBSERVATION_AGE, "
+    + "'skew': models.FUTURE_SKEW_TOLERANCE, 'alert_max_age': presentation.MAX_ALERT_OBSERVATION_AGE}))";
   const output = JSON.parse(require("node:child_process").execFileSync(
     "python3",
     ["-c", script],
     { cwd: path.resolve(__dirname, "../.."), encoding: "utf8" },
   ));
-  assert.equal(output.max_age, 7200);
-  assert.deepEqual(output.eligible, ages.map((age) => AirloomCore.isFreshObservation(age === null ? null : now - age, now)));
+  assert.equal(output.max_age, AirloomCore.MAX_OBSERVATION_AGE);
+  assert.equal(output.skew, AirloomCore.FUTURE_SKEW_TOLERANCE);
+  assert.equal(output.alert_max_age, 7200);
+  const js = ages.map((age) => AirloomCore.isFreshObservation(age === null ? null : now - age, now));
+  assert.deepEqual(js, [true, true, true, false, false, false]);
+  assert.deepEqual(output.fresh, js);
+  assert.deepEqual(output.eligible, js);
 });
 
 test("readingProvenance uses Demo > Stale > Old precedence", () => {
