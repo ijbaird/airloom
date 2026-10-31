@@ -2183,6 +2183,16 @@ test("disabled Preferences controls have a muted, not-allowed style distinct fro
   assert.equal(cssDeclaration(".form-grid select", "background"), "var(--soft)");
 });
 
+test("fixed-home search input shares the form input styling", () => {
+  for (const p of ["width", "height", "padding", "border", "border-radius", "background", "color"]) {
+    assert.equal(
+      cssDeclaration('.form-grid input[type="search"]', p),
+      cssDeclaration('.form-grid input[type="text"]', p),
+    );
+    assert.notEqual(cssDeclaration('.form-grid input[type="search"]', p), null, p);
+  }
+});
+
 test("preview Save ignores unimplemented settings", () => {
   const app = loadApp({ preview: true });
   app.runTimers();
