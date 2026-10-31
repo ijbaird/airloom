@@ -407,13 +407,17 @@ class SensorCache:
 
     def store_trend(self, sensor_id: int, trend: list) -> None:
         with self._lock:
-            self._db.execute(
-                "INSERT INTO trends (sensor_index, data, fetched_at) VALUES (?, ?, ?)"
-                " ON CONFLICT(sensor_index) DO UPDATE SET data = excluded.data,"
-                " fetched_at = excluded.fetched_at",
-                (int(sensor_id), json.dumps(trend), self.clock()),
-            )
-            self._db.commit()
+            try:
+                self._db.execute(
+                    "INSERT INTO trends (sensor_index, data, fetched_at) VALUES (?, ?, ?)"
+                    " ON CONFLICT(sensor_index) DO UPDATE SET data = excluded.data,"
+                    " fetched_at = excluded.fetched_at",
+                    (int(sensor_id), json.dumps(trend), self.clock()),
+                )
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def get_trend(self, sensor_id: int, max_age: float) -> list | None:
         with self._lock:
@@ -426,10 +430,14 @@ class SensorCache:
 
     def clear(self) -> None:
         with self._lock:
-            self._db.execute("DELETE FROM sensors")
-            self._db.execute("DELETE FROM regions")
-            self._db.execute("DELETE FROM trends")
-            self._db.commit()
+            try:
+                self._db.execute("DELETE FROM sensors")
+                self._db.execute("DELETE FROM regions")
+                self._db.execute("DELETE FROM trends")
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
 
 @dataclass(frozen=True, slots=True)

@@ -391,6 +391,57 @@ class TrendTest(CacheBase):
         self.assertIsNone(self.cache.get_trend(8, max_age=120))
 
 
+class TransactionRollbackTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "cache.db"
+        self.cache = cache.SensorCache(self.path, clock=FakeClock(), busy_timeout=0.01)
+        self.addCleanup(self.cache.close)
+
+    def _hold_read_lock(self):
+        """Keep a SHARED lock open so the cache's COMMIT fails with "locked"."""
+        reader = sqlite3.connect(self.path, isolation_level=None)
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM trends").fetchone()
+        return reader
+
+    def test_failed_trend_commit_releases_transaction_and_locks(self):
+        reader = self._hold_read_lock()
+        with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+            self.cache.store_trend(1, [{"label": "Now", "aqi": 5}])
+        self.assertFalse(self.cache._db.in_transaction)
+        self.assertIsNone(self.cache.get_trend(1, max_age=3600))
+        reader.execute("COMMIT")
+        writer = sqlite3.connect(self.path, timeout=0.01)
+        self.addCleanup(writer.close)
+        writer.execute("INSERT INTO trends VALUES (2, '[]', 1000.0)")  # no lock retained
+        writer.commit()
+        self.cache.store_trend(1, [{"label": "Now", "aqi": 5}])  # retry succeeds
+        self.assertEqual(self.cache.get_trend(1, max_age=3600), [{"label": "Now", "aqi": 5}])
+
+    def test_failed_clear_keeps_data_and_is_not_committed_later(self):
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        self.cache.store_fetch(bounds, "outdoor", [row(1)], 1754680000)
+        self.cache.store_trend(1, [{"label": "Now", "aqi": 5}])
+        reader = self._hold_read_lock()
+        with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+            self.cache.clear()
+        self.assertFalse(self.cache._db.in_transaction)
+        reader.execute("COMMIT")
+        self.cache.store_trend(2, [])  # an unrelated commit must not carry the clear
+        observer = sqlite3.connect(self.path)
+        try:
+            counts = tuple(
+                observer.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("sensors", "regions", "trends")
+            )
+        finally:
+            observer.close()
+        self.assertEqual(counts, (1, 1, 2))
+
+
 class PruneTest(CacheBase):
     def test_region_count_is_capped(self):
         for index in range(cache.MAX_REGIONS + 10):
