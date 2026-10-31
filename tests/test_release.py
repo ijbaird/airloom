@@ -1109,6 +1109,8 @@ elif command == "update":
         sys.exit(1)
     if env.get("FAKE_UPDATE_ADDS_KEY"):
         remote["keys"].append(env["FAKE_UPDATE_ADDS_KEY"])
+    if env.get("FAKE_UPDATE_DISABLES_GPG_VERIFY") == "1":
+        remote["gpg_verify"] = False
     # FAKE_UPGRADE_RESULT models partial upgrades so the version and commit
     # checks are each exercised alone.
     result = "stale" if env.get("FAKE_STALE_UPGRADE") == "1" else env.get("FAKE_UPGRADE_RESULT", "complete")
@@ -1434,6 +1436,14 @@ else:
         result, _, summary = self.run_client_gate(FAKE_UPDATE_ADDS_KEY="OTHERFPR")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("previous installation trust changed from CORRECTFPR to CORRECTFPR OTHERFPR", result.stderr)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_production_upgrade_must_leave_previous_origin_requiring_signatures(self):
+        # Trusted keys stay the same; only the signature policy is dropped.
+        result, _, summary = self.run_client_gate(FAKE_UPDATE_DISABLES_GPG_VERIFY="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation origin airloom-origin stopped requiring GPG signatures", result.stderr)
+        self.assertNotIn("upgrade_verified", result.stdout)
         self.assertNotIn("upgrade_verified", summary)
 
     def test_development_option_imports_the_candidate_key_into_the_previous_install(self):
