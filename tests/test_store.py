@@ -926,6 +926,63 @@ class BackgroundDurabilityTest(StoreThreadsTestCase):
             self.assertEqual(received, ["One", "Two"])
             self.assertEqual(stderr.getvalue().count("callback broke"), 2)
 
+    def test_directory_inspection_error_is_reported_and_the_next_save_recovers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            errors = []
+            settings = Store(path, on_durability_error=errors.append)
+            real_is_dir = Path.is_dir
+            denied = []
+
+            def is_dir(directory, *args, **kwargs):
+                # Access to the settings directory is revoked for one inspection
+                # by the sync worker, as when an ancestor's permissions change.
+                if (threading.current_thread().name == store.SYNC_THREAD_NAME
+                        and directory == path.parent and not denied):
+                    denied.append(directory)
+                    raise PermissionError(errno.EACCES, "Permission denied", str(directory))
+                return real_is_dir(directory, *args, **kwargs)
+
+            with mock.patch.object(Path, "is_dir", is_dir):
+                saved = settings.apply({**settings.data, "location_name": "Denied"})
+                started = time.monotonic()
+                self.assertFalse(settings.flush(1))
+                self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(denied, [path.parent])
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], store.SettingsDurabilityError)
+            self.assertEqual(errors[0].saved, saved)
+            self.assertIn("Permission denied", str(errors[0]))
+
+            # Access restored: the next save starts a worker that confirms it.
+            settings.save()
+            self.assertTrue(settings.flush(5))
+            self.assertEqual(len(errors), 1)
+
+    def test_unexpected_worker_exception_releases_the_worker_and_keeps_work_unconfirmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            settings = Store(path)
+            hooked = []
+            failing = [True]
+            real_sync = store._fsync_directory
+
+            def sync(directory):
+                if failing[0]:
+                    raise RuntimeError("unexpected")
+                real_sync(directory)
+
+            with mock.patch("airloom.store._fsync_directory", side_effect=sync), \
+                    mock.patch.object(threading, "excepthook", hooked.append):
+                settings.save()
+                started = time.monotonic()
+                self.assertFalse(settings.flush(1))
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertEqual([str(args.exc_value) for args in hooked], ["unexpected"])
+                failing[0] = False
+                settings.save()
+                self.assertTrue(settings.flush(5))
+
 
 class SensorIdTest(unittest.TestCase):
     def test_accepts_positive_integral_ids_through_javascript_safe_maximum(self):

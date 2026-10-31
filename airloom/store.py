@@ -155,7 +155,8 @@ class Store:
     fails stays unconfirmed and is retried by the pass after the next save;
     one that has vanished is replaced by the directories from its nearest
     surviving ancestor down to the settings directory, since any of their
-    entries may have been recreated.
+    entries may have been recreated. One that cannot be inspected is kept
+    as unconfirmed.
 
     When a pass leaves anything unconfirmed, ``on_durability_error`` is
     called on the worker thread with a SettingsDurabilityError whose
@@ -264,48 +265,89 @@ class Store:
                 self._sync_worker.start()
 
     def _sync_loop(self) -> None:
-        while True:
+        worker = threading.current_thread()
+        # What this worker has taken from the shared state and not yet
+        # confirmed or handed back.
+        taken: list[Path] = []
+        try:
+            while True:
+                with self._sync_condition:
+                    saved = self._unsynced_settings
+                    if saved is None:
+                        self._retire(worker)
+                        return
+                    self._unsynced_settings = None
+                    taken = self._unconfirmed_directories
+                    self._unconfirmed_directories = []
+                failed, first_error = self._sync_directories(taken)
+                if first_error is None:
+                    taken = []
+                    continue
+                self._requeue(failed)
+                taken = []
+                error = SettingsDurabilityError(
+                    "Settings were saved, but the system could not confirm they reached "
+                    f"the disk: {first_error}",
+                    saved,
+                )
+                error.__cause__ = first_error
+                self._report_durability_error(error)
+        finally:
             with self._sync_condition:
-                saved = self._unsynced_settings
-                if saved is None:
-                    self._exited_workers = [
-                        worker for worker in self._exited_workers if worker.is_alive()
-                    ]
-                    self._exited_workers.append(threading.current_thread())
-                    self._sync_worker = None
-                    self._sync_condition.notify_all()
-                    return
-                self._unsynced_settings = None
-                unconfirmed = self._unconfirmed_directories
-                self._unconfirmed_directories = []
-            directories: list[Path] = []
-            for directory in unconfirmed:
+                if self._sync_worker is worker:
+                    # An unexpected exception: nothing taken is confirmed, and
+                    # the next save must start a fresh worker.
+                    self._requeue(taken)
+                    self._retire(worker)
+
+    def _retire(self, worker: threading.Thread) -> None:
+        """Hand the worker role back; the caller holds ``_sync_condition``."""
+        self._exited_workers = [
+            exited for exited in self._exited_workers if exited.is_alive()
+        ]
+        self._exited_workers.append(worker)
+        self._sync_worker = None
+        self._sync_condition.notify_all()
+
+    def _requeue(self, directories: list[Path]) -> None:
+        """Put unconfirmed directories back, ahead of any queued since."""
+        with self._sync_condition:
+            queued = self._unconfirmed_directories
+            self._unconfirmed_directories = directories + [
+                d for d in queued if d not in directories
+            ]
+
+    def _sync_directories(self, unconfirmed: list[Path]) -> tuple[list[Path], OSError | None]:
+        """Sync each directory, or its replacements if it vanished. Returns
+        the directories still unconfirmed and the first error.
+
+        A directory that cannot be inspected stays unconfirmed as it is."""
+        directories: list[Path] = []
+        failed: list[Path] = []
+        first_error: OSError | None = None
+        for directory in unconfirmed:
+            try:
                 vanished = not directory.is_dir()
-                for pending in self._current_chain(directory) if vanished else [directory]:
-                    if pending not in directories:
-                        directories.append(pending)
-            failed: list[Path] = []
-            first_error: OSError | None = None
-            for directory in directories:
-                try:
-                    _fsync_directory(directory)
-                except OSError as exc:
-                    retry = (self._current_chain(directory)
-                             if isinstance(exc, FileNotFoundError) else [directory])
-                    failed += [pending for pending in retry if pending not in failed]
-                    first_error = first_error or exc
-            if first_error is None:
+                pending = self._current_chain(directory) if vanished else [directory]
+            except OSError as exc:
+                if directory not in failed:
+                    failed.append(directory)
+                first_error = first_error or exc
                 continue
-            with self._sync_condition:
-                queued = self._unconfirmed_directories
-                self._unconfirmed_directories = failed + [d for d in queued if d not in failed]
-            error = SettingsDurabilityError(
-                "Settings were saved, but the system could not confirm they reached "
-                f"the disk: {first_error}",
-                saved,
-            )
-            error.__cause__ = first_error
-            self._report_durability_error(error)
+            directories += [d for d in pending if d not in directories]
+        for directory in directories:
+            try:
+                _fsync_directory(directory)
+            except OSError as exc:
+                retry = [directory]
+                if isinstance(exc, FileNotFoundError):
+                    try:
+                        retry = self._current_chain(directory)
+                    except OSError:
+                        pass  # The next pass finds the chain from this one.
+                failed += [d for d in retry if d not in failed]
+                first_error = first_error or exc
+        return failed, first_error
 
     def _current_chain(self, vanished: Path) -> list[Path]:
         """What to confirm in place of a directory that no longer exists.
