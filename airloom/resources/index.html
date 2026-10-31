@@ -10,7 +10,8 @@
   </head>
   <body>
     <main class="map-shell">
-      <section class="map-panel" id="map-panel" aria-label="Air quality sensor map">
+      <section class="map-panel" id="map-panel" tabindex="0" aria-label="Air quality sensor map" aria-roledescription="map" aria-describedby="map-keyboard-help">
+        <p class="visually-hidden" id="map-keyboard-help">Use the arrow keys to pan the map, Shift with an arrow key to pan farther, and plus or minus to zoom.</p>
         <div id="tiles-old" class="tile-layer" hidden></div>
         <div id="tiles" class="tile-layer"></div>
         <canvas id="heatmap" class="heatmap-layer" hidden></canvas>

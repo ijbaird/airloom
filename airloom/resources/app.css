@@ -28,6 +28,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .map-shell { position: fixed; inset: 0; }
 .map-panel { position: absolute; inset: 0; overflow: hidden; background: #dfe7df; cursor: grab; user-select: none; touch-action: none; }
+.map-panel:focus-visible { outline: calc(3px * var(--interface-scale)) solid var(--accent); outline-offset: calc(-3px * var(--interface-scale)); }
 .map-panel.dragging { cursor: grabbing; }
 .tile-layer, .marker-layer { position: absolute; inset: 0; will-change: transform; transform-origin: 0 0; }
 .tile-layer[hidden] { display: none; }

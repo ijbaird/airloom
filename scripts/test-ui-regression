@@ -28,6 +28,7 @@ scenario passes.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import http.server
 import json
 import os
@@ -828,6 +829,168 @@ def scenario_reduced_motion(root: Path, geocoder: GeocoderStub):
         app.stop()
 
 
+class X11Input:
+    """Real pointer and key input through the X server's XTEST extension."""
+
+    def __init__(self):
+        if not os.environ.get("DISPLAY"):
+            raise AssertionError("keyboard-map needs an X11 display with XTEST (libXtst)")
+        try:
+            self.xlib = ctypes.CDLL("libX11.so.6")
+            self.xtst = ctypes.CDLL("libXtst.so.6")
+        except OSError as exc:
+            raise AssertionError(f"keyboard-map needs an X11 display with XTEST (libXtst): {exc}") from exc
+        self.xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.xlib.XOpenDisplay.restype = ctypes.c_void_p
+        self.xlib.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        self.xlib.XStringToKeysym.restype = ctypes.c_ulong
+        self.xlib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self.xlib.XKeysymToKeycode.restype = ctypes.c_ubyte
+        self.xlib.XFlush.argtypes = [ctypes.c_void_p]
+        self.xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.xtst.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+        self.xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.dpy = self.xlib.XOpenDisplay(None)
+        if not self.dpy:
+            raise AssertionError(f"keyboard-map needs an X11 display with XTEST (libXtst): cannot open {os.environ['DISPLAY']}")
+
+    def _keycode(self, name: str) -> int:
+        keysym = self.xlib.XStringToKeysym(name.encode("ascii"))
+        keycode = self.xlib.XKeysymToKeycode(self.dpy, keysym) if keysym else 0
+        if not keycode:
+            raise AssertionError(f"the X keyboard map has no key for {name!r}")
+        return keycode
+
+    def _press(self, keycode: int, down: bool):
+        self.xtst.XTestFakeKeyEvent(self.dpy, keycode, 1 if down else 0, 0)
+
+    def key(self, name: str, shift: bool = False):
+        keycode = self._keycode(name)
+        shift_code = self._keycode("Shift_L") if shift else None
+        if shift_code:
+            self._press(shift_code, True)
+        self._press(keycode, True)
+        self._press(keycode, False)
+        if shift_code:
+            self._press(shift_code, False)
+        self.xlib.XFlush(self.dpy)
+
+    def move(self, x: int, y: int):
+        self.xtst.XTestFakeMotionEvent(self.dpy, -1, x, y, 0)
+        self.xlib.XFlush(self.dpy)
+
+    def click(self, x: int, y: int):
+        self.move(x, y)
+        self.xtst.XTestFakeButtonEvent(self.dpy, 1, 1, 0)
+        self.xtst.XTestFakeButtonEvent(self.dpy, 1, 0, 0)
+        self.xlib.XFlush(self.dpy)
+
+    def close(self):
+        if self.dpy:
+            self.xlib.XCloseDisplay(self.dpy)
+            self.dpy = None
+
+
+MOUSE_RECORDER_JS = """
+(() => {
+  window.__lastMouse = null;
+  if (!window.__mouseRecorder) {
+    window.__mouseRecorder = (event) => { window.__lastMouse = { x: event.clientX, y: event.clientY }; };
+    document.addEventListener("mousemove", window.__mouseRecorder, true);
+  }
+  return "installed";
+})()
+"""
+
+
+def page_origin(sock: str, x11: X11Input) -> tuple[int, int]:
+    """Where the page's (0, 0) sits on the X screen, at 100% interface scale."""
+    # Move somewhere else first so the final move is a real motion event.
+    eval_js(sock, MOUSE_RECORDER_JS)
+    x11.move(590, 390)
+    wait_for(lambda: eval_js(sock, "window.__lastMouse"), 5, "a recorded pointer move")
+    eval_js(sock, MOUSE_RECORDER_JS)
+    x11.move(600, 400)
+    mouse = wait_for(lambda: eval_js(sock, "window.__lastMouse"), 5, "a recorded pointer move")
+    return 600 - mouse["x"], 400 - mouse["y"]
+
+
+def element_center(sock: str, selector: str, origin: tuple[int, int]) -> tuple[int, int]:
+    rect = eval_js(sock, f"""(() => {{
+      const r = document.querySelector({json.dumps(selector)}).getBoundingClientRect();
+      return {{ x: r.left + r.width / 2, y: r.top + r.height / 2 }};
+    }})()""")
+    return round(origin[0] + rect["x"]), round(origin[1] + rect["y"])
+
+
+ACTIVE_FOCUS_JS = """
+(() => {
+  const active = document.activeElement;
+  if (!active) return null;
+  return active.id === "map-panel" ? "map-panel" : (active.classList.contains("map-marker") ? active.dataset.id : active.id || active.tagName);
+})()
+"""
+
+
+def scenario_keyboard_map(root: Path, geocoder: GeocoderStub):
+    print("— real keyboard input reaches, pans, and zooms the map —")
+    app = DebugApp(root, "keyboard-map", geocoder.url, extra_env={"GDK_BACKEND": "x11"})
+    x11 = None
+    try:
+        app.start().wait_ready()
+        sock = app.sock_path
+        x11 = X11Input()
+        origin = page_origin(sock, x11)
+
+        x11.click(*element_center(sock, "#search", origin))
+        wait_for(lambda: eval_js(sock, "document.activeElement.id") == "search", 5, "a real click to focus search")
+        expected = eval_js(sock, """[...document.querySelectorAll(".map-marker")].map((m) => m.dataset.id).reverse()""")
+        expected.append("map-panel")
+        reached = []
+        for target in expected:
+            x11.key("Tab", shift=True)
+            wait_for(lambda: eval_js(sock, ACTIVE_FOCUS_JS) == target, 5, f"Shift+Tab to reach {target}")
+            reached.append(target)
+        check(reached == expected, f"Shift+Tab from search crosses {len(expected) - 1} markers to the map")
+        ring = eval_js(sock, """(() => {
+          const panel = document.querySelector("#map-panel");
+          return { focusVisible: panel.matches(":focus-visible"), outline: getComputedStyle(panel).outlineStyle };
+        })()""")
+        check(ring["focusVisible"] and ring["outline"] != "none", f"the focused map shows its focus ring ({ring})")
+
+        check(eval_js(sock, COUNT_SENSOR_PAYLOADS_JS) == "installed", "payload counter installed")
+        before = request(sock, "state")
+        x11.key("Right")
+        wait_for(lambda: request(sock, "state")["center"]["lon"] > before["center"]["lon"], 5, "Right to pan east")
+        wait_for(lambda: eval_js(sock, "window.__sensorsPayloads") >= 1, 20, "the panned view's sensor fetch")
+        panned = request(sock, "state")
+        check(panned["center"]["lon"] > before["center"]["lon"] and panned["zoom"] == before["zoom"],
+              "Right pans the map east and fetches the new view")
+
+        zoom = request(sock, "state")["zoom"]
+        x11.key("equal")
+        wait_for(lambda: (lambda state: state["zoom"] == zoom + 1 and state["navigationIdle"])(request(sock, "state")),
+                 10, "= to zoom in one level and settle")
+        x11.key("minus")
+        wait_for(lambda: (lambda state: state["zoom"] == zoom and state["navigationIdle"])(request(sock, "state")),
+                 10, "- to zoom back out and settle")
+        check(eval_js(sock, "document.activeElement.id") == "map-panel",
+              f"= and - zoom the map from {zoom} to {zoom + 1} and back, keeping focus on it")
+
+        x11.click(*element_center(sock, "#search", origin))
+        wait_for(lambda: eval_js(sock, "document.activeElement.id") == "search", 5, "a real click to refocus search")
+        center = request(sock, "state")["center"]
+        x11.key("Right")
+        x11.key("x")
+        wait_for(lambda: eval_js(sock, "document.querySelector('#search').value.endsWith('x')"), 5, "typing into search")
+        check(request(sock, "state")["center"] == center, "arrow keys in the search field leave the map alone")
+    finally:
+        if x11 is not None:
+            x11.close()
+        app.stop()
+
+
 # ------------------------------------------------- fixture PurpleAir data
 
 DEAD_PROXY_ENV = {name: "http://127.0.0.1:9" for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")}
@@ -1413,6 +1576,7 @@ STANDALONE_SCENARIOS = {
     "cache-fallback": scenario_cache_fallback,
     "trend-retry": scenario_trend_retry,
     "stripped-debug": scenario_stripped_debug,
+    "keyboard-map": scenario_keyboard_map,
 }
 ALL_SCENARIOS = [*APP_SCENARIOS, *STANDALONE_SCENARIOS]
 

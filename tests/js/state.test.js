@@ -493,6 +493,129 @@ test("native pinch cancels an in-flight recenter", () => {
   assertCenter(app, expected);
 });
 
+// Dispatches a keydown on #map-panel (as if it held focus) and reports
+// whether the handler claimed the key with preventDefault().
+function pressMapKey(app, key, extra = {}) {
+  const panel = app.elements.get("map-panel");
+  let prevented = false;
+  panel.dispatch("keydown", {
+    key,
+    target: panel,
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+    preventDefault() { prevented = true; },
+    ...extra,
+  });
+  return prevented;
+}
+
+test("the map is a named focusable region with keyboard help", () => {
+  const app = loadApp();
+  const panel = app.elements.get("map-panel");
+  assert.equal(panel.getAttribute("tabindex"), "0");
+  assert.equal(panel.getAttribute("aria-label"), "Air quality sensor map");
+  assert.equal(panel.getAttribute("aria-describedby"), "map-keyboard-help");
+  // The fake DOM does not parse text content, so read the help from the page source.
+  const help = fs.readFileSync(indexPath, "utf8").match(/<p\b[^>]*\bid="map-keyboard-help"[^>]*>([^<]*)<\/p>/);
+  assert.ok(help, "index.html needs a #map-keyboard-help paragraph");
+  assert.match(help[1], /arrow keys.*plus or minus/);
+  assert.notEqual(cssDeclaration(".map-panel:focus-visible", "outline"), null);
+});
+
+test("arrow keys pan the focused map by a fifth of the viewport and schedule a view fetch", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.runTimers();
+  app.messages.length = 0;
+  const worldSize = 256 * 2 ** 12;
+  const expectedLon = 0.2 * 512 / worldSize * 360;
+
+  const prevented = pressMapKey(app, "ArrowRight");
+  closeTo(app.context.Airloom.debugState().center.lon, expectedLon);
+  closeTo(app.context.Airloom.debugState().center.lat, 0);
+  assert.equal(prevented, true);
+
+  app.runTimers();
+  const views = app.messages.filter((item) => item.action === "view-changed");
+  assert.equal(views.length, 1);
+  closeTo(views[0].lon, expectedLon);
+
+  assert.equal(pressMapKey(app, "ArrowDown", { shiftKey: true }), true);
+  const expectedLat = Math.atan(Math.sinh(-2 * Math.PI * 0.6 * 512 / worldSize)) * 180 / Math.PI;
+  assertCenter(app, { lat: expectedLat, lon: expectedLon });
+  assert.ok(expectedLat < 0);
+});
+
+test("map keyboard panning cancels an in-flight recenter", () => {
+  const app = loadApp();
+  configureMap(app);
+  startFlight(app);
+  assert.equal(pressMapKey(app, "ArrowLeft"), true);
+  const expected = { ...app.context.Airloom.debugState().center };
+
+  app.runAnimationFrames(10000);
+  assertCenter(app, expected);
+});
+
+test("plus and minus zoom the focused map", () => {
+  const app = loadApp({ reducedMotion: true });
+  configureMap(app);
+  assert.equal(app.context.Airloom.debugState().zoom, 12);
+  assert.equal(pressMapKey(app, "+"), true);
+  assert.equal(app.context.Airloom.debugState().zoom, 13);
+  assert.equal(pressMapKey(app, "="), true);
+  assert.equal(app.context.Airloom.debugState().zoom, 14);
+  assert.equal(pressMapKey(app, "-"), true);
+  assert.equal(app.context.Airloom.debugState().zoom, 13);
+});
+
+test("map keys are ignored outside the focused map, with modifiers, and while Preferences is open", () => {
+  const app = loadApp({ reducedMotion: true });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1)]);
+  const marker = markerFor(app, 1);
+  assert.ok(marker, "the fixture sensor renders a marker");
+  const before = () => {
+    const { center, zoom } = app.context.Airloom.debugState();
+    return { center: { ...center }, zoom };
+  };
+  const assertIgnored = (label, press) => {
+    const expected = before();
+    for (const key of ["ArrowRight", "ArrowUp", "+", "-"]) {
+      assert.equal(press(key), false, `${label}: ${key} must not be prevented`);
+    }
+    assertCenter(app, expected.center);
+    assert.equal(app.context.Airloom.debugState().zoom, expected.zoom, `${label}: zoom`);
+  };
+
+  assertIgnored("search target", (key) => pressMapKey(app, key, { target: app.elements.get("search") }));
+  assertIgnored("marker target", (key) => pressMapKey(app, key, { target: marker }));
+  assertIgnored("Ctrl", (key) => pressMapKey(app, key, { ctrlKey: true }));
+  openSettings(app);
+  assertIgnored("Preferences open", (key) => pressMapKey(app, key));
+});
+
+test("debugState reports navigation idle only after flights and zoom animations settle", () => {
+  const app = loadApp();
+  configureMap(app);
+  assert.equal(app.context.Airloom.debugState().navigationIdle, true);
+
+  startFlight(app);
+  assert.equal(app.context.Airloom.debugState().navigationIdle, false);
+  app.runAnimationFrames(10000);
+  assert.equal(app.context.Airloom.debugState().navigationIdle, true);
+
+  app.elements.get("zoom-in").click();
+  assert.equal(app.context.Airloom.debugState().navigationIdle, false);
+  for (let frame = 0; frame < 100 && !app.context.Airloom.debugState().navigationIdle; frame += 1) {
+    app.runAnimationFrames(10000 + frame * 16);
+  }
+  assert.equal(app.context.Airloom.debugState().navigationIdle, true);
+  assert.equal(app.context.Airloom.debugState().zoom, 13);
+});
+
 test("flight invalidates active DOM pinch changes and end settlement", () => {
   const app = loadApp();
   configureMap(app);

@@ -122,6 +122,7 @@
       source: state.source,
       viewportScale: window.visualViewport ? window.visualViewport.scale : null,
       reducedMotion: prefersReducedMotion(),
+      navigationIdle: navigationIdle(),
     }),
     debugSearch(query) {
       const input = $("#search");
@@ -982,6 +983,13 @@
     document.documentElement.classList.toggle("reduce-motion", prefersReducedMotion());
   }
   let zoomAnim = null;
+  let flightToken = null;
+
+  // True once no flight, zoom animation, or pinch can still move the map.
+  function navigationIdle() {
+    const flying = flightToken !== null && navigation.isCurrent("fly", flightToken);
+    return zoomAnim === null && !flying && pinch === null && nativePinchStartZoom === null;
+  }
 
   function cancelZoomAnimation() {
     navigation.cancel("zoom");
@@ -1109,7 +1117,9 @@
     nativePinchStartZoom = null;
     cancelZoomAnimation();
     const token = navigation.begin("fly");
+    flightToken = token;
     if (prefersReducedMotion() || durationMs <= 0) {
+      flightToken = null;
       state.center = { lat, lon: targetLon };
       renderMap();
       scheduleViewChanged();
@@ -1123,7 +1133,7 @@
       state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (targetLon - from.lon) * ease };
       renderFrame();
       if (t < 1) requestAnimationFrame(step);
-      else { renderMapMarkers(); scheduleViewChanged(); }
+      else { flightToken = null; renderMapMarkers(); scheduleViewChanged(); }
     }
     requestAnimationFrame(step);
   }
@@ -1487,6 +1497,35 @@
   // for marker presses (pointerdown early-returns on buttons).
   $("#map-panel").addEventListener("pointerup", (event) => { const dragged = state.drag !== null; state.drag = null; event.currentTarget.classList.remove("dragging"); if (dragged) renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
+
+  // Keyboard panning shares pointer dragging's cancellation and view-fetch
+  // path. Keys act only while the map itself has focus, so markers, the
+  // popup, inputs, and Preferences keep their own keys.
+  const MAP_KEY_PAN_FRACTION = 0.2;
+  const MAP_KEY_PAN_SHIFT_FRACTION = 0.6;
+  const MAP_KEY_PAN = { ArrowRight: [-1, 0], ArrowLeft: [1, 0], ArrowDown: [0, -1], ArrowUp: [0, 1] };
+  const MAP_KEY_ZOOM = { "+": 1, "=": 1, "-": -1, "_": -1 };
+  function onMapKeydown(event) {
+    if (event.target !== $("#map-panel") || event.ctrlKey || event.altKey || event.metaKey || $("#settings-dialog").open) return;
+    const pan = MAP_KEY_PAN[event.key];
+    if (pan) {
+      event.preventDefault();
+      const panel = $("#map-panel");
+      const fraction = event.shiftKey ? MAP_KEY_PAN_SHIFT_FRACTION : MAP_KEY_PAN_FRACTION;
+      beginDirectManipulation();
+      hideTransientOverlays();
+      panBy(pan[0] * fraction * panel.clientWidth, pan[1] * fraction * panel.clientHeight);
+      renderMapMarkers();
+      return;
+    }
+    const zoom = MAP_KEY_ZOOM[event.key];
+    if (zoom) {
+      event.preventDefault();
+      animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) + zoom, centerAnchor());
+    }
+  }
+  $("#map-panel").addEventListener("keydown", onMapKeydown);
+
   function isZoomWheel(event) {
     return Boolean(event.deltaY) && Math.abs(event.deltaX) <= Math.abs(event.deltaY);
   }

@@ -58,6 +58,7 @@ REQUIRED_COVERAGE = {
     "popup/search/narrow layouts at all scales and preview actions": "layouts",
     "stripped debug module on a private bus": "stripped-debug",
     "live window resize across the narrow breakpoint": "resize",
+    "keyboard map traversal and panning": "keyboard-map",
 }
 REQUIRED_SCENARIOS = set(REQUIRED_COVERAGE.values())
 
@@ -137,6 +138,12 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         with redirect_stdout(output):
             self.assertEqual(self.script.main(["--list"]), 0)
         self.assertEqual(set(output.getvalue().split()), REQUIRED_SCENARIOS)
+
+    def test_keyboard_map_scenario_requires_x11_rather_than_skipping(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DISPLAY", None)
+            with self.assertRaisesRegex(AssertionError, "X11 display with XTEST"):
+                self.script.X11Input()
 
     def test_layouts_cover_the_reported_scaled_widths_at_every_scale(self):
         self.assertEqual(self.script.SCALES, (1.0, 1.25, 1.5))
