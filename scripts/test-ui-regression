@@ -229,12 +229,15 @@ def proc_bytes(pid: int, name: str) -> bytes:
 
 
 def descendants(pid: int) -> list[int]:
+    """Every descendant of pid. A parent that exits mid-walk has no children
+    left and is skipped; any other error, such as a permission or I/O failure
+    on a live process, propagates rather than hiding owned descendants."""
     found, frontier = [], [pid]
     while frontier:
         parent = frontier.pop()
         try:
             children = Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
-        except OSError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         for child in map(int, children):
             found.append(child)

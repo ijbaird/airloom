@@ -665,6 +665,51 @@ class UiRegressionScriptContractTest(unittest.TestCase):
                     self.script.proc_bytes(12345, "cmdline")
                 self.assertEqual(raised.exception.errno, error.errno)
 
+    def test_descendants_skip_only_vanished_processes(self):
+        # A parent that exits mid-walk has no children left to own; any other
+        # failure would silently hide live owned descendants, so it propagates.
+        for error in (FileNotFoundError(), ProcessLookupError(errno.ESRCH, "No such process")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(self.script.Path, "read_text", side_effect=error):
+                self.assertEqual(self.script.descendants(12345), [])
+        for error in (PermissionError(errno.EACCES, "Permission denied"), OSError(errno.EIO, "I/O error")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(self.script.Path, "read_text", side_effect=error):
+                with self.assertRaises(type(error)) as raised:
+                    self.script.descendants(12345)
+                self.assertEqual(raised.exception.errno, error.errno)
+        child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertIn(child.pid, self.script.descendants(os.getpid()))
+
+    def test_descendant_enumeration_failure_still_stops_the_owned_app(self):
+        # The error fails the scenario, but the instance it started is still
+        # stopped on the way out.
+        stopped = []
+
+        class FakeApp:
+            def __init__(self, *_args, **_kwargs):
+                self.process = mock.Mock(pid=12345, poll=mock.Mock(return_value=None))
+
+            def start(self):
+                return self
+
+            def stop(self):
+                stopped.append(self)
+
+        error = PermissionError(errno.EACCES, "Permission denied")
+        stripped = self.root / "stripped-project"
+        stripped.mkdir()
+        with mock.patch.object(self.script, "DebugApp", FakeApp), \
+                mock.patch.object(self.script, "make_stripped_tree", return_value=stripped), \
+                mock.patch.object(self.script.time, "sleep"), \
+                mock.patch.object(self.script.Path, "read_text", side_effect=error), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(PermissionError):
+                self.script.scenario_stripped_debug(self.root, mock.Mock(url="http://127.0.0.1:9"))
+        self.assertEqual(len(stopped), 1)
+
     def test_viewport_width_excludes_the_window_frame_before_scaling(self):
         # Under a compositor (mutter) the webview spans the whole window; under
         # Xvfb GTK draws a solid CSD frame inside the requested size.
