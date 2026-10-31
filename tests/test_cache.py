@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gc
+import io
+import json
 import os
 import sqlite3
 import tempfile
@@ -8,10 +10,12 @@ import unittest
 import warnings
 import weakref
 from pathlib import Path
+from unittest import mock
 
 from airloom import cache, purpleair
 from airloom.purpleair import (
-    Bounds, bounds_around, DATA_FIELDS, MAP_FIELDS, FetchResult, PurpleAirError,
+    Bounds, bounds_around, DATA_FIELDS, MAP_FIELDS, FetchResult, PurpleAirClient,
+    PurpleAirError,
 )
 
 
@@ -20,6 +24,21 @@ def row(sensor_id, lat=45.5, lon=-122.6, **extra):
               "longitude": lon, "last_seen": 1000, "pm2.5_cf_1": 4.0, "humidity": 40}
     values.update(extra)
     return values
+
+
+def fake_urlopen(payloads, urls):
+    """A urlopen stand-in that serves `payloads` in order and records each URL."""
+    remaining = list(payloads)
+
+    def opener(request, timeout=None):
+        urls.append(request.full_url)
+        payload = remaining.pop(0)
+        return mock.MagicMock(
+            __enter__=lambda s: io.StringIO(json.dumps(payload)),
+            __exit__=lambda s, *a: False,
+        )
+
+    return opener
 
 
 def _close_weak_cache(reference):
@@ -778,6 +797,76 @@ class BooleanCachedValueTest(CacheBase):
             self.bounds, "indoor", [row(5, location_type=True)], 1754680000)
         result = cache.fetch_area(FakeClient([]), self.cache, self.bounds, "indoor", ttl=120)
         self.assertEqual(result.rows, [])
+
+
+class FutureObservationTest(CacheBase):
+    NOW = 1_800_000_000.0
+
+    def setUp(self):
+        super().setUp()
+        self.clock.now = self.NOW
+        self.bounds = bounds_around(45.5, -122.6, 20.0)
+
+    def _observed_at(self, sensor_index):
+        return self.cache._db.execute(
+            "SELECT observed_at FROM sensors WHERE sensor_index = ?", (sensor_index,)).fetchone()[0]
+
+    def test_future_last_seen_is_stored_as_missing_and_still_ages_out(self):
+        self.cache.upsert_rows([row(1, last_seen=int(self.NOW) * 1000)])
+        self.assertIsNone(self.cache.sensors_in(self.bounds)[0]["last_seen"])
+        self.assertEqual(self._observed_at(1), self.NOW)
+        self.clock.now += cache.SENSOR_MAX_AGE + 1
+        self.cache.prune()
+        self.assertEqual(self.cache.sensors_in(self.bounds), [])
+
+    def test_legacy_future_observed_at_is_pruned(self):
+        self.cache._db.execute(
+            "INSERT INTO sensors (sensor_index, latitude, longitude, data, fetched_at,"
+            " observed_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, 45.5, -122.6, json.dumps(row(1)), self.NOW, self.NOW * 1000),
+        )
+        self.cache._db.commit()
+        self.cache.prune()
+        count = self.cache._db.execute("SELECT COUNT(*) FROM sensors").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_future_delta_checkpoint_keeps_previous_checkpoint(self):
+        now = int(self.NOW)
+        self.cache.store_fetch(self.bounds, "outdoor", [row(1, last_seen=now)], now)
+        self.clock.now += 300
+        client = PurpleAirClient("key", clock=self.clock)
+        urls = []
+        payloads = [
+            {"fields": list(DATA_FIELDS), "data": [[1, now + 300, 50, 70, 1.0, 4.0, 5.0, 99]],
+             "time_stamp": now * 1000},
+            {"fields": list(DATA_FIELDS), "data": [], "time_stamp": now + 600},
+        ]
+        with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen(payloads, urls)):
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+            self.assertEqual(
+                self.cache.covering_region(self.bounds, "outdoor").api_time_stamp, now)
+            self.clock.now += 300
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual(len(urls), 2)
+        self.assertIn(f"modified_since={now}", urls[1])
+
+    def test_future_full_snapshot_stamp_forces_next_full_fetch(self):
+        now = int(self.NOW)
+        client = PurpleAirClient("key", clock=self.clock)
+        urls = []
+        map_row = [row(1, last_seen=now).get(field) for field in MAP_FIELDS]
+        payloads = [
+            {"fields": list(MAP_FIELDS), "data": [map_row], "time_stamp": now * 1000},
+            {"fields": list(MAP_FIELDS), "data": [map_row], "time_stamp": now + 300},
+        ]
+        with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen(payloads, urls)):
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+            self.assertIsNone(self.cache.covering_region(self.bounds, "outdoor").api_time_stamp)
+            self.clock.now += 300
+            cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        self.assertEqual(len(urls), 2)
+        self.assertNotIn("modified_since", urls[1])
+        self.assertIn("latitude", urls[1].split("fields=")[1].split("&")[0])
 
 
 class FetchFavoritesTest(CacheBase):

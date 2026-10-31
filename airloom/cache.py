@@ -21,6 +21,7 @@ from .purpleair import (
     Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, FetchResult,
     PurpleAirError, _integer, _number,
 )
+from .models import FUTURE_SKEW_TOLERANCE, plausible_observation_time
 from .validation import sensor_id
 
 MAX_REGIONS = 50
@@ -220,6 +221,9 @@ class SensorCache:
             existing = cursor.fetchone()
             merged = dict(json.loads(existing[0])) if existing else {}
             merged.update(values)
+            if "last_seen" in values:
+                merged["last_seen"] = plausible_observation_time(
+                    _integer(values["last_seen"]), now)
             merged["sensor_index"] = normalized_id
             coordinates = _coordinates(merged)
             if coordinates is None:
@@ -353,7 +357,10 @@ class SensorCache:
 
     def _prune_locked(self, now: float, preserve_region: int | None = None) -> None:
         cutoff = now - SENSOR_MAX_AGE
-        cursor = self._db.execute("DELETE FROM sensors WHERE observed_at < ?", (cutoff,))
+        cursor = self._db.execute(
+            "DELETE FROM sensors WHERE observed_at < ? OR observed_at > ?",
+            (cutoff, now + FUTURE_SKEW_TOLERANCE),
+        )
         if cursor.rowcount:
             # A delta checkpoint cannot prove that a pruned row was absent from
             # the next response. Keep only a just-completed full snapshot, if any.

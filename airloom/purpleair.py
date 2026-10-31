@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
@@ -12,7 +14,7 @@ from urllib.request import Request, urlopen
 from . import __version__
 from .aqi import aqi_from_pm25, epa_corrected_pm25
 from .geography import Bounds, bounds_around, bounds_contains, split_bounds
-from .models import Sensor
+from .models import Sensor, plausible_observation_time
 from .validation import sensor_id
 
 
@@ -92,9 +94,11 @@ class FetchResult:
 
 
 class PurpleAirClient:
-    def __init__(self, api_key: str, timeout: int = 20):
+    def __init__(self, api_key: str, timeout: int = 20,
+                 clock: Callable[[], float] = time.time):
         self.api_key = api_key.strip()
         self.timeout = timeout
+        self.clock = clock
 
     def fetch_rows(
         self,
@@ -138,7 +142,7 @@ class PurpleAirClient:
         except Exception as exc:
             raise PurpleAirError(f"PurpleAir request failed: {exc}") from exc
         try:
-            return parse_rows(payload)
+            return parse_rows(payload, now=self.clock())
         except PurpleAirError:
             raise
         except Exception as exc:
@@ -151,10 +155,15 @@ class PurpleAirClient:
         location_filter: str = "outdoor",
     ) -> list[Sensor]:
         result = self.fetch_rows(bounds=bounds, show_only=show_only, location_filter=location_filter)
-        return _sensors_from_rows(result.rows)
+        return _sensors_from_rows(result.rows, now=self.clock())
 
 
-def parse_rows(payload: dict) -> FetchResult:
+def parse_rows(payload: dict, requested: tuple[str, ...] | None = None, *,
+               now: float | None = None) -> FetchResult:
+    """Pair each data row with its field names. Observation times and the
+    checkpoint stamp too far in the future to be clock skew become missing."""
+    if now is None:
+        now = time.time()
     if not isinstance(payload, dict):
         raise PurpleAirError("Unexpected PurpleAir response.")
     fields = payload.get("fields")
@@ -163,10 +172,14 @@ def parse_rows(payload: dict) -> FetchResult:
         message = payload.get("description") or payload.get("error") or "Unexpected PurpleAir response."
         raise PurpleAirError(str(message))
     values_list = [dict(zip(fields, row, strict=False)) for row in rows if isinstance(row, list)]
-    return FetchResult(values_list, _integer(payload.get("time_stamp")))
+    for values in values_list:
+        if "last_seen" in values:
+            values["last_seen"] = plausible_observation_time(_integer(values["last_seen"]), now)
+    time_stamp = plausible_observation_time(_integer(payload.get("time_stamp")), now)
+    return FetchResult(values_list, time_stamp)
 
 
-def sensor_from_values(values: dict) -> Sensor | None:
+def sensor_from_values(values: dict, now: float | None = None) -> Sensor | None:
     lat = _number(values.get("latitude"))
     lon = _number(values.get("longitude"))
     normalized_id = sensor_id(values.get("sensor_index"))
@@ -196,7 +209,8 @@ def sensor_from_values(values: dict) -> Sensor | None:
         pm1=_rounded(_number(values.get("pm1.0"))),
         pm10=_rounded(_number(values.get("pm10.0"))),
         confidence=_integer(values.get("confidence")),
-        last_seen=_integer(values.get("last_seen")),
+        last_seen=plausible_observation_time(
+            _integer(values.get("last_seen")), time.time() if now is None else now),
         trend=[],
         indoor=_integer(values.get("location_type")) == 1,
     )
@@ -219,18 +233,18 @@ def trend_from_values(values: dict) -> list[dict]:
     return trend
 
 
-def _sensors_from_rows(rows: list[dict]) -> list[Sensor]:
+def _sensors_from_rows(rows: list[dict], now: float | None = None) -> list[Sensor]:
     sensors = []
     for values in rows:
-        sensor = sensor_from_values(values)
+        sensor = sensor_from_values(values, now)
         if sensor is not None:
             sensor.trend = trend_from_values(values)
             sensors.append(sensor)
     return sensors
 
 
-def parse_sensor_payload(payload: dict) -> list[Sensor]:
-    return _sensors_from_rows(parse_rows(payload).rows)
+def parse_sensor_payload(payload: dict, now: float | None = None) -> list[Sensor]:
+    return _sensors_from_rows(parse_rows(payload, now=now).rows, now)
 
 
 def _number(value) -> float | None:
