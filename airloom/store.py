@@ -31,6 +31,22 @@ DEFAULT_CONFIG = {
 }
 
 
+class SettingsDurabilityError(OSError):
+    """The new settings replaced the old file, but the rename may not survive a crash."""
+
+    def __init__(self, message: str, saved: dict):
+        super().__init__(message)
+        self.saved = saved
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _default_config_dir() -> Path:
     # An empty or relative XDG_CONFIG_HOME must be ignored per the XDG spec;
     # honoring it would write the API key relative to the current directory.
@@ -117,12 +133,26 @@ class Store:
     def apply(self, candidate: dict) -> dict:
         clean = _sanitize(candidate)
         with self._save_lock:
-            self._write(clean)
+            try:
+                self._write(clean)
+            except SettingsDurabilityError:
+                # The rename already happened, so the new settings are live.
+                self.data = clean
+                raise
             self.data = clean
         return clean
 
     def _write(self, data: dict) -> None:
+        created = []
+        directory = self.path.parent
+        while not directory.exists():
+            created.insert(0, directory)
+            directory = directory.parent
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Each new directory is only reachable after a crash once the entry
+        # in its parent has been synced.
+        for directory in created:
+            _fsync_directory(directory.parent)
         # mkstemp uses O_EXCL and mode 0600, so preexisting files and links
         # cannot redirect or expose the API key while it is being written.
         descriptor, temporary_name = tempfile.mkstemp(
@@ -147,6 +177,13 @@ class Store:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+        try:
+            _fsync_directory(self.path.parent)
+        except OSError as exc:
+            raise SettingsDurabilityError(
+                f"Settings were saved, but the system could not confirm they reached the disk: {exc}",
+                data,
+            ) from exc
 
     def public_config(self) -> dict:
         api_key = self.data.get("api_key")

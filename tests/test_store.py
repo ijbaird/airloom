@@ -1,5 +1,7 @@
+import errno
 import json
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -144,10 +146,15 @@ class StoreTest(unittest.TestCase):
 
     def test_temp_file_is_private_from_creation(self):
         real_open = os.open
-        seen_modes = []
+        creations = []
 
         def spy_open(path, flags, mode=0o777):
-            seen_modes.append(mode)
+            # Read-only directory opens for fsync create nothing; every
+            # creating open must be the exclusive, private temp file.
+            if flags & os.O_CREAT:
+                creations.append((flags & (os.O_CREAT | os.O_EXCL), mode))
+            else:
+                self.assertEqual(flags & (os.O_WRONLY | os.O_RDWR), 0)
             return real_open(path, flags, mode)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -155,7 +162,7 @@ class StoreTest(unittest.TestCase):
             store = Store(path)
             with mock.patch("airloom.store.os.open", spy_open):
                 store.save()
-            self.assertEqual(seen_modes, [0o600])
+            self.assertEqual(creations, [(os.O_CREAT | os.O_EXCL, 0o600)])
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_empty_or_relative_xdg_config_home_is_ignored(self):
@@ -512,6 +519,101 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(settings.data["interface_scale"], 1.5)
             self.assertEqual(Store(path).data, settings.data)
             self.assertEqual(list(Path(directory).iterdir()), [path])
+
+
+class DurabilityTest(unittest.TestCase):
+    def record(self, fail=None):
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            if fail is not None and fail(fd, events):
+                raise OSError(errno.EIO, "I/O error")
+            events.append(("fsync", os.fstat(fd).st_ino))
+            real_fsync(fd)
+
+        def replace(src, dst):
+            events.append(("replace",))
+            real_replace(src, dst)
+
+        patches = (
+            mock.patch("airloom.store.os.fsync", side_effect=fsync),
+            mock.patch("airloom.store.os.replace", side_effect=replace),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        return events
+
+    def test_save_syncs_directory_after_replace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            settings = Store(path)
+            events = self.record()
+            settings.save()
+            self.assertEqual(
+                events,
+                [("fsync", path.stat().st_ino), ("replace",), ("fsync", path.parent.stat().st_ino)],
+            )
+
+    def test_first_save_syncs_new_directory_entries_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "new" / "airloom" / "config.json"
+            settings = Store(path)
+            events = self.record()
+            settings.save()
+
+            def ino(directory):
+                return directory.stat().st_ino
+
+            self.assertEqual(
+                events,
+                [
+                    ("fsync", ino(Path(tmp))),
+                    ("fsync", ino(Path(tmp) / "new")),
+                    ("fsync", path.stat().st_ino),
+                    ("replace",),
+                    ("fsync", ino(Path(tmp) / "new" / "airloom")),
+                ],
+            )
+
+    def test_directory_fsync_failure_after_replace_keeps_new_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            settings = Store(path)
+            settings.save()
+            self.record(
+                fail=lambda fd, events: stat.S_ISDIR(os.fstat(fd).st_mode)
+                and ("replace",) in events
+            )
+            with self.assertRaises(store.SettingsDurabilityError) as caught:
+                settings.apply({**settings.data, "location_name": "Changed"})
+            exc = caught.exception
+            self.assertIsInstance(exc, OSError)
+            self.assertEqual(exc.saved["location_name"], "Changed")
+            self.assertEqual(settings.data, exc.saved)
+            self.assertEqual(Store(path).data, exc.saved)
+            self.assertEqual(list(Path(tmp).iterdir()), [path])
+            self.assertIn("saved", str(exc))
+
+            with self.assertRaises(store.SettingsDurabilityError) as caught:
+                settings.toggle_favorite(5)
+            self.assertIn(5, settings.data["favorites"])
+            self.assertEqual(settings.data, caught.exception.saved)
+            self.assertEqual(Store(path).data, caught.exception.saved)
+            self.assertEqual(list(Path(tmp).iterdir()), [path])
+
+    def test_new_directory_sync_failure_is_a_plain_prewrite_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "new" / "airloom" / "config.json"
+            settings = Store(path)
+            original = deepcopy(settings.data)
+            self.record(fail=lambda fd, events: stat.S_ISDIR(os.fstat(fd).st_mode))
+            with self.assertRaises(OSError) as caught:
+                settings.apply({**settings.data, "location_name": "Changed"})
+            self.assertNotIsInstance(caught.exception, store.SettingsDurabilityError)
+            self.assertEqual(settings.data, original)
+            self.assertFalse(path.exists())
 
 
 class SensorIdTest(unittest.TestCase):
