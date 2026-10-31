@@ -231,17 +231,21 @@ class SensorCache:
                         if key in previous and key not in values:
                             merged[key] = None
             merged["sensor_index"] = normalized_id
+            last_seen = _integer(merged.get("last_seen"))
+            observed_at = (
+                float(last_seen) if last_seen is not None
+                else float(existing[1]) if existing else now
+            )
+            if observed_at < now - SENSOR_MAX_AGE:
+                # Storing an already-expired row would only make the next prune
+                # wipe every region's coverage; the caller still shows the row.
+                continue
             coordinates = _coordinates(merged)
             if coordinates is None:
                 unknown.append(normalized_id)
                 continue
             lat, lon = coordinates
             merged["latitude"], merged["longitude"] = lat, lon
-            last_seen = _integer(merged.get("last_seen"))
-            observed_at = (
-                float(last_seen) if last_seen is not None
-                else float(existing[1]) if existing else now
-            )
             self._db.execute(
                 "INSERT INTO sensors (sensor_index, latitude, longitude, data, fetched_at,"
                 " observed_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(sensor_index) DO UPDATE SET"

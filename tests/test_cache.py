@@ -993,3 +993,39 @@ class FetchFavoritesTest(CacheBase):
         client = FakeClient([FetchResult([row(5, name="Invalid", latitude=91)], 1754680300)])
         cache.fetch_favorites(client, self.cache, [5], have_ids=set(), ttl=120, force=True)
         self.assertEqual(self.cache.sensors_in(bounds), original)
+
+
+class OfflineFavoriteCoverageTest(CacheBase):
+    def test_offline_favorite_keeps_area_delta_polling_across_cycles(self):
+        self.clock.now = 200000.0
+        bounds = bounds_around(45.5, -122.6, 20.0)
+        offline = row(99, lat=40.0, lon=-120.0, last_seen=200000 - 2 * 86400)
+        client = FakeClient([
+            FetchResult([row(1, last_seen=200000)], 200000),
+            FetchResult([offline], 200000),
+            FetchResult([], 200300),
+            FetchResult([offline], 200300),
+            FetchResult([], 200600),
+            FetchResult([offline], 200600),
+        ])
+        for _ in range(3):
+            area = cache.fetch_area(client, self.cache, bounds, "outdoor", ttl=120)
+            fav = cache.fetch_favorites(
+                client, self.cache, [99], {r["sensor_index"] for r in area.rows}, ttl=120)
+            self.assertEqual([r["sensor_index"] for r in fav], [99])
+            self.assertEqual(fav[0]["last_seen"], 200000 - 2 * 86400)
+            self.assertIsNotNone(self.cache.covering_region(bounds, "outdoor"))
+            self.clock.now += 300
+
+        self.assertEqual(client.calls[0]["fields"], MAP_FIELDS)
+        self.assertNotIn("modified_since", client.calls[0])
+        self.assertEqual([c.get("show_only") for c in client.calls[1::2]], [[99], [99], [99]])
+        self.assertEqual(client.calls[2]["fields"], DATA_FIELDS)
+        self.assertEqual(client.calls[2]["modified_since"], 200000)
+        self.assertEqual(client.calls[4]["fields"], DATA_FIELDS)
+        self.assertEqual(client.calls[4]["modified_since"], 200300)
+        self.assertEqual(self.cache.fresh_sensors([99], 3600), {})
+
+    def test_expired_incoming_row_is_not_reported_unknown(self):
+        self.clock.now = 200000.0
+        self.assertEqual(self.cache.upsert_rows([row(98, lat=None, last_seen=1)]), [])
