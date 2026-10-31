@@ -1107,6 +1107,12 @@ elif command == "install":
 elif command == "update":
     remote = remotes[state["origin"]]
     if not accepts(remote):
+        # Real flatpak 1.18.1 downgrades an untrusted summary to a warning
+        # for an installed ref and exits 0 without updating.
+        if env.get("FAKE_UPDATE_IGNORES_UNTRUSTED") == "1":
+            print("F: Warning: Treating remote fetch error as non-fatal", file=sys.stderr)
+            print("Nothing to update.")
+            sys.exit(0)
         print("GPG signatures found, but none are in trusted keyring", file=sys.stderr)
         sys.exit(1)
     if env.get("FAKE_UPDATE_ADDS_KEY"):
@@ -1344,9 +1350,11 @@ else:
         self.assertNotIn("upgrade_verified", summary)
 
     def test_upgrade_must_reach_a_new_commit(self):
+        # An update that leaves the commit in place did not accept the
+        # candidate, whatever version it reports.
         result, _, summary = self.run_client_gate(FAKE_UPGRADE_RESULT="same-commit")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("upgrade did not reach a new commit", result.stderr)
+        self.assertIn("previous installation (trusting CORRECTFPR) rejected the candidate release", result.stderr)
         self.assertNotIn("upgrade_verified", summary)
 
     def test_previous_release_must_update_from_the_published_repository(self):
@@ -1369,9 +1377,10 @@ else:
         self.assertIn("version", result.stderr.lower())
 
     def test_previous_installation_must_reach_the_current_commit(self):
-        result, _, _ = self.run_client_gate(FAKE_STALE_UPGRADE="1")
+        result, _, summary = self.run_client_gate(FAKE_STALE_UPGRADE="1")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("upgrade", result.stderr.lower())
+        self.assertIn("rejected the candidate release", result.stderr)
+        self.assertNotIn("upgrade_verified", summary)
 
     def test_accepting_a_wrong_signing_key_fails_the_gate(self):
         result, _, _ = self.run_client_gate(FAKE_ACCEPT_WRONG_KEY="1")
@@ -1427,6 +1436,17 @@ else:
         self.assertIn("repository_install_verified", summary)
         self.assertNotIn("upgrade_verified", summary)
         self.assertFalse(any(a.startswith("--gpg-import") for m in self.remote_modifications(entries) for a in m))
+
+    def test_production_upgrade_names_a_rejection_that_flatpak_reports_as_nothing_to_update(self):
+        result, _, summary = self.run_client_gate(
+            FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR", FAKE_UPDATE_IGNORES_UNTRUSTED="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Nothing to update.", result.stdout)
+        self.assertIn("previous installation (trusting PREVIOUSFPR) rejected the candidate release; "
+                      "a signing-key rotation needs a reviewed client migration", result.stderr)
+        self.assertNotIn("does not match expected", result.stderr)
+        self.assertNotIn("upgrade_verified", result.stdout)
+        self.assertNotIn("upgrade_verified", summary)
 
     def test_previous_origin_must_require_signatures_before_the_upgrade(self):
         result, entries, summary = self.run_client_gate(FAKE_PREVIOUS_GPG_VERIFY="0")

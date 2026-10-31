@@ -197,8 +197,14 @@ verify_previous_upgrade() (
     trust="preserved"
     flatpak remote-modify --user --url="${repo_url}" "${origin}"
   fi
-  flatpak update --user --noninteractive --no-deps --arch="${arch}" "${app_id}" \
-    || fail "previous installation (trusting ${previous_keys:-none}) rejected the candidate release; a signing-key rotation needs a reviewed client migration"
+  local rejected="previous installation (trusting ${previous_keys:-none}) rejected the candidate release; a signing-key rotation needs a reviewed client migration"
+  flatpak update --user --noninteractive --no-deps --arch="${arch}" "${app_id}" || fail "${rejected}"
+  # flatpak 1.18.1 treats an untrusted summary as a non-fatal fetch error for
+  # an installed ref: it reports "Nothing to update." and exits 0. An
+  # unchanged commit is that rejection, so name it before the version check.
+  new_commit="$(installed_commit)"
+  [[ -n "${new_commit}" ]] || fail "upgrade did not reach a new commit"
+  [[ "${new_commit}" != "${old_commit}" ]] || fail "${rejected}"
   if [[ "${trust}" == "preserved" ]]; then
     current_keys="$(remote_trusted_keys "${origin}")"
     [[ "${current_keys}" == "${previous_keys}" ]] \
@@ -206,8 +212,6 @@ verify_previous_upgrade() (
     remote_requires_signatures "${origin}" || fail "previous installation origin ${origin} stopped requiring GPG signatures"
   fi
   assert_version "${version}" "upgrade"
-  new_commit="$(installed_commit)"
-  [[ -n "${new_commit}" && "${new_commit}" != "${old_commit}" ]] || fail "upgrade did not reach a new commit"
   evidence "upgrade_verified previous_version=${previous_version} version=${version} previous_commit=${old_commit} current_commit=${new_commit} trust=${trust} previous_keys=${previous_keys:-none}"
 )
 
