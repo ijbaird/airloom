@@ -29,6 +29,11 @@ from airloom import geocode
 from airloom.geocode import Place
 from airloom.requests import RequestRegistry
 
+try:
+    from tests.record_handoff import WRITE_RECORD_SOURCE, nonempty, wait_for_record
+except ImportError:  # run from inside tests/ (unittest discover -s tests)
+    from record_handoff import WRITE_RECORD_SOURCE, nonempty, wait_for_record
+
 
 PROJECT = Path(__file__).resolve().parent.parent
 SCRIPT = PROJECT / "scripts" / "test-ui-regression"
@@ -72,17 +77,17 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
-
-Path(os.environ["AIRLOOM_TEST_ENV_RECORD"]).write_text(json.dumps({
+''' + WRITE_RECORD_SOURCE + r'''
+write_record(os.environ["AIRLOOM_TEST_ENV_RECORD"], json.dumps({
     "pid": os.getpid(),
     "env": {key: os.environ.get(key) for key in (
         "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "AIRLOOM_DEBUG_SOCKET", "AIRLOOM_NOMINATIM_URL",
         "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS")},
     "config": json.loads((Path(os.environ["XDG_CONFIG_HOME"]) / "airloom" / "config.json").read_text()),
-}), encoding="utf-8")
+}))
 # A grandchild in the same session, like WebKit's helper processes.
 helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-Path(os.environ["AIRLOOM_TEST_ENV_RECORD"] + ".helper").write_text(str(helper.pid))
+write_record(os.environ["AIRLOOM_TEST_ENV_RECORD"] + ".helper", str(helper.pid))
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(os.environ["AIRLOOM_DEBUG_SOCKET"])
 server.listen(5)
@@ -112,7 +117,7 @@ def process_gone(pid: int, timeout: float = 3.0) -> bool:
             state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
             if state == "Z":
                 return True
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):  # gone, possibly mid-read
             return True
         time.sleep(0.02)
     return False
@@ -172,7 +177,7 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         finally:
             app.stop()
 
-        child = json.loads(record.read_text(encoding="utf-8"))
+        child = wait_for_record(record, json.loads, what="the fake app's environment record")
         for key in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "AIRLOOM_DEBUG_SOCKET"):
             self.assertTrue(Path(child["env"][key]).is_relative_to(apps_root / "main"), key)
         self.assertEqual(child["env"]["AIRLOOM_NOMINATIM_URL"], "http://127.0.0.1:1")
@@ -180,7 +185,7 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         self.assertNotIn("api_key", child["config"], "scenarios must run on demo data")
         self.assertEqual(child["config"]["home_mode"], "fixed")
         self.assertTrue(process_gone(child["pid"]), "the debug child survived cleanup")
-        helper = int(Path(str(record) + ".helper").read_text())
+        helper = wait_for_record(str(record) + ".helper", int, what="the fake app's helper pid")
         self.assertTrue(process_gone(helper), "a helper in the child's session survived cleanup")
         self.assertIsNone(unrelated.poll(), "cleanup touched an unrelated process")
 
@@ -223,7 +228,7 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         app.stop()
 
         self.assertIsNotNone(app.process.poll())
-        self.assertTrue(process_gone(json.loads(record.read_text())["pid"]))
+        self.assertTrue(process_gone(wait_for_record(record, json.loads, what="the fake app's record")["pid"]))
 
     def test_geocoder_stub_is_loopback_and_records_queries(self):
         with self.script.GeocoderStub() as stub:
@@ -262,8 +267,8 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         (project / "run").write_text(
             "#!/usr/bin/env python3\n"
             "import os, time\n"
-            "from pathlib import Path\n"
-            "Path(os.environ['AIRLOOM_TEST_ENV_RECORD']).write_text(os.environ.get('DBUS_SESSION_BUS_ADDRESS', ''))\n"
+            + WRITE_RECORD_SOURCE
+            + "write_record(os.environ['AIRLOOM_TEST_ENV_RECORD'], os.environ.get('DBUS_SESSION_BUS_ADDRESS', ''))\n"
             "time.sleep(60)\n",
             encoding="utf-8",
         )
@@ -283,13 +288,9 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         )
         app.start()
         try:
-            deadline = time.monotonic() + 10
-            while not (record.exists() and record.read_text()) and time.monotonic() < deadline:
-                time.sleep(0.05)
+            address = wait_for_record(record, nonempty, what="the child's session bus address")
         finally:
             app.stop()
-        address = record.read_text()
-        self.assertTrue(address, "the child had no session bus")
         self.assertNotEqual(address, "unix:path=/nonexistent/caller-bus")
         self.assertIsNotNone(app.process.poll())
 
@@ -464,6 +465,14 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         for detail in ('"viewport": [313, 469]', '"panel": [313, 425]',
                        '"markerLayer": "translate(-166576.04px, -93104.5px)"', '"expectedLayer": [-167032.04, -93104.5]'):
             self.assertIn(detail, message)
+
+    def test_proc_reads_treat_a_vanished_process_as_empty(self):
+        # Descendants can exit between being listed and being read; that is
+        # "not a match", not a crash of the scenario.
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        self.assertEqual(self.script.proc_bytes(gone.pid, "cmdline"), b"")
+        self.assertIn(b"python", self.script.proc_bytes(os.getpid(), "cmdline").lower())
 
     def test_viewport_width_excludes_the_window_frame_before_scaling(self):
         # Under a compositor (mutter) the webview spans the whole window; under

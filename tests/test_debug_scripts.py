@@ -10,6 +10,11 @@ import time
 import unittest
 from pathlib import Path
 
+try:
+    from tests.record_handoff import WRITE_RECORD_SOURCE, nonempty, wait_for_record
+except ImportError:  # run from inside tests/ (unittest discover -s tests)
+    from record_handoff import WRITE_RECORD_SOURCE, nonempty, wait_for_record
+
 
 PROJECT = Path(__file__).resolve().parent.parent
 
@@ -20,14 +25,13 @@ import os
 import re
 import socket
 from pathlib import Path
-
-record = Path(os.environ["AIRLOOM_TEST_ENV_RECORD"])
-record.write_text(json.dumps({
+''' + WRITE_RECORD_SOURCE + r'''
+write_record(os.environ["AIRLOOM_TEST_ENV_RECORD"], json.dumps({
     "pid": os.getpid(),
     "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME"),
     "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME"),
     "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": os.environ.get("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"),
-}), encoding="utf-8")
+}))
 for variable in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
     app_dir = Path(os.environ[variable]) / "airloom"
     app_dir.mkdir(parents=True, exist_ok=True)
@@ -251,7 +255,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
             f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
         )
 
-        child = json.loads(record.read_text(encoding="utf-8"))
+        child = wait_for_record(record, json.loads, what="the fake app's environment record")
         for variable, sentinel in (
             ("XDG_CONFIG_HOME", sentinel_config),
             ("XDG_CACHE_HOME", sentinel_cache),
@@ -278,7 +282,8 @@ class DebugScriptIsolationTest(unittest.TestCase):
             fake_bin / "dbus-run-session",
             f"#!{sys.executable}\n"
             "import json, os, sys\n"
-            f"open({str(record)!r}, 'w').write(json.dumps("
+            + WRITE_RECORD_SOURCE
+            + f"write_record({str(record)!r}, json.dumps("
             "{'argv': sys.argv[1:], 'env': dict(os.environ)}))\n",
         )
         write_executable(fake_bin / "mutter", "#!/bin/sh\nexit 1\n")
@@ -311,7 +316,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
         self.assertIn("FAIL", completed.stderr)
         self.assertFalse(output.exists() and any(output.iterdir()))
-        session = json.loads(record.read_text(encoding="utf-8"))
+        session = wait_for_record(record, json.loads, what="the fake session's record")
         argv, child_env = session["argv"], session["env"]
         self.assertEqual(argv[:2], ["--", "mutter"])
         for flag in ("--headless", "--wayland", "--no-x11"):
@@ -393,14 +398,17 @@ class DebugScriptIsolationTest(unittest.TestCase):
             '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--inside-compositor" ]; do shift; done\n'
             'echo ok > "$2/done"\n',
         )
-        unmounts = self.root / "unmounts.jsonl"
-        # A stuck unmount: records itself, ignores SIGTERM, and never returns.
+        unmounts = self.root / "unmounts"
+        unmounts.mkdir()
+        # A stuck unmount: records itself (one complete record per process,
+        # since it is killed at the bound), ignores SIGTERM, and never returns.
         stuck = (
             f"#!{sys.executable}\n"
             "import json, os, signal, sys, time\n"
             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            f"with open({str(unmounts)!r}, 'a') as record:\n"
-            "    record.write(json.dumps({'pid': os.getpid(), 'args': sys.argv[1:]}) + '\\n')\n"
+            + WRITE_RECORD_SOURCE
+            + f"write_record(os.path.join({str(unmounts)!r}, f'{{os.getpid()}}.json'), "
+            "json.dumps({'pid': os.getpid(), 'args': sys.argv[1:]}))\n"
             "time.sleep(300)\n"
         )
         for name in ("fusermount3", "fusermount"):
@@ -437,7 +445,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
             "except BaseException as exc:\n"
             "    outcome = {'result': type(exc).__name__, 'message': str(exc)}\n"
             "outcome['elapsed'] = time.monotonic() - start\n"
-            "pids = [json.loads(line)['pid'] for line in open(unmounts)] if os.path.exists(unmounts) else []\n"
+            "pids = [json.load(open(path))['pid'] for path in glob.glob(os.path.join(unmounts, '*.json'))]\n"
             "outcome['unreaped'] = [pid for pid in pids if os.path.exists(f'/proc/{pid}')]\n"
             "print('OUTCOME ' + json.dumps(outcome))\n",
             encoding="utf-8",
@@ -469,7 +477,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
         # Each of the two unmounts is bounded (1 s plus the kill), so the
         # whole cleanup finishes far inside the guard.
         self.assertLess(outcome["elapsed"], 10, outcome)
-        calls = [json.loads(line) for line in unmounts.read_text(encoding="utf-8").splitlines()]
+        calls = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(unmounts.glob("*.json"))]
         self.assertEqual(len(calls), 2, "a stuck unmount skipped the next mount")
         for call in calls:
             self.assertEqual(call["args"][:2], ["-u", "-z"])
@@ -653,10 +661,9 @@ class DebugScriptIsolationTest(unittest.TestCase):
         self.assertFalse(result["leftover"], "the timed-out child was not reaped")
         self.assertLess(result["elapsed"], 5)
 
-    def _kill_recorded_unmounts(self, record: Path) -> None:
-        if record.exists():
-            for line in record.read_text(encoding="utf-8").splitlines():
-                self._kill_owned_pid(json.loads(line)["pid"])
+    def _kill_recorded_unmounts(self, records: Path) -> None:
+        for path in records.glob("*.json"):
+            self._kill_owned_pid(json.loads(path.read_text(encoding="utf-8"))["pid"])
 
     def _exercise_screenshot_abort(self, timeout_s: int, cancel_signal, signal_during_cleanup=None) -> None:
         # A copy of the real script in a fake project whose debug-run never
@@ -673,9 +680,9 @@ class DebugScriptIsolationTest(unittest.TestCase):
             f"#!{sys.executable}\n"
             "import json, os, subprocess, sys, time\n"
             "helper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
-            f"open({str(record) + '.tmp'!r}, 'w').write(json.dumps("
+            + WRITE_RECORD_SOURCE
+            + f"write_record({str(record)!r}, json.dumps("
             "{'app': os.getpid(), 'helper': helper.pid, 'runner': os.getppid()}))\n"
-            f"os.replace({str(record) + '.tmp'!r}, {str(record)!r})\n"
             "time.sleep(300)\n",
         )
         fake_bin = self.root / "fake-bin"
@@ -744,11 +751,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
              "--output", str(self.root / "shots")],
             env=env, stdout=log, stderr=subprocess.STDOUT,
         )
-        deadline = time.monotonic() + 20
-        while not record.exists() and outer.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertTrue(record.exists(), "the fake app never started")
-        owned = json.loads(record.read_text(encoding="utf-8"))
+        owned = wait_for_record(record, json.loads, what="the fake app never started", writer=outer)
         for pid in owned.values():
             self.addCleanup(self._kill_owned_pid, pid)
         if cancel_signal is not None:
@@ -768,11 +771,11 @@ class DebugScriptIsolationTest(unittest.TestCase):
     def test_owned_process_cleanup_terminates_the_entire_process_group(self):
         record = self.root / "owned-child.pid"
         parent_program = (
-            "import subprocess, sys, time; "
-            "child = subprocess.Popen([sys.executable, '-c', "
-            "'import time; time.sleep(60)']); "
-            "open(sys.argv[1], 'w').write(str(child.pid)); "
-            "time.sleep(60)"
+            "import subprocess, sys, time\n"
+            + WRITE_RECORD_SOURCE
+            + "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "write_record(sys.argv[1], str(child.pid))\n"
+            "time.sleep(60)\n"
         )
         parent = subprocess.Popen(
             [sys.executable, "-c", parent_program, str(record)],
@@ -781,10 +784,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
         self.addCleanup(self._stop_owned_process, parent)
-        deadline = time.monotonic() + 2
-        while not record.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        child_pid = int(record.read_text(encoding="utf-8"))
+        child_pid = wait_for_record(record, int, what="the owned child's pid", writer=parent)
         self.addCleanup(self._kill_owned_pid, child_pid)
 
         self._stop_owned_process(parent)
@@ -799,7 +799,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
                 state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
                 if state == "Z":
                     return True
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):  # gone, possibly mid-read
                 return True
             time.sleep(0.01)
         return False

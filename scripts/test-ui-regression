@@ -216,6 +216,15 @@ def stop_owned(process: subprocess.Popen, sock_path: str | None = None) -> None:
         process.wait(timeout=5)
 
 
+def proc_bytes(pid: int, name: str) -> bytes:
+    """/proc/<pid>/<name>, or b"" once the process has gone (it can exit
+    between being listed and being read)."""
+    try:
+        return Path(f"/proc/{pid}/{name}").read_bytes()
+    except OSError:
+        return b""
+
+
 def descendants(pid: int) -> list[int]:
     found, frontier = [], [pid]
     while frontier:
@@ -807,7 +816,7 @@ def scenario_shell_recovery(app: DebugApp):
     print("— renderer crash recovery and Reload —")
     sock = app.sock_path
     web_processes = [pid for pid in descendants(app.process.pid)
-                     if "WebKitWebProcess" in Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")]
+                     if b"WebKitWebProcess" in proc_bytes(pid, "cmdline")]
     check(bool(web_processes), f"found this instance's own WebKit web process ({web_processes})")
     for pid in web_processes:
         os.kill(pid, signal.SIGKILL)
@@ -1028,10 +1037,11 @@ def scenario_stripped_debug(root: Path, geocoder: GeocoderStub):
         check(app.process.poll() is None, "the app keeps running without the debug module")
         caller_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
         app_pids = [pid for pid in descendants(app.process.pid)
-                    if b"-m\0airloom" in Path(f"/proc/{pid}/cmdline").read_bytes()]
+                    if b"-m\0airloom" in proc_bytes(pid, "cmdline")]
         check(len(app_pids) == 1, f"exactly one stripped Airloom process runs ({app_pids})")
-        environ = dict(item.split(b"=", 1) for item in
-                       Path(f"/proc/{app_pids[0]}/environ").read_bytes().split(b"\0") if b"=" in item)
+        raw_environ = proc_bytes(app_pids[0], "environ")
+        check(bool(raw_environ), "the stripped Airloom process is still running")
+        environ = dict(item.split(b"=", 1) for item in raw_environ.split(b"\0") if b"=" in item)
         bus = environ.get(b"DBUS_SESSION_BUS_ADDRESS", b"").decode()
         check(bool(bus) and bus != caller_bus, "it registers on a private session bus, not the caller's")
         check(not os.path.exists(app.sock_path), "no debug socket is opened")
