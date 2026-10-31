@@ -1340,6 +1340,13 @@
     if (context === "main") state.placeResults = [];
   }
 
+  function cancelMainSearch() {
+    const pending = state.placeRequests.main !== null;
+    invalidatePlaceSearch("main");
+    // Also stop a queued main search before it reaches the network.
+    if (pending) bridge({ action: "cancel-place-search", context: "main" });
+  }
+
   function submitPlaceSearch(context) {
     const input = context === "home" ? $("#home-place-input") : $("#search");
     const query = input.value.trim();
@@ -1448,7 +1455,7 @@
 
   $("#search").addEventListener("input", (event) => {
     state.query = event.target.value;
-    invalidatePlaceSearch("main");
+    cancelMainSearch();
     renderLists();
     renderMapMarkers();
     reconcilePopup();
@@ -1464,7 +1471,11 @@
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
     if (event.key === "Escape" && !$("#settings-dialog").open) {
       if (!$("#map-popup").hidden) hidePopup(true);
-      else if (!$("#search-results").hidden) { $("#search-results").hidden = true; $("#search").focus(); }
+      else if (!$("#search-results").hidden || (document.activeElement === $("#search") && state.placeRequests.main !== null)) {
+        cancelMainSearch();
+        $("#search-results").hidden = true;
+        $("#search").focus();
+      }
       else if (!$("#detail-card").hidden) hideDetail();
       else if (!$("#sensors-panel").hidden) {
         $("#sensors-panel").hidden = true;

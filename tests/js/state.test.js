@@ -1894,6 +1894,60 @@ test("closing Preferences invalidates pending home search responses", () => {
   assert.equal(app.elements.get("search-results").hidden, true);
 });
 
+function mainCancellations(app) {
+  return app.messages.filter((message) => message.action === "cancel-place-search" && message.context === "main");
+}
+
+test("Escape while a main search is pending cancels it and a late result cannot reopen results", () => {
+  const app = loadApp();
+  configureMap(app);
+  const search = app.elements.get("search");
+  search.value = "Paris";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+  search.focus();
+
+  app.document.dispatch("keydown", { key: "Escape", ctrlKey: false, metaKey: false });
+
+  assert.deepEqual(mainCancellations(app), [{ action: "cancel-place-search", context: "main" }]);
+  assert.equal(app.document.activeElement, search);
+  app.context.Airloom.receive("places", {
+    request_id: 1,
+    context: "main",
+    query: "Paris",
+    results: [{ name: "Late Paris", latitude: 48.85, longitude: 2.35 }],
+  });
+  assert.equal(app.elements.get("search-results").hidden, true);
+});
+
+test("editing a submitted query cancels its pending remote search once", () => {
+  const app = loadApp();
+  const search = app.elements.get("search");
+  search.value = "Portland";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+
+  for (const value of ["Paris", "Pari"]) {
+    search.value = value;
+    search.dispatch("input", { target: search });
+  }
+
+  assert.equal(mainCancellations(app).length, 1);
+});
+
+test("clearing search with nothing pending sends no cancellation", () => {
+  const app = loadApp();
+  const search = app.elements.get("search");
+  search.value = "Paris";
+  search.dispatch("input", { target: search });
+  search.value = "";
+  search.dispatch("input", { target: search });
+  search.focus();
+  app.document.dispatch("keydown", { key: "Escape", ctrlKey: false, metaKey: false });
+
+  assert.equal(mainCancellations(app).length, 0);
+});
+
 test("trend unavailable is terminal instead of indefinite loading", () => {
   const app = loadApp();
   configureMap(app, { has_api_key: true });
