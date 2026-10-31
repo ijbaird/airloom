@@ -111,8 +111,10 @@ class Geocoder:
                 timeout,
             )
             fallback = f"{latitude:.2f}, {longitude:.2f}"
-            if not isinstance(payload, dict):
-                # Malformed responses fall back to coordinates but are retried.
+            if not isinstance(payload, dict) or "error" in payload:
+                # Malformed responses and error envelopes (transient or
+                # "Unable to geocode", which look alike) fall back to
+                # coordinates but are retried.
                 return fallback
             label = _label_from(payload) or fallback
             self._store_cached(key, label, self._reverse_cache)

@@ -551,6 +551,27 @@ class ReverseCacheTest(unittest.TestCase):
             self.assertEqual(client.reverse(45, -122), "Stubville")
         self.assertEqual(spy.call_count, 2)
 
+    def test_error_envelopes_are_not_cached_and_the_next_lookup_retries(self):
+        # Nominatim's permanent "Unable to geocode" cannot be told apart from
+        # a transient error envelope, so neither becomes a cached label.
+        for error in ("Service temporarily unavailable", "Unable to geocode"):
+            with self.subTest(error=error):
+                client, _ = make_geocoder()
+                events = record_network_path(client)
+                with mock.patch.object(
+                    geocode.urllib.request,
+                    "urlopen",
+                    side_effect=[
+                        fake_response({"error": error}),
+                        fake_response({"name": "Recovered"}),
+                    ],
+                ) as spy:
+                    self.assertEqual(client.reverse(45, -122), "45.00, -122.00")
+                    self.assertEqual(len(client._reverse_cache), 0)
+                    self.assertEqual(client.reverse(45, -122), "Recovered")
+                self.assertEqual(spy.call_count, 2)
+                self.assertEqual(events, ["request", "throttle", "request", "throttle"])
+
     def test_adapter_cancellation_caches_nothing_and_a_retry_succeeds(self):
         class LookupCancelled(Exception):
             pass
