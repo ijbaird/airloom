@@ -134,7 +134,10 @@ class Store:
     Store-owned worker thread (``SYNC_THREAD_NAME``), started when a rename
     needs it and exiting once idle. Each pass starts after the renames it
     covers, so one pass may confirm several saves. A directory whose sync
-    fails stays unconfirmed and is retried by the pass after the next save.
+    fails stays unconfirmed and is retried by the pass after the next save;
+    one that has vanished is replaced by the directories from its nearest
+    surviving ancestor down to the settings directory, since any of their
+    entries may have been recreated.
 
     When a pass leaves anything unconfirmed, ``on_durability_error`` is
     called on the worker thread with a SettingsDurabilityError whose
@@ -260,15 +263,23 @@ class Store:
                     self._sync_condition.notify_all()
                     return
                 self._unsynced_settings = None
-                directories = self._unconfirmed_directories
+                unconfirmed = self._unconfirmed_directories
                 self._unconfirmed_directories = []
+            directories: list[Path] = []
+            for directory in unconfirmed:
+                vanished = not directory.is_dir()
+                for pending in self._current_chain(directory) if vanished else [directory]:
+                    if pending not in directories:
+                        directories.append(pending)
             failed: list[Path] = []
             first_error: OSError | None = None
             for directory in directories:
                 try:
                     _fsync_directory(directory)
                 except OSError as exc:
-                    failed.append(directory)
+                    retry = (self._current_chain(directory)
+                             if isinstance(exc, FileNotFoundError) else [directory])
+                    failed += [pending for pending in retry if pending not in failed]
                     first_error = first_error or exc
             if first_error is None:
                 continue
@@ -282,6 +293,21 @@ class Store:
             )
             error.__cause__ = first_error
             self._report_durability_error(error)
+
+    def _current_chain(self, vanished: Path) -> list[Path]:
+        """What to confirm in place of a directory that no longer exists.
+
+        It, or something above it, was deleted and perhaps recreated, so
+        every entry from the nearest surviving directory down to the settings
+        directory may be new and unsynced."""
+        lineage = [self.path.parent, *self.path.parent.parents]
+        anchor = vanished.parent
+        while (anchor not in lineage or not anchor.is_dir()) and anchor != anchor.parent:
+            anchor = anchor.parent
+        return [
+            directory for directory in reversed(lineage)
+            if directory == anchor or anchor in directory.parents
+        ]
 
     def _report_durability_error(self, error: SettingsDurabilityError) -> None:
         callback = self.on_durability_error

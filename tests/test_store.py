@@ -2,6 +2,7 @@ import errno
 import io
 import json
 import os
+import shutil
 import stat
 import tempfile
 import threading
@@ -751,6 +752,70 @@ class DurabilityTest(StoreThreadsTestCase):
                     ("fsync", path.parent.stat().st_ino),
                 ],
             )
+
+
+class VanishedDirectoryTest(StoreThreadsTestCase):
+    def record_syncs(self, fail=lambda directory: False):
+        synced = []
+        real_sync = store._fsync_directory
+
+        def sync(directory):
+            if fail(directory):
+                raise OSError(errno.EIO, "I/O error")
+            real_sync(directory)
+            synced.append(directory)
+
+        patch = mock.patch("airloom.store._fsync_directory", side_effect=sync)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return synced
+
+    def test_deleted_unconfirmed_directory_is_retired_for_the_current_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            errors = []
+            settings = Store(root / "old" / "airloom" / "config.json",
+                             on_durability_error=errors.append)
+            failing = [True]
+            synced = self.record_syncs(lambda directory: failing[0] and directory == root / "old")
+            settings.save()
+            self.assertFalse(settings.flush(5))
+            failing[0] = False
+            shutil.rmtree(root / "old")
+            (root / "new").mkdir()
+            settings.path = root / "new" / "config.json"
+            synced.clear()
+            settings.save()
+            self.assertTrue(settings.flush(5))
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(synced, [root, root / "new"])
+
+    def test_directory_recreated_after_a_missed_sync_resyncs_its_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "airloom" / "config.json"
+            errors = []
+            settings = Store(path, on_durability_error=errors.append)
+            real_sync = store._fsync_directory
+            deleted = []
+
+            def delete_before_sync(directory):
+                if directory == path.parent and not deleted:
+                    shutil.rmtree(path.parent)
+                    deleted.append(directory)
+                real_sync(directory)
+
+            with mock.patch("airloom.store._fsync_directory", side_effect=delete_before_sync):
+                settings.save()
+                self.assertFalse(settings.flush(5))
+            self.assertEqual(len(errors), 1)
+            # Recreated outside the store: its entry in the root is new.
+            path.parent.mkdir()
+            synced = self.record_syncs()
+            settings.save()
+            self.assertTrue(settings.flush(5))
+            self.assertEqual(synced, [root, path.parent])
+            self.assertEqual(len(errors), 1)
 
 
 class BackgroundDurabilityTest(StoreThreadsTestCase):
