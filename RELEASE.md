@@ -23,17 +23,39 @@ Publication is queued: the tag's run waits behind any earlier `Flatpak` publicat
 
 The `Flatpak` workflow downloads both architecture artifacts, generates `SHA256SUMS`, creates the GitHub release with generated notes, and attaches the bundles, checksums, and per-architecture `*.provenance.json` files. Ordinary branch pushes and pull requests still produce unsigned development artifacts, but cannot sign or publish stable releases.
 
-Before either publication job, the `verify-client` matrix uses isolated per-user Flatpak installations to install each signed bundle with GPG verification enabled, assert its origin and version, assemble and install from a signed multi-architecture test repository, upgrade a previous supported release, and require a wrong signing key to be rejected. Evidence is recorded in the job summary. Ordinary CI generates an ephemeral key and signs only disposable verification fixtures; its uploaded development artifacts remain unsigned. Protected releases re-import the production key and fail unless its fingerprint matches the committed `packaging/airloom-flatpak.gpg`. These are real CI gates: the local dry-run tests do not replace them.
+Before either publication job, the `verify-client` matrix uses isolated per-user Flatpak installations to install each signed bundle with GPG verification enabled, assert its origin and version, assemble and install from a signed multi-architecture test repository, upgrade a previous supported release, and require a wrong signing key to be rejected. The previous supported release is the newest version tag, at or below the version being built (strictly below for protected releases), with a published (non-draft) GitHub release that includes that architecture's bundle; unpublished or bundle-less tags are skipped, and the job fails if none qualifies or the GitHub API cannot answer. Evidence is recorded in the job summary. Ordinary CI generates an ephemeral key and signs only disposable verification fixtures; its uploaded development artifacts remain unsigned. Protected releases re-import the production key and fail unless its fingerprint matches the committed `packaging/airloom-flatpak.gpg`. Protected releases verify the upgrade as an existing user receives it: the previous release's installation keeps its own keyring and signature settings, and only its origin URL is redirected to the candidate repository. Ordinary CI signs fixtures with an ephemeral key no release trusts, so only those runs pass the development-only `--import-candidate-key` option, and the verifier refuses that option for the committed production key. These are real CI gates: the local dry-run tests do not replace them.
 
 The tag push also publishes the signed flatpak update repository to GitHub Pages (https://ijbaird.github.io/airloom/), which is how installed copies auto-update. One synchronous publication coordinator holds the only cross-tag publication slot while the GitHub release and Pages jobs run sequentially with separately scoped permissions. Both channels revalidate eligibility and the captured tag/source commit immediately before publication, and reject artifacts whose provenance or bundle checksum does not match that source. If the Pages deploy fails or needs re-running, trigger the `Flatpak` workflow manually (`workflow_dispatch`) from the current release tag — the publish jobs are idempotent. Replacing an older stable release additionally requires selecting that tag, setting `allow_older` to true, and typing its exact `vX.Y.Z` tag into `confirm_tag`; either safeguard alone is rejected.
 
 Each provenance file records the source commit, the digest-pinned container image, resolved GNOME runtime and SDK refs/commits, Flatpak tool versions, immutable action refs, and the bundle's SHA-256 checksum. These resolved inputs provide an audit trail, not a promise of bit-for-bit reproducibility: rebuilding from them can still vary with mutable external repositories, timestamps, and build tools.
 
-The repo signing key lives in the `FLATPAK_GPG_PRIVATE_KEY` Actions secret; the canonical copy is the 1Password item "Airloom Flatpak Signing Key" (personal vault), which can re-set the secret via `op document get "Airloom Flatpak Signing Key" | gh secret set FLATPAK_GPG_PRIVATE_KEY`. Track the key's expiry and extend it before expiration, refreshing both the canonical copy and Actions secret. Rotation or compromise requires a reviewed migration: deployed clients trust the committed `packaging/airloom-flatpak.gpg`, so merely replacing the secret does not establish trust. Coordinate the public key, newly signed bundles/repository, and client migration, retain the canonical old key until that migration is complete, and rebuild from known-good source after a compromise.
+The repo signing key lives in the `FLATPAK_GPG_PRIVATE_KEY` Actions secret; the canonical copy is the 1Password item "Airloom Flatpak Signing Key" (personal vault), which can re-set the secret via `op document get "Airloom Flatpak Signing Key" | gh secret set FLATPAK_GPG_PRIVATE_KEY`. Track the key's expiry and extend it before expiration, refreshing both the canonical copy and Actions secret. Rotation or compromise requires a reviewed migration: deployed clients trust the committed `packaging/airloom-flatpak.gpg`, so merely replacing the secret does not establish trust. A signing-key rotation therefore fails the protected upgrade gate until a reviewed client migration exists; this is intended. Coordinate the public key, newly signed bundles/repository, and client migration, retain the canonical old key until that migration is complete, and rebuild from known-good source after a compromise.
 
-Install a downloaded bundle by replacing `VERSION` and `ARCH` with the values in its filename (`ARCH` is normally `x86_64` or `aarch64`):
+Install a downloaded bundle by replacing `ARCH` with the value in its filename. GitHub release assets are named `Airloom-x86_64.flatpak` and `Airloom-aarch64.flatpak`; only local builds from `scripts/build-flatpak.sh` are named `dist/Airloom-VERSION-ARCH.flatpak`.
 
 ```bash
-flatpak install --user ./Airloom-VERSION-ARCH.flatpak
+flatpak install --user ./Airloom-ARCH.flatpak
 ```
+
+## If a tag run fails
+
+If any gate fails in the `Flatpak` run for tag `vX.Y.Z`, first establish whether anything was published:
+
+```bash
+gh release view vX.Y.Z --repo ijbaird/airloom
+gh api "repos/ijbaird/airloom/deployments?environment=github-pages&sha=$(git rev-parse 'vX.Y.Z^{commit}')" --jq length
+```
+
+`gh release view` must report `release not found`, and the deployments query must print `0`.
+
+**Nothing published:** fix the failure through the normal pull-request path, merge, and wait for the `Flatpak` run on `main` to go green for the fixed commit. The failed tag can stay in place meanwhile: it has no published release, so PR and `main` verification skips it and upgrades from the newest published release instead. Then replace the tag on that commit:
+
+```bash
+git push --delete origin vX.Y.Z
+git tag -d vX.Y.Z
+git tag -a vX.Y.Z -m "Airloom X.Y.Z" <green-main-commit-sha>
+git push origin vX.Y.Z
+```
+
+**Anything published** (any GitHub release for the tag, including a draft or partial one, or a Pages deployment from the tag): never move or delete the tag. Fix forward through the normal pull-request path and release the next patch version instead.
 

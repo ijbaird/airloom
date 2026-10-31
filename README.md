@@ -61,8 +61,8 @@ Updates then arrive automatically through GNOME Software, or manually with
 `flatpak update`.
 
 Already installed from a downloaded bundle? Reinstall once from any current
-bundle (`flatpak install --user --reinstall ./Airloom-VERSION-ARCH.flatpak`,
-substituting the filename values) or add
+bundle (`flatpak install --user --reinstall ./Airloom-ARCH.flatpak`,
+using the downloaded file's name) or add
 the remote and reinstall from it (`flatpak remote-add --user airloom
 https://ijbaird.github.io/airloom/airloom.flatpakrepo && flatpak install
 --user --reinstall airloom ai.stealthvision.Airloom`) — either way rebinds

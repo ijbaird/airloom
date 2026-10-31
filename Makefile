@@ -20,18 +20,23 @@ check-js:
 flatpak:
 	./scripts/build-flatpak.sh
 
+# Destinations are single-quoted for the shell (embedded quotes become '\''),
+# so a staging path with spaces, globs, or quotes stays one literal argument.
+shell_quote = '$(subst ','\'',$(1))'
+dest = $(call shell_quote,$(DESTDIR)$(PREFIX))
+
 # DESTDIR is staging only; run-installed finds its prefix relative to its bin directory.
 install:
-	install -d $(DESTDIR)$(PREFIX)/share/airloom
-	tar --exclude='__pycache__' --exclude='*.pyc' -cf - airloom | tar -xf - -C $(DESTDIR)$(PREFIX)/share/airloom
-	install -Dm755 run-installed $(DESTDIR)$(PREFIX)/bin/airloom
-	install -Dm644 packaging/ai.stealthvision.Airloom.desktop $(DESTDIR)$(PREFIX)/share/applications/ai.stealthvision.Airloom.desktop
-	install -Dm644 packaging/ai.stealthvision.Airloom.metainfo.xml $(DESTDIR)$(PREFIX)/share/metainfo/ai.stealthvision.Airloom.metainfo.xml
-	install -Dm644 packaging/ai.stealthvision.Airloom.svg $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/ai.stealthvision.Airloom.svg
+	install -d -- $(dest)/share/airloom
+	tar --exclude='__pycache__' --exclude='*.pyc' -cf - airloom | tar -xf - -C $(dest)/share/airloom
+	install -Dm755 -- run-installed $(dest)/bin/airloom
+	install -Dm644 -- packaging/ai.stealthvision.Airloom.desktop $(dest)/share/applications/ai.stealthvision.Airloom.desktop
+	install -Dm644 -- packaging/ai.stealthvision.Airloom.metainfo.xml $(dest)/share/metainfo/ai.stealthvision.Airloom.metainfo.xml
+	install -Dm644 -- packaging/ai.stealthvision.Airloom.svg $(dest)/share/icons/hicolor/scalable/apps/ai.stealthvision.Airloom.svg
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/airloom
-	rm -rf $(DESTDIR)$(PREFIX)/share/airloom
-	rm -f $(DESTDIR)$(PREFIX)/share/applications/ai.stealthvision.Airloom.desktop
-	rm -f $(DESTDIR)$(PREFIX)/share/metainfo/ai.stealthvision.Airloom.metainfo.xml
-	rm -f $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/ai.stealthvision.Airloom.svg
+	rm -f -- $(dest)/bin/airloom
+	rm -rf -- $(dest)/share/airloom
+	rm -f -- $(dest)/share/applications/ai.stealthvision.Airloom.desktop
+	rm -f -- $(dest)/share/metainfo/ai.stealthvision.Airloom.metainfo.xml
+	rm -f -- $(dest)/share/icons/hicolor/scalable/apps/ai.stealthvision.Airloom.svg

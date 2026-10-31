@@ -429,7 +429,9 @@ This task runs Tasks 1–2's final script on published artifacts; it adds no rep
 
 - [ ] **Step 1: Prove the tooling is real Docker and the pinned image.**
   ```bash
-  WT=/home/ian/.local/share/opencode/worktree/460fa0/astra-v0-14-0   # the W4 worktree at its final commit
+  # The W4 checkout at its final commit. For the integrated-HEAD replay, point WT at the
+  # integration checkout (/home/ian/.local/share/opencode/worktree/460fa0/astra-v0-14-0) instead.
+  WT=/home/ian/.local/share/opencode/worktree/460fa0/astra-release-v0-14-0
   IMG=ghcr.io/flathub-infra/flatpak-github-actions@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77
   R=/tmp/opencode/w4-replay; D=/tmp/opencode/w4-replay-scripts
   rm -rf "$R" "$D"; mkdir -p "$R"/artifacts/prev "$R"/artifacts/cand "$R"/pages "$R"/negative "$R"/out "$D"
@@ -482,17 +484,44 @@ This task runs Tasks 1–2's final script on published artifacts; it adds no rep
   - the log ends `exit=0`;
   - it contains `bundle_verified … key=$PROD version=0.13.0`, `repository_install_verified … version=0.13.0`, and `upgrade_verified previous_version=0.12.3 version=0.13.0 … current_commit=<pages ref> trust=preserved previous_keys=$PROD`;
   - it contains `wrong_key_rejected` and `client_verification_complete arch=x86_64 version=0.13.0`;
-  - `grep -c -- '--gpg-file' "$WT/scripts/verify-flatpak-release.sh"` prints `0`.
+  - no executed `flatpak` command passes `--gpg-file`. Check the real argv, not the script text: an explanatory comment in the script mentions the flag, so a raw `grep -c` prints `1`. Write a pass-through shim, rerun the same replay with it first on `PATH`, and count:
+    ```bash
+    mkdir -p "$D/shim"
+    printf '%s\n' '#!/bin/bash' "printf 'flatpak-argv:' >&2; printf ' %q' \"\$@\" >&2; printf '\\n' >&2" 'exec /app/bin/flatpak "$@"' > "$D/shim/flatpak"
+    chmod 755 "$D/shim/flatpak"
+    docker run --rm --privileged -v "$WT:/src:ro" -v "$D/shim:/shim:ro" -v "$R/artifacts:/artifacts:ro" -v "$R/pages:/pages:ro" \
+      -e PATH=/shim:/app/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      -e FLATPAK_GPG_PUBLIC_KEY=/src/packaging/airloom-flatpak.gpg -w /src "$IMG" \
+      scripts/verify-flatpak-release.sh --bundle /artifacts/cand/Airloom-x86_64.flatpak \
+        --previous-bundle /artifacts/prev/Airloom-x86_64.flatpak --repo /pages/repo \
+        --arch x86_64 --version 0.13.0 --previous-version 0.12.3 > "$R/out/positive-argv.log" 2>&1; echo "exit=$?" >> "$R/out/positive-argv.log"
+    grep -c '^flatpak-argv:' "$R/out/positive-argv.log"                         # nonzero
+    grep '^flatpak-argv:' "$R/out/positive-argv.log" | grep -c -- '--gpg-file'  # must print 0
+    grep '^flatpak-argv: remote-modify' "$R/out/positive-argv.log"              # --url=... only
+    ```
+    (`flatpak` is `/app/bin/flatpak` in the pinned image. The shimmed log must also end `exit=0`.)
 - [ ] **Step 5: Build the negative fixture: the candidate re-signed with a throwaway key.** Write `$D/build-negative.sh` (`set -euo pipefail`; work dir `/negative`):
-  1. `cp -a /pages/repo /negative/repo`, and create a fresh 0700 `GNUPGHOME=/negative/gnupg`.
+  1. `cp -a /pages/repo /negative/repo`, then `chmod -R u+w /negative/repo`. `cp -a` keeps the read-only mirror's modes; only this private copy becomes owner-writable, and `/pages` stays mounted read-only. Create a fresh 0700 `GNUPGHOME=/negative/gnupg`.
   2. `gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "Airloom Replay Throwaway <throwaway@example.invalid>" ed25519 sign 1d`. Set `THROW` to its fingerprint, export it to `/negative/throwaway.gpg`, and set `PROD` from `/src/packaging/airloom-flatpak.gpg` using a scratch GnuPG home.
-  3. For every `app/` ref in `ostree refs --repo=/negative/repo`, with `c=$(ostree rev-parse …)`, run:
-     - `ostree gpg-sign --repo=/negative/repo --delete "$c" "$PROD"`
-     - `ostree gpg-sign --repo=/negative/repo --gpg-homedir="$GNUPGHOME" "$c" "$THROW"`
+  3. Re-sign every `app/` ref. `ostree gpg-sign --delete` matches signatures only through the repository's remote keyrings, and the mirror deleted its remote, so without a keyring-only remote it prints `Signatures deleted: 0`. A short key ID and `--gpg-homedir` do not help either. Run exactly:
+     ```bash
+     ostree remote add --repo=/negative/repo --gpg-import=/src/packaging/airloom-flatpak.gpg production-key file:///nonexistent
+     for ref in $(ostree refs --repo=/negative/repo | grep '^app/'); do
+       c="$(ostree rev-parse --repo=/negative/repo "${ref}")"
+       deleted="$(ostree gpg-sign --repo=/negative/repo --delete "${c}" "${PROD}")"
+       echo "${deleted}"
+       [[ "${deleted}" == "Signatures deleted: 1" ]] || { echo "production signature not deleted from ${ref}" >&2; exit 1; }
+       ostree gpg-sign --repo=/negative/repo --gpg-homedir="${GNUPGHOME}" "${c}" "${THROW}"
+       echo "resigned ${ref} ${c}"
+     done
+     ostree remote delete --repo=/negative/repo production-key
+     ```
   4. `flatpak build-update-repo --no-update-appstream --gpg-sign="$THROW" --gpg-homedir="$GNUPGHOME" /negative/repo`
   5. `flatpak build-bundle /negative/repo /negative/Airloom-x86_64.flatpak ai.stealthvision.Airloom stable --arch=x86_64 --repo-url=https://ijbaird.github.io/airloom/repo --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo --gpg-keys=/negative/throwaway.gpg`
   6. Sanity-check the x86_64 commit with the script's own `ostree init` / `remote add --gpg-import=KEY` / `pull-local --gpg-verify --commit-metadata-only` technique: it must verify with `throwaway.gpg` and must **fail** with the production key. Exit 1 otherwise.
-  7. Print `throwaway=$THROW production=$PROD commit=$c`.
+  7. Reset `c` to the x86_64 commit (`ostree rev-parse --repo=/negative/repo app/ai.stealthvision.Airloom/x86_64/stable`) and print `throwaway=$THROW production=$PROD commit=$c`.
+
+  The expected sanity failure under the production key prints an `error: … Can't check signature: public key not found` line before the final `sanity:` and `throwaway=` lines.
 
   Run it:
   ```bash
@@ -504,7 +533,8 @@ This task runs Tasks 1–2's final script on published artifacts; it adds no rep
 - [ ] **Step 6: Negative replay, production mode (must fail at the upgrade).**
   ```bash
   neg() { docker run --rm --privileged -v "$1:/verify.sh:ro" -v "$WT:/src:ro" -v "$R/artifacts:/artifacts:ro" \
-    -v "$R/negative:/negative:ro" -e FLATPAK_GPG_PUBLIC_KEY=/negative/throwaway.gpg -w /src "$IMG" \
+    -v "$R/negative:/negative:ro" -e FLATPAK_GPG_PUBLIC_KEY=/negative/throwaway.gpg \
+    -e AIRLOOM_PUBLIC_KEY_FILE=/src/packaging/airloom-flatpak.gpg -w /src "$IMG" \
     /verify.sh --bundle /negative/Airloom-x86_64.flatpak --previous-bundle /artifacts/prev/Airloom-x86_64.flatpak \
       --repo /negative/repo --arch x86_64 --version 0.13.0 --previous-version 0.12.3 "${@:2}"; }
   neg "$WT/scripts/verify-flatpak-release.sh" > "$R/out/negative.log" 2>&1; echo "exit=$?" >> "$R/out/negative.log"
@@ -512,8 +542,10 @@ This task runs Tasks 1–2's final script on published artifacts; it adds no rep
   Pass when all of the following hold:
   - the exit is nonzero;
   - the log contains `bundle_verified … key=<THROW>` and `repository_install_verified`;
-  - it contains `client verification denied: previous installation (trusting $PROD) rejected the candidate release; a signing-key rotation needs a reviewed client migration`;
+  - it contains `client verification denied: previous installation (trusting $PROD) did not update to the candidate release: flatpak update left commit <previous commit> installed. If the signing key changed, this is likely an unmigrated key rotation; a signing-key rotation needs a reviewed client migration. flatpak update output: …Nothing to update.` On flatpak 1.18.1, `update` treats the untrusted summary as a non-fatal fetch error and exits 0, so the denial comes from the unchanged-commit check, not from a nonzero exit;
   - it contains no `upgrade_verified`.
+
+  `neg` mounts the verifier at `/verify.sh`, so it cannot find `packaging/` relative to itself. `AIRLOOM_PUBLIC_KEY_FILE` points the development control's committed-key refusal at the real production key.
 - [ ] **Step 7: Controls showing the rejection comes from trust preservation, not a broken fixture.**
   ```bash
   neg "$WT/scripts/verify-flatpak-release.sh" --import-candidate-key > "$R/out/negative-dev-control.log" 2>&1; echo "exit=$?" >> "$R/out/negative-dev-control.log"

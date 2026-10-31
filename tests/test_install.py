@@ -97,6 +97,128 @@ class StagedInstallTest(unittest.TestCase):
         )
 
 
+INSTALLED = (
+    "usr/bin/airloom",
+    "usr/share/airloom/airloom/__init__.py",
+    "usr/share/applications/ai.stealthvision.Airloom.desktop",
+    "usr/share/metainfo/ai.stealthvision.Airloom.metainfo.xml",
+    "usr/share/icons/hicolor/scalable/apps/ai.stealthvision.Airloom.svg",
+)
+
+
+def copy_sources(root: Path) -> Path:
+    # Install runs from this copy, so an unquoted path's relative fallout lands
+    # in the temporary directory, never in the checkout.
+    source = root / "src"
+    (source / "packaging").mkdir(parents=True)
+    shutil.copy2(PROJECT_ROOT / "Makefile", source / "Makefile")
+    shutil.copy2(PROJECT_ROOT / "run-installed", source / "run-installed")
+    shutil.copytree(
+        PROJECT_ROOT / "airloom",
+        source / "airloom",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    for suffix in ("desktop", "metainfo.xml", "svg"):
+        name = f"ai.stealthvision.Airloom.{suffix}"
+        shutil.copy2(PROJECT_ROOT / "packaging" / name, source / "packaging" / name)
+    return source
+
+
+def make(
+    cwd: Path, makefile: Path, target: str, stage: Path
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    for variable in ("PREFIX", "DESTDIR", "AIRLOOM_PREFIX"):
+        environment.pop(variable, None)
+    return subprocess.run(
+        [
+            "make",
+            "--no-print-directory",
+            "-f",
+            str(makefile),
+            target,
+            f"DESTDIR={stage}",
+            "PREFIX=/usr",
+        ],
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+
+class StagedPathQuotingTest(unittest.TestCase):
+    def test_uninstall_with_a_spaced_staging_path_leaves_a_sibling_file(self):
+        # The review's reproduction: `package stage` next to an unrelated `package`.
+        with tempfile.TemporaryDirectory(prefix="airloom-quote-test-") as temporary:
+            root = Path(temporary)
+            sibling = root / "package"
+            sibling.write_text("keep\n")
+            result = make(
+                root, PROJECT_ROOT / "Makefile", "uninstall", root / "package stage"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sibling.read_text(), "keep\n")
+
+    def test_uninstall_with_a_glob_staging_path_leaves_matching_siblings(self):
+        with tempfile.TemporaryDirectory(prefix="airloom-quote-test-") as temporary:
+            root = Path(temporary)
+            launcher = root / "stagea/usr/bin/airloom"
+            kept = root / "stagea/usr/share/airloom/keep"
+            for sentinel in (launcher, kept):
+                sentinel.parent.mkdir(parents=True)
+                sentinel.write_text("keep\n")
+            result = make(
+                root, PROJECT_ROOT / "Makefile", "uninstall", root / "stage[ab]*"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(launcher.read_text(), "keep\n")
+            self.assertEqual(kept.read_text(), "keep\n")
+
+    def test_install_and_uninstall_round_trip_in_shell_sensitive_staging_paths(self):
+        for name in ("package stage", "stage[ab]*", "it's stage"):
+            with self.subTest(stage=name), tempfile.TemporaryDirectory(
+                prefix="airloom-quote-test-"
+            ) as temporary:
+                root = Path(temporary)
+                source = copy_sources(root)
+                stage = root / name
+                (root / "package").write_text("keep\n")
+                (root / "stagea/usr/bin").mkdir(parents=True)
+                (root / "stagea/usr/bin/airloom").write_text("keep\n")
+                other = stage / "usr/share/applications/other.desktop"
+                other.parent.mkdir(parents=True)
+                other.write_text("keep\n")
+
+                result = make(source, source / "Makefile", "install", stage)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for relative in INSTALLED:
+                    self.assertTrue((stage / relative).is_file(), relative)
+                result = make(source, source / "Makefile", "uninstall", stage)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for relative in INSTALLED:
+                    self.assertFalse((stage / relative).exists(), relative)
+                self.assertFalse((stage / "usr/share/airloom").exists())
+                for survivor in (
+                    other,
+                    root / "package",
+                    root / "stagea/usr/bin/airloom",
+                ):
+                    self.assertEqual(survivor.read_text(), "keep\n")
+
+    def test_every_destination_is_quoted_and_deletions_end_options(self):
+        recipes = [
+            line
+            for line in (PROJECT_ROOT / "Makefile").read_text().splitlines()
+            if line.startswith("\t")
+        ]
+        self.assertFalse(
+            [line for line in recipes if "$(DESTDIR)" in line or "$(PREFIX)" in line]
+        )
+        for line in (line for line in recipes if line.startswith("\trm ")):
+            self.assertIn(" -- $(dest)/", line)
+
+
 class BuildVersionTest(unittest.TestCase):
     def test_bundle_filename_uses_committed_version_from_dirty_checkout(self):
         with tempfile.TemporaryDirectory(prefix="airloom-version-test-") as temporary:

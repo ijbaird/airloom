@@ -493,7 +493,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
     # mountinfo and lstat are modeled, so nothing real is ever mounted.
 
     OWNER_DRIVER = (
-        "import gc, glob, json, os, sys\n"
+        "import fnmatch, gc, glob, json, os, sys\n"
         "from importlib.machinery import SourceFileLoader\n"
         "from importlib.util import module_from_spec, spec_from_loader\n"
         "from pathlib import Path\n"
@@ -511,11 +511,18 @@ class DebugScriptIsolationTest(unittest.TestCase):
         "    if mode == 'fail':\n"
         "        raise PermissionError(13, 'Permission denied', '/proc/self/mountinfo')\n"
         "    real = original_read(path)\n"
-        "    if mode in ('real', 'launch-fail'):\n"
+        "    if mode in ('real', 'launch-fail', 'proc-denied'):\n"
         "        return real\n"
         "    # The kernel reports the canonical path, never a symlinked alias.\n"
         "    return real + ''.join(f'90 1 0:90 / {r}/state rw - fuse.fake fake rw\\n' for r in roots()).encode()\n"
         "Path.read_bytes = read_bytes\n"
+        "if mode == 'proc-denied':\n"
+        "    original_text = Path.read_text\n"
+        "    def read_text(path, *args, **kwargs):\n"
+        "        if fnmatch.fnmatch(str(path), '/proc/*/task/*/children'):\n"
+        "            raise PermissionError(13, 'Permission denied', str(path))\n"
+        "        return original_text(path, *args, **kwargs)\n"
+        "    Path.read_text = read_text\n"
         "if foreign:\n"
         "    original_lstat = os.lstat\n"
         "    def lstat(path, *args, **kwargs):\n"
@@ -660,6 +667,56 @@ class DebugScriptIsolationTest(unittest.TestCase):
         self.assertEqual(result["fine"], ["reported"])
         self.assertFalse(result["leftover"], "the timed-out child was not reaped")
         self.assertLess(result["elapsed"], 5)
+
+    # -- process enumeration skips only vanished processes ------------------
+
+    PROC_TASKS = {"/proc/100/task": ["100", "101"], "/proc/200/task": FileNotFoundError(2, "gone")}
+    PROC_CHILDREN = {"/proc/100/task/100/children": "200 ",
+                     "/proc/100/task/101/children": ProcessLookupError(3, "gone")}
+
+    def _descendants_with(self, tasks: dict, children: dict) -> list[int]:
+        """Run make-screenshots' descendants(100) against a modeled /proc,
+        where an exception value is raised instead of returned."""
+        from importlib.machinery import SourceFileLoader
+        from importlib.util import module_from_spec, spec_from_loader
+        from unittest import mock
+
+        loader = SourceFileLoader("make_screenshots", str(PROJECT / "scripts" / "make-screenshots"))
+        module = module_from_spec(spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+
+        def serve(table, path):
+            value = table[str(path)]
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        with mock.patch.object(module.os, "listdir", lambda path: serve(tasks, path)), \
+                mock.patch.object(Path, "read_text", lambda path, *a, **k: serve(children, path)):
+            return module.descendants(100)
+
+    def test_screenshot_descendants_skip_only_vanished_processes_and_tasks(self):
+        self.assertEqual(self._descendants_with(self.PROC_TASKS, self.PROC_CHILDREN), [200])
+
+    def test_screenshot_descendants_surface_other_proc_errors(self):
+        for where in ("listdir", "children"):
+            for error in (PermissionError(13, "Permission denied"), OSError(5, "I/O error")):
+                with self.subTest(where=where, error=type(error).__name__):
+                    tasks, children = dict(self.PROC_TASKS), dict(self.PROC_CHILDREN)
+                    if where == "listdir":
+                        tasks["/proc/200/task"] = error
+                    else:
+                        children["/proc/100/task/100/children"] = error
+                    with self.assertRaises(type(error)) as raised:
+                        self._descendants_with(tasks, children)
+                    self.assertEqual(raised.exception.errno, error.errno)
+
+    def test_screenshot_cleanup_fails_when_process_enumeration_is_denied(self):
+        outcome, stderr, roots = self._run_owner(mode="proc-denied")
+        self.assertEqual(outcome["result"], "AssertionError", stderr)
+        self.assertIn("cleanup was incomplete", outcome["message"])
+        self.assertIn("stopping leftover processes: ", stderr)
+        self.assertEqual(roots, [])
 
     def _kill_recorded_unmounts(self, records: Path) -> None:
         for path in records.glob("*.json"):

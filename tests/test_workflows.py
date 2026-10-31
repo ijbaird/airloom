@@ -143,14 +143,23 @@ def job_ancestors(source, job_name):
 
 
 def context_value(context, path):
+    """A github.* value, or None for a missing key, as GitHub propagates null."""
     value = context
     for part in path.split("."):
-        value = value[part]
+        value = value.get(part) if isinstance(value, dict) else None
     return value
 
 
+def expression_contains(text, search):
+    return text is not None and search.lower() in text.lower()
+
+
+def expression_ends_with(text, suffix):
+    return text is not None and text.lower().endswith(suffix.lower())
+
+
 def evaluate_condition(expression, context):
-    """Evaluate the boolean operators and github.* values used by job gates."""
+    """Evaluate the boolean operators, functions, and github.* values used by job gates."""
     if not expression:
         return False
     paths = re.findall(r"\bgithub(?:\.[A-Za-z_][A-Za-z0-9_]*)+", expression)
@@ -158,7 +167,8 @@ def evaluate_condition(expression, context):
         expression = expression.replace(path, repr(context_value(context, path)))
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
-    return bool(eval(expression, {"__builtins__": {}}, {}))
+    functions = {"contains": expression_contains, "endsWith": expression_ends_with}
+    return bool(eval(expression, {"__builtins__": {}}, functions))
 
 
 def pull_request_context(*, actor, author_type, head_repository):
@@ -177,6 +187,16 @@ def pull_request_context(*, actor, author_type, head_repository):
     }
 
 
+MENTION_FIELDS = {"issue_comment": ("comment", "body"), "pull_request_review_comment": ("comment", "body"),
+                  "pull_request_review": ("review", "body"), "issues": ("issue", "body")}
+
+
+def mention_context(event_name, *, actor, sender_type, text, field=None):
+    obj, default_field = MENTION_FIELDS[event_name]
+    return {"github": {"event_name": event_name, "actor": actor, "repository": "ijbaird/airloom",
+                       "event": {"sender": {"type": sender_type}, obj: {field or default_field: text}}}}
+
+
 class WorkflowContractTest(unittest.TestCase):
     def test_test_job_runs_the_complete_make_check_gate(self):
         test_job = job_block(workflow("flatpak.yml"), "test")
@@ -189,6 +209,7 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("webkitgtk6.0", ui_job)
         self.assertIn("gobject-introspection", ui_job)
         self.assertIn("xorg-x11-server-Xvfb", ui_job)
+        self.assertIn("libXtst", ui_job)
         self.assertIn("xvfb-run", ui_job)
         self.assertIn("scripts/test-heatmap", ui_job)
         self.assertIn("scripts/test-save-refresh", ui_job)
@@ -462,6 +483,29 @@ class WorkflowContractTest(unittest.TestCase):
                     head_repository=head_repository,
                 )
                 self.assertIs(evaluate_condition(condition, context), expected)
+
+    def test_claude_mentions_run_only_for_human_actors_on_every_event(self):
+        source = workflow("claude.yml")
+        on_block = re.search(r"(?ms)^on:\n(.*?)^\S", source).group(1)
+        self.assertEqual(set(re.findall(r"(?m)^  ([a-z_]+):$", on_block)), set(MENTION_FIELDS))
+        job = job_block(source, "claude")
+        condition = job_condition(job)
+        self.assertTrue(condition, "claude needs a job-level skip condition")
+        self.assertLess(job.index("if: |"), job.index("actions/checkout@"))
+        scenarios = (
+            ("human mention", "octocat", "User", "@claude please look", True),
+            ("human without mention", "octocat", "User", "looks good", False),
+            ("bot sender and actor", "helper-app[bot]", "Bot", "@claude run", False),
+            ("bot actor, user-typed sender", "helper-app[bot]", "User", "@claude run", False),
+            ("bot sender, human actor", "octocat", "Bot", "@claude run", False),
+        )
+        for event_name in MENTION_FIELDS:
+            for name, actor, sender_type, text, expected in scenarios:
+                with self.subTest(event=event_name, scenario=name):
+                    context = mention_context(event_name, actor=actor, sender_type=sender_type, text=text)
+                    self.assertIs(evaluate_condition(condition, context), expected)
+        title = mention_context("issues", actor="octocat", sender_type="User", text="@claude help", field="title")
+        self.assertIs(evaluate_condition(condition, title), True)
 
     def test_offered_checkout_update_is_immutable_in_every_workflow(self):
         for path in WORKFLOWS.glob("*.yml"):

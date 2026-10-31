@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.server
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,6 +25,8 @@ VERIFY_CLIENT = PROJECT_ROOT / "scripts" / "verify-flatpak-release.sh"
 PUBLISH_REPO = PROJECT_ROOT / "scripts" / "publish-flatpak-repo.sh"
 WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "flatpak.yml"
 PUBLISH_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "publish.yml"
+RELEASE_GUIDE = PROJECT_ROOT / "RELEASE.md"
+README = PROJECT_ROOT / "README.md"
 SOURCE_SHA = "a" * 40
 RUNTIME_COMMIT = "b" * 64
 SDK_COMMIT = "c" * 64
@@ -151,6 +155,10 @@ def step_block(job: str, step_name: str) -> str:
         job,
     )
     return match.group(1) if match else ""
+
+
+def run_block(step: str) -> str:
+    return textwrap.dedent(step.split("        run: |\n", 1)[1])
 
 
 class ReleaseEligibilityTest(unittest.TestCase):
@@ -954,7 +962,7 @@ class SigningKeyTest(unittest.TestCase):
 
 
 class ClientVerificationTest(unittest.TestCase):
-    def run_client_gate(self, **fake_overrides):
+    def run_client_gate(self, *extra_args, committed_key="production", **fake_overrides):
         with tempfile.TemporaryDirectory(prefix="airloom-client-test-") as temporary:
             root = Path(temporary)
             bin_dir = root / "bin"
@@ -968,6 +976,8 @@ class ClientVerificationTest(unittest.TestCase):
             repo.mkdir()
             correct_key = root / "correct.gpg"
             correct_key.write_bytes(b"correct-test-key")
+            production_key = root / "production.gpg"
+            production_key.write_bytes(b"production-test-key")
             summary = root / "summary.md"
             summary.touch()
             (root / "correct-home").mkdir(mode=0o700)
@@ -994,7 +1004,10 @@ with open(env["FAKE_FLATPAK_LOG"], "a") as stream:
 command = next((arg for arg in args if not arg.startswith("-")), "")
 current_version = env["FAKE_CURRENT_VERSION"]
 previous_version = env["FAKE_PREVIOUS_VERSION"]
-correct_key = Path(env["FAKE_CORRECT_KEY"]).read_bytes()
+FPRS = {b"correct-test-key": "CORRECTFPR", b"wrong-test-key": "WRONGFPR", b"production-test-key": "PRODUCTIONFPR"}
+# The key that signs the repository's commits; a remote accepts them only
+# when it trusts that key or does not verify signatures.
+repo_signer = env.get("FAKE_REPO_SIGNER", "CORRECTFPR")
 
 def save():
     state_path.write_text(json.dumps(state))
@@ -1003,25 +1016,33 @@ def save():
 def option(name):
     return next((arg.split("=", 1)[1] for arg in args if arg.startswith(name + "=")), None)
 
-def key_matches(path):
-    return path is not None and Path(path).read_bytes() == correct_key
+def fingerprint(path):
+    return FPRS.get(Path(path).read_bytes(), "UNKNOWNFPR")
+
+def accepts(remote):
+    return not remote["gpg_verify"] or repo_signer in remote["keys"] or env.get("FAKE_ACCEPT_WRONG_KEY") == "1"
 
 if command == "remote-add":
     name, url = args[-2:]
-    key_ok = key_matches(option("--gpg-import"))
-    if not key_ok and env.get("FAKE_WRONG_KEY_REMOTE_ADD_SIGNATURE") == "1":
+    imported = option("--gpg-import")
+    keys = [fingerprint(imported)] if imported is not None else []
+    if repo_signer not in keys and env.get("FAKE_WRONG_KEY_REMOTE_ADD_SIGNATURE") == "1":
         print("OSTree GPG signature verification failed: wrong key", file=sys.stderr)
         sys.exit(1)
-    if not key_ok and env.get("FAKE_WRONG_KEY_REMOTE_ADD_UNRELATED") == "1":
+    if repo_signer not in keys and env.get("FAKE_WRONG_KEY_REMOTE_ADD_UNRELATED") == "1":
         print("network unreachable while fetching metadata", file=sys.stderr)
         sys.exit(1)
-    remotes[name] = {"url": url, "key_ok": key_ok}
+    remotes[name] = {"url": url, "keys": keys, "gpg_verify": True}
     save()
 elif command == "remote-modify":
     name = args[-1]
     remote = remotes[name]
     remote["url"] = option("--url") or remote["url"]
-    remote["key_ok"] = remote["key_ok"] or key_matches(option("--gpg-import"))
+    imported = option("--gpg-import")
+    if imported is not None:
+        remote["keys"] = sorted(set(remote["keys"]) | {fingerprint(imported)})
+    if "--gpg-verify" in args:
+        remote["gpg_verify"] = True
     save()
 elif command == "install":
     bundle = next((arg for arg in args if arg.endswith(".flatpak")), None)
@@ -1036,7 +1057,9 @@ elif command == "install":
         # origin remote trusts exactly those and requires signatures only
         # when there are any.
         if previous:
-            keys, signer, gpg_verify = ["PREVIOUSFPR"], "PREVIOUSFPR", True
+            trusted = env.get("FAKE_PREVIOUS_TRUSTED_KEY", "CORRECTFPR")
+            keys, signer = [trusted], trusted
+            gpg_verify = env.get("FAKE_PREVIOUS_GPG_VERIFY", "1") == "1"
             url = env.get("FAKE_PREVIOUS_BUNDLE_URL", "https://ijbaird.github.io/airloom/repo")
         else:
             signature = env.get("FAKE_CURRENT_BUNDLE_SIGNATURE", "selected")
@@ -1064,18 +1087,18 @@ elif command == "install":
         origin = env.get("FAKE_ORIGIN", "airloom-origin")
         commit = "previous-commit" if previous else "current-commit"
         state = {"version": version, "commit": commit, "origin": origin}
-        remotes[origin] = {"url": url, "key_ok": True, "keys": keys, "gpg_verify": gpg_verify}
+        remotes[origin] = {"url": url, "keys": keys, "gpg_verify": gpg_verify}
         signers = json.loads((client / "signers.json").read_text()) if (client / "signers.json").exists() else {}
         signers[commit] = signer
         (client / "signers.json").write_text(json.dumps(signers))
     else:
         remote_name = args[-2]
         remote = remotes[remote_name]
-        if not remote["key_ok"] and env.get("FAKE_ACCEPT_WRONG_KEY") != "1":
+        if not accepts(remote):
             if env.get("FAKE_WRONG_KEY_INSTALL_UNRELATED") == "1":
                 print("network unreachable while pulling commit", file=sys.stderr)
             else:
-                print("GPG signature verification failed: wrong key", file=sys.stderr)
+                print("GPG signatures found, but none are in trusted keyring", file=sys.stderr)
             sys.exit(1)
         state = {
             "version": current_version,
@@ -1085,12 +1108,24 @@ elif command == "install":
     save()
 elif command == "update":
     remote = remotes[state["origin"]]
-    if not remote["key_ok"] and env.get("FAKE_ACCEPT_WRONG_KEY") != "1":
-        print("GPG signature verification failed: wrong key", file=sys.stderr)
+    if not accepts(remote):
+        # Real flatpak 1.18.1 downgrades an untrusted summary to a warning
+        # for an installed ref and exits 0 without updating.
+        if env.get("FAKE_UPDATE_IGNORES_UNTRUSTED") == "1":
+            print("F: Warning: Treating remote fetch error as non-fatal", file=sys.stderr)
+            print("Nothing to update.")
+            sys.exit(0)
+        print("GPG signatures found, but none are in trusted keyring", file=sys.stderr)
         sys.exit(1)
+    if env.get("FAKE_UPDATE_ADDS_KEY"):
+        remote["keys"].append(env["FAKE_UPDATE_ADDS_KEY"])
+    if env.get("FAKE_UPDATE_DISABLES_GPG_VERIFY") == "1":
+        remote["gpg_verify"] = False
     # FAKE_UPGRADE_RESULT models partial upgrades so the version and commit
     # checks are each exercised alone.
     result = "stale" if env.get("FAKE_STALE_UPGRADE") == "1" else env.get("FAKE_UPGRADE_RESULT", "complete")
+    if result == "stale":
+        print("Nothing to update.")
     if result in ("complete", "same-commit"):
         state["version"] = current_version
     if result in ("complete", "old-version"):
@@ -1123,7 +1158,8 @@ else:
                 "    sys.stdout.buffer.write(b'wrong-test-key')\n"
                 "elif '--show-keys' in sys.argv:\n"
                 "    data = Path(sys.argv[-1]).read_bytes()\n"
-                "    fpr = {b'correct-test-key': 'CORRECTFPR', b'wrong-test-key': 'WRONGFPR'}[data]\n"
+                "    fpr = {b'correct-test-key': 'CORRECTFPR', b'wrong-test-key': 'WRONGFPR',\n"
+                "           b'production-test-key': 'PRODUCTIONFPR'}[data]\n"
                 "    print(f'pub:u:255:22:X:1::::::scESC:\\nfpr:::::::::{fpr}:')\n",
                 encoding="utf-8",
             )
@@ -1177,8 +1213,10 @@ else:
                 GITHUB_STEP_SUMMARY=str(summary),
                 FLATPAK_GPG_PUBLIC_KEY=str(correct_key),
                 GNUPGHOME=str(root / "correct-home"),
+                AIRLOOM_PUBLIC_KEY_FILE=str(
+                    correct_key if committed_key == "candidate" else production_key
+                ),
                 FAKE_FLATPAK_LOG=str(log),
-                FAKE_CORRECT_KEY=str(correct_key),
                 FAKE_PREVIOUS_BUNDLE=str(previous),
                 FAKE_CURRENT_VERSION="1.2.3",
                 FAKE_PREVIOUS_VERSION="1.2.2",
@@ -1199,6 +1237,7 @@ else:
                     "1.2.3",
                     "--previous-version",
                     "1.2.2",
+                    *extra_args,
                 ],
                 cwd=PROJECT_ROOT,
                 env=env,
@@ -1315,9 +1354,12 @@ else:
         self.assertNotIn("upgrade_verified", summary)
 
     def test_upgrade_must_reach_a_new_commit(self):
+        # An update that leaves the commit in place did not accept the
+        # candidate, whatever version it reports.
         result, _, summary = self.run_client_gate(FAKE_UPGRADE_RESULT="same-commit")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("upgrade did not reach a new commit", result.stderr)
+        self.assertIn("previous installation (trusting CORRECTFPR) did not update to the candidate release: "
+                      "flatpak update left commit previous-commit installed.", result.stderr)
         self.assertNotIn("upgrade_verified", summary)
 
     def test_previous_release_must_update_from_the_published_repository(self):
@@ -1340,9 +1382,10 @@ else:
         self.assertIn("version", result.stderr.lower())
 
     def test_previous_installation_must_reach_the_current_commit(self):
-        result, _, _ = self.run_client_gate(FAKE_STALE_UPGRADE="1")
+        result, _, summary = self.run_client_gate(FAKE_STALE_UPGRADE="1")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("upgrade", result.stderr.lower())
+        self.assertIn("did not update to the candidate release", result.stderr)
+        self.assertNotIn("upgrade_verified", summary)
 
     def test_accepting_a_wrong_signing_key_fails_the_gate(self):
         result, _, _ = self.run_client_gate(FAKE_ACCEPT_WRONG_KEY="1")
@@ -1374,6 +1417,98 @@ else:
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("unrelated reason", result.stderr)
         self.assertNotIn("wrong_key_rejected", summary)
+
+    def remote_modifications(self, entries):
+        return [e["args"] for e in entries if "remote-modify" in e["args"]]
+
+    def test_production_upgrade_redirects_only_the_previous_origin_url(self):
+        result, entries, summary = self.run_client_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (modify,) = self.remote_modifications(entries)
+        self.assertEqual(modify[:2], ["remote-modify", "--user"])
+        self.assertEqual(modify[-1], "airloom-origin")
+        self.assertEqual([a for a in modify[2:-1] if a.startswith("--")], [modify[2]])
+        self.assertRegex(modify[2], r"^--url=file:///.+/repo$")
+        self.assertIn("upgrade_verified previous_version=1.2.2 version=1.2.3", summary)
+        self.assertIn("trust=preserved previous_keys=CORRECTFPR", summary)
+
+    ROTATION_ADVICE = (
+        "If the signing key changed, this is likely an unmigrated key rotation; "
+        "a signing-key rotation needs a reviewed client migration."
+    )
+
+    def test_production_upgrade_rejects_a_candidate_the_previous_install_does_not_trust(self):
+        result, entries, summary = self.run_client_gate(FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation (trusting PREVIOUSFPR) did not update to the candidate release: "
+                      "flatpak update exited 1. " + self.ROTATION_ADVICE, result.stderr)
+        self.assertIn("flatpak update output: GPG signatures found, but none are in trusted keyring", result.stderr)
+        self.assertIn("bundle_verified", summary)
+        self.assertIn("repository_install_verified", summary)
+        self.assertNotIn("upgrade_verified", summary)
+        self.assertFalse(any(a.startswith("--gpg-import") for m in self.remote_modifications(entries) for a in m))
+
+    def test_production_upgrade_names_a_rejection_that_flatpak_reports_as_nothing_to_update(self):
+        result, _, summary = self.run_client_gate(
+            FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR", FAKE_UPDATE_IGNORES_UNTRUSTED="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Nothing to update.", result.stdout)
+        self.assertIn("previous installation (trusting PREVIOUSFPR) did not update to the candidate release: "
+                      "flatpak update left commit previous-commit installed. " + self.ROTATION_ADVICE, result.stderr)
+        self.assertIn("flatpak update output: F: Warning: Treating remote fetch error as non-fatal\nNothing to update.",
+                      result.stderr)
+        self.assertNotIn("does not match expected", result.stderr)
+        self.assertNotIn("upgrade_verified", result.stdout)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_development_no_op_update_is_denied_without_rotation_advice(self):
+        # The candidate key was imported, so a key rotation cannot explain it.
+        result, _, summary = self.run_client_gate(
+            "--import-candidate-key", FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR", FAKE_STALE_UPGRADE="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation (trusting PREVIOUSFPR) did not update to the candidate release: "
+                      "flatpak update left commit previous-commit installed. flatpak update output: Nothing to update.",
+                      result.stderr)
+        self.assertNotIn("key rotation", result.stderr)
+        self.assertNotIn("upgrade_verified", result.stdout)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_previous_origin_must_require_signatures_before_the_upgrade(self):
+        result, entries, summary = self.run_client_gate(FAKE_PREVIOUS_GPG_VERIFY="0")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation origin airloom-origin does not require GPG signatures", result.stderr)
+        self.assertFalse(any("update" in e["args"] for e in entries))
+
+    def test_production_upgrade_must_leave_previous_trust_unchanged(self):
+        result, _, summary = self.run_client_gate(FAKE_UPDATE_ADDS_KEY="OTHERFPR")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation trust changed from CORRECTFPR to CORRECTFPR OTHERFPR", result.stderr)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_production_upgrade_must_leave_previous_origin_requiring_signatures(self):
+        # Trusted keys stay the same; only the signature policy is dropped.
+        result, _, summary = self.run_client_gate(FAKE_UPDATE_DISABLES_GPG_VERIFY="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("previous installation origin airloom-origin stopped requiring GPG signatures", result.stderr)
+        self.assertNotIn("upgrade_verified", result.stdout)
+        self.assertNotIn("upgrade_verified", summary)
+
+    def test_development_option_imports_the_candidate_key_into_the_previous_install(self):
+        result, entries, summary = self.run_client_gate(
+            "--import-candidate-key", FAKE_PREVIOUS_TRUSTED_KEY="PREVIOUSFPR")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        (modify,) = self.remote_modifications(entries)
+        self.assertTrue(any(a.startswith("--gpg-import=") and a.endswith("correct.gpg") for a in modify))
+        self.assertTrue(any(a.startswith("--url=file://") for a in modify))
+        self.assertIn("trust=candidate-key-imported previous_keys=PREVIOUSFPR", summary)
+
+    def test_development_option_refuses_the_committed_production_key(self):
+        result, entries, summary = self.run_client_gate("--import-candidate-key", committed_key="candidate")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--import-candidate-key is development-only and refuses the committed "
+                      "production key CORRECTFPR", result.stderr)
+        self.assertEqual(entries, [])
+        self.assertEqual(summary, "")
 
 
 class ReleaseWorkflowContractTest(unittest.TestCase):
@@ -1488,6 +1623,154 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         for step_name in ("Archive update-repo artifact", "Upload update-repo artifact"):
             self.assertNotIn("needs.release-eligibility.outputs.eligible", step_block(self.flatpak, step_name))
         self.assertNotIn("--no-gpg-verify", self.source)
+
+    def test_only_development_runs_import_the_candidate_key_into_the_previous_install(self):
+        verify = step_block(self.verify, "Verify signed client installation and upgrade")
+        self.assertIn("RELEASE_ELIGIBLE: ${{ needs.release-eligibility.outputs.eligible }}", verify)
+        self.assertEqual(self.source.count("--import-candidate-key"), 1)
+        self.assertNotIn("--import-candidate-key", self.publish_source)
+        script = run_block(verify).replace("${{ matrix.arch }}", "x86_64")
+        for eligible, expected in (("true", False), ("false", True), ("", True)):
+            with self.subTest(eligible=eligible), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stub = root / "scripts" / "verify-flatpak-release.sh"
+                stub.parent.mkdir()
+                stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGS_OUT"\n', encoding="utf-8")
+                stub.chmod(0o755)
+                env = dict(os.environ, RELEASE_ELIGIBLE=eligible, EXPECTED_VERSION="1.2.3",
+                           PREVIOUS_VERSION="1.2.2", ARGS_OUT=str(root / "args"))
+                subprocess.run(["bash", "-c", script], cwd=root, env=env, check=True)
+                args = (root / "args").read_text(encoding="utf-8").splitlines()
+                self.assertEqual("--import-candidate-key" in args, expected)
+                self.assertEqual(args[args.index("--version") + 1], "1.2.3")
+                self.assertEqual(args[args.index("--previous-bundle") + 1], "previous/Airloom-x86_64.flatpak")
+
+    def select_previous_release(self, tags, releases, *, eligible="false", version="0.14.0"):
+        """Run the workflow's selection step against a fake releases API.
+
+        releases maps a tag to its release JSON, or to an HTTP status code;
+        tags absent from it answer 404 like an unpublished tag.
+        """
+        script = run_block(step_block(self.verify, "Select previous supported release"))
+        requests = []
+
+        class FakeReleases(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, self.headers.get("Authorization")))
+                tag = self.path.rsplit("/", 1)[-1]
+                release = releases.get(tag, 404) if self.path.startswith(
+                    "/repos/ijbaird/airloom/releases/tags/") else 404
+                status = release if isinstance(release, int) else 200
+                body = b"" if isinstance(release, int) else json.dumps(release).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeReleases)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with release_checkout(tags=tags, package=version) as root:
+                github_env = root / "github-env"
+                env = dict(
+                    os.environ,
+                    RELEASE_ELIGIBLE=eligible,
+                    ARCH="x86_64",
+                    GITHUB_ENV=str(github_env),
+                    GITHUB_API_URL=f"http://127.0.0.1:{server.server_address[1]}",
+                    GITHUB_REPOSITORY="ijbaird/airloom",
+                    GITHUB_TOKEN="fake-token",
+                )
+                result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
+                                        capture_output=True, text=True)
+                written = github_env.read_text(encoding="utf-8") if github_env.exists() else ""
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        return result, written, requests
+
+    @staticmethod
+    def published(tag, *assets, draft=False):
+        return {"tag_name": tag, "draft": draft,
+                "assets": [{"name": name, "state": "uploaded"} for name in assets]}
+
+    def test_previous_release_selection_skips_an_unpublished_failed_tag(self):
+        # Failed-tag recovery: v0.14.0 was tagged but nothing was published,
+        # and the fixed 0.14.0 commit must still pass PR/main verification.
+        result, written, requests = self.select_previous_release(
+            ("v0.12.3", "v0.13.0", "v0.14.0"),
+            {
+                "v0.12.3": self.published("v0.12.3", "Airloom-x86_64.flatpak"),
+                "v0.13.0": self.published("v0.13.0", "Airloom-x86_64.flatpak"),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PREVIOUS_TAG=v0.13.0\n", written)
+        self.assertIn("PREVIOUS_VERSION=0.13.0\n", written)
+        self.assertIn("skipping v0.14.0", result.stderr)
+        self.assertEqual([path for path, _ in requests], [
+            "/repos/ijbaird/airloom/releases/tags/v0.14.0",
+            "/repos/ijbaird/airloom/releases/tags/v0.13.0",
+        ])
+        self.assertTrue(all(auth == "Bearer fake-token" for _, auth in requests))
+
+    def test_previous_release_selection_skips_drafts_and_releases_without_the_arch_bundle(self):
+        result, written, _ = self.select_previous_release(
+            ("v0.12.3", "v0.13.0", "v0.14.0"),
+            {
+                "v0.12.3": self.published("v0.12.3", "Airloom-x86_64.flatpak"),
+                "v0.13.0": self.published("v0.13.0", "Airloom-aarch64.flatpak"),
+                "v0.14.0": self.published("v0.14.0", "Airloom-x86_64.flatpak", draft=True),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PREVIOUS_TAG=v0.12.3\n", written)
+
+    def test_development_runs_still_upgrade_from_a_published_equal_version_release(self):
+        result, written, _ = self.select_previous_release(
+            ("v0.13.0", "v0.14.0"),
+            {
+                "v0.13.0": self.published("v0.13.0", "Airloom-x86_64.flatpak"),
+                "v0.14.0": self.published("v0.14.0", "Airloom-x86_64.flatpak"),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PREVIOUS_TAG=v0.14.0\n", written)
+
+    def test_release_runs_never_upgrade_from_the_release_being_built(self):
+        result, written, _ = self.select_previous_release(
+            ("v0.13.0", "v0.14.0"),
+            {
+                "v0.13.0": self.published("v0.13.0", "Airloom-x86_64.flatpak"),
+                "v0.14.0": self.published("v0.14.0", "Airloom-x86_64.flatpak"),
+            },
+            eligible="true",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PREVIOUS_TAG=v0.13.0\n", written)
+
+    def test_previous_release_selection_denies_without_a_published_candidate(self):
+        result, written, _ = self.select_previous_release(("v0.13.0", "v0.14.0"), {})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("no published previous release with Airloom-x86_64.flatpak", result.stderr)
+        self.assertNotIn("PREVIOUS_TAG", written)
+
+    def test_previous_release_selection_fails_closed_when_the_api_errors(self):
+        # Only a 404 means "not published"; any other answer must not quietly
+        # fall back to an older release.
+        result, written, requests = self.select_previous_release(
+            ("v0.13.0", "v0.14.0"),
+            {"v0.13.0": self.published("v0.13.0", "Airloom-x86_64.flatpak"), "v0.14.0": 500},
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("v0.14.0", result.stderr)
+        self.assertNotIn("PREVIOUS_TAG", written)
+        self.assertEqual(len(requests), 1)
 
     def test_newer_tag_after_initial_eligibility_is_rejected_at_publication(self):
         with release_checkout() as root:
@@ -1713,6 +1996,41 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             self.source,
             r"ghcr\.io/flathub-infra/flatpak-github-actions@sha256:[0-9a-f]{64}",
         )
+
+
+class ReleaseDocumentationTest(unittest.TestCase):
+    def test_downloaded_bundle_examples_use_published_asset_names(self):
+        self.assertIn("bundle: Airloom-${{ matrix.arch }}.flatpak", WORKFLOW.read_text(encoding="utf-8"))
+        for path in (RELEASE_GUIDE, README):
+            with self.subTest(doc=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("./Airloom-ARCH.flatpak", text)
+                for match in re.finditer(r"(\S*)Airloom-VERSION-ARCH\.flatpak", text):
+                    self.assertTrue(match.group(1).endswith("dist/"), match.group(0))
+
+    def test_release_guide_documents_failed_tag_recovery(self):
+        text = RELEASE_GUIDE.read_text(encoding="utf-8")
+        section = text[text.index("## If a tag run fails"):]
+        for expected in (
+            "gh release view vX.Y.Z --repo ijbaird/airloom",
+            "deployments?environment=github-pages&sha=",
+            "git push --delete origin vX.Y.Z",
+            "git tag -d vX.Y.Z",
+            "never move or delete the tag",
+            "next patch version",
+            "upgrades from the newest published release",
+        ):
+            self.assertIn(expected, section)
+
+    def test_release_guide_explains_previous_release_selection(self):
+        text = RELEASE_GUIDE.read_text(encoding="utf-8")
+        self.assertIn("published (non-draft) GitHub release that includes that architecture's bundle", text)
+
+    def test_release_guide_states_the_signing_key_rotation_policy(self):
+        text = RELEASE_GUIDE.read_text(encoding="utf-8")
+        self.assertIn("--import-candidate-key", text)
+        self.assertIn("only its origin URL is redirected", text)
+        self.assertIn("fails the protected upgrade gate until a reviewed client migration", text)
 
 
 if __name__ == "__main__":
