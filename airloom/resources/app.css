@@ -208,7 +208,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .settings-dialog::backdrop { background: rgba(15,24,19,.46); backdrop-filter: blur(3px); }
 .settings-dialog form { padding: calc(22px * var(--interface-scale)); overflow-y: auto; }
 .dialog-heading { display: flex; align-items: center; justify-content: space-between; }
-.dialog-heading h2 { color: var(--ink); font-size: calc(23px * var(--interface-scale)); text-transform: none; letter-spacing: -.03em; }
+/* A narrow dialog shrinks the one-word title, never wrapping it, until it and
+   the full-size close button (34em / 14) share a line; wider dialogs keep
+   23px. 100cqi * scale / scale is the form's width in both modes: WebKit's
+   desktop zoom inflates container units inside font-size by that scale. */
+.settings-dialog form { container-type: inline-size; }
+.dialog-heading h2 { color: var(--ink); font-size: min(calc(23px * var(--interface-scale)), calc((100cqi * var(--interface-scale) - 34em / 14) / 6)); white-space: nowrap; text-transform: none; letter-spacing: -.03em; }
+:root[data-interface-scale="1.25"] .dialog-heading h2 { font-size: min(calc(23px * var(--interface-scale)), calc((100cqi * var(--interface-scale) / 1.25 - 34em / 14) / 6)); }
+:root[data-interface-scale="1.5"] .dialog-heading h2 { font-size: min(calc(23px * var(--interface-scale)), calc((100cqi * var(--interface-scale) / 1.5 - 34em / 14) / 6)); }
+.dialog-heading .icon-button { flex: none; }
 .dialog-intro { margin: calc(9px * var(--interface-scale)) 0 calc(18px * var(--interface-scale)); color: var(--muted); line-height: 1.45; }
 .form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: calc(13px * var(--interface-scale)); }
 .form-grid > label:not(.checkbox) { display: flex; flex-direction: column; gap: calc(6px * var(--interface-scale)); color: var(--muted); font-size: calc(11px * var(--interface-scale)); font-weight: 650; }

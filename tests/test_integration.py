@@ -311,6 +311,11 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         # narrowest width at the widest scale in both themes.
         self.assertIn("home-place-input", self.script.HOME_PLACE_SEARCH_JS)
         self.assertIn("home-place-results", self.script.HOME_PLACE_SEARCH_MEASURE_JS)
+        # Preferences is checked for sideways scroll in every case, and the
+        # home search's clip check covers the whole dialog form.
+        self.assertIn("#settings-title", self.script.LAYOUT_MEASURE_JS)
+        self.assertIn("#settings-form", self.script.LAYOUT_MEASURE_JS)
+        self.assertIn("#settings-form", self.script.HOME_PLACE_SEARCH_MEASURE_JS)
         for theme in self.script.LAYOUT_THEMES:
             self.assertIn(("desktop", 320, max(self.script.SCALES), theme), cases)
 

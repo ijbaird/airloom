@@ -1335,8 +1335,37 @@ LAYOUT_MEASURE_JS = r"""
       }
     }
   }
+  // Preferences must not scroll sideways, and its title and close button share
+  // one line without squeezing the button.
+  let preferences = null;
+  const dialog = document.querySelector("#settings-dialog");
+  if (dialog.open) {
+    const form = document.querySelector("#settings-form");
+    const heading = document.querySelector("#settings-title");
+    const title = heading.getBoundingClientRect();
+    const close = document.querySelector("#close-settings").getBoundingClientRect();
+    const scale = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--interface-scale"));
+    const text = document.createRange();
+    text.selectNodeContents(heading);
+    // At fractional zoom clientWidth rounds down and scrollWidth up (518.4px
+    // reads as 519>518), so confirm with the real horizontal scroll range.
+    const scrolls = (el) => {
+      if (el.scrollWidth <= el.clientWidth + 0.5) return false;
+      el.scrollLeft = el.scrollWidth;
+      const range = el.scrollLeft;
+      el.scrollLeft = 0;
+      return range > 0;
+    };
+    preferences = {
+      scroll: [dialog, form].filter(scrolls).map((el) => `#${el.id} ${el.scrollWidth}>${el.clientWidth}`),
+      titleLines: new Set([...text.getClientRects()].map((r) => Math.round(r.top))).size,
+      titleRight: title.right, closeLeft: close.left, closeWidth: close.width, closeHeight: close.height,
+      closeTarget: 34 * scale,
+    };
+  }
   const input = document.querySelector("#search").getBoundingClientRect();
   return JSON.stringify({
+    preferences,
     theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
     viewport: width,
     scrollWidth: document.documentElement.scrollWidth,
@@ -1481,7 +1510,7 @@ HOME_PLACE_SEARCH_MEASURE_JS = r"""
     }
   }
   const clipped = [];
-  for (const el of [dialog, results, ...results.querySelectorAll("button")]) {
+  for (const el of [dialog, document.querySelector("#settings-form"), results, ...results.querySelectorAll("button")]) {
     if (el.scrollWidth > el.clientWidth + 1) clipped.push(`${el.id ? "#" + el.id : el.tagName.toLowerCase()} ${el.scrollWidth}>${el.clientWidth}`);
   }
   const out = {
@@ -1805,7 +1834,7 @@ def scenario_layouts(root: Path):
                    f"{label}: typed fixed-home search shows its {len(HOME_PLACE_RESULTS)} stubbed results ({search['results']})")
             expect(search["theme"] == theme, f"{label}: Preferences renders the {theme} color scheme ({search['theme']})")
             expect(not search["escaped"], f"{label}: home search input and results stay inside Preferences {search['escaped']}")
-            expect(not search["clipped"], f"{label}: neither Preferences nor the home search results are clipped {search['clipped']}")
+            expect(not search["clipped"], f"{label}: nothing in Preferences or the results is clipped {search['clipped']}")
             field, dropdown = search["input"], search["dropdown"]
             expect(field["right"] - field["left"] >= 120,
                    f"{label}: populated home search input stays usable ({field['right'] - field['left']:.0f}px)")
@@ -1871,6 +1900,15 @@ def scenario_layouts(root: Path):
         expect(not row["overflow"], f"{label}: nothing extends past the {row['viewport']}px viewport {row['overflow']}")
         expect(not row["clipped"], f"{label}: no clipped overlay content {row['clipped']}")
         expect(not row["escaped"], f"{label}: overlay content stays inside its container {row['escaped']}")
+        prefs = row["preferences"]
+        if prefs is not None:
+            expect(not prefs["scroll"], f"{label}: Preferences has no horizontal scroll {prefs['scroll']}")
+            expect(prefs["titleLines"] == 1 and prefs["titleRight"] <= prefs["closeLeft"] + 0.5,
+                   f"{label}: Preferences title stays on one line beside the close button "
+                   f"({prefs['titleLines']} line(s), title right {prefs['titleRight']:.1f}, close left {prefs['closeLeft']:.1f})")
+            expect(min(prefs["closeWidth"], prefs["closeHeight"]) >= prefs["closeTarget"] - 0.5,
+                   f"{label}: Preferences close button keeps its {prefs['closeTarget']:g}px target "
+                   f"({prefs['closeWidth']:.1f}x{prefs['closeHeight']:.1f})")
         expect(row["searchInputWidth"] >= 40, f"{label}: search input stays usable ({row['searchInputWidth']:.0f}px)")
     if problems:
         raise AssertionError(f"{len(problems)} layout check(s) failed; first: {problems[0]}")
