@@ -855,6 +855,38 @@ class TrendDecisionTest(unittest.TestCase):
         self.assertEqual(h.controller.begin_trend(1).kind, "remote")
 
 
+class CachedStartupDecisionTest(unittest.TestCase):
+    def test_home_paint_is_bound_to_the_home_target(self):
+        h = Harness()
+        home_bounds = h.controller.home_bounds()
+        token = h.controller.begin_cached_startup()
+        h.controller.view_changed(VIEW)
+
+        self.assertFalse(h.controller.apply_cached_startup(token, [reading(7)], home_bounds))
+        self.assertEqual(h.controller.sensors, [])
+        self.assertEqual(h.controller.current_view[1], (15.0, -20.0))
+        # A view away from home never admits a home paint.
+        self.assertIsNone(h.controller.begin_cached_startup())
+
+    def test_home_report_keeps_the_home_paint(self):
+        h = Harness()
+        home_bounds = h.controller.home_bounds()
+        token = h.controller.begin_cached_startup()
+        config = h.config
+        h.controller.view_changed(
+            {
+                "north": home_bounds.north,
+                "west": home_bounds.west,
+                "south": home_bounds.south,
+                "east": home_bounds.east,
+                "lat": float(config["latitude"]),
+                "lon": float(config["longitude"]),
+            }
+        )
+
+        self.assertTrue(h.controller.apply_cached_startup(token, [reading(7)], home_bounds))
+
+
 class LifecycleTest(unittest.TestCase):
     def test_shutdown_rejects_new_work_and_invalidates_callbacks(self):
         h = Harness()

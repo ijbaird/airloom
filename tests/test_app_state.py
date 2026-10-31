@@ -337,6 +337,66 @@ class CachedStartupTest(ApplicationAdapterTestCase):
                     [sensor.sensor_id for sensor in live],
                 )
 
+    def home_report(self, app):
+        bounds = app.controller.home_bounds()
+        config = app.store.data
+        return {
+            "north": bounds.north,
+            "west": bounds.west,
+            "south": bounds.south,
+            "east": bounds.east,
+            "lat": config["latitude"],
+            "lon": config["longitude"],
+        }
+
+    def test_navigation_during_a_delayed_home_read_drops_the_home_paint(self):
+        # A report of the home target itself still coalesces into the paint.
+        for case, report, painted in (
+            ("elsewhere", lambda app: VIEW, False),
+            ("home", self.home_report, True),
+        ):
+            with self.subTest(case=case):
+                app = self.make_app(cache=FakeCache([make_row(7)]))
+                threads, idles = ThreadQueue(), IdleQueue()
+
+                with (
+                    mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                    mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                ):
+                    app._paint_cached_home()
+                    app._on_view_changed(report(app))
+                    threads.threads[0].run()
+                    for index in range(len(idles.callbacks)):
+                        idles.run(index)
+
+                self.assertEqual(len(self.sensor_payloads(app)), int(painted))
+                self.assertEqual(
+                    [sensor.sensor_id for sensor in app.sensors], [7] if painted else []
+                )
+
+    def test_recovery_away_from_home_queues_no_home_paint(self):
+        app = self.make_app(cache=FakeCache([make_row(7)]))
+        app.webview = FakeWebView()
+        app._start_fetch = lambda request: app.sent.append(("fetch", request.center))
+        app.controller.view_changed({**VIEW, "zoom": 9})
+        app.sent.clear()
+        threads, idles = ThreadQueue(), IdleQueue()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+        ):
+            app._on_web_process_terminated(None, "crashed")
+            app._on_script_message(None, ScriptMessage({"action": "ready"}))
+            for thread in threads.threads:
+                thread.run()
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+
+        self.assertEqual(self.sensor_payloads(app), [])
+        self.assertEqual(app.sensors, [])
+        self.assertEqual([p for e, p in app.sent if e == "fetch"], [(15.0, -20.0)])
+
 
 class PresentationPayloadTest(ApplicationAdapterTestCase):
     def test_opposite_type_favorites_obey_one_filter_and_remote_summary_inputs(self):

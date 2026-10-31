@@ -220,6 +220,8 @@ class ApplicationController:
         self.current_view: tuple[Bounds, tuple[float, float]] | None = None
         # The page's last valid map zoom, restored into a recovered shell.
         self.current_zoom: float | None = None
+        # The home target a startup cache paint was admitted for.
+        self._cached_startup_target: tuple[Bounds, tuple[float, float]] | None = None
         # Fetched coverage that lets a return to a fresh view skip a fetch.
         self.view_bounds: Bounds | None = None
         self.view_fetched_at = 0.0
@@ -337,6 +339,9 @@ class ApplicationController:
         """The (bounds, center) a refresh would fetch: the view, else home."""
         if self.current_view is not None:
             return self.current_view
+        return self._home_target()
+
+    def _home_target(self) -> tuple[Bounds, tuple[float, float]]:
         config = self.config
         center = (float(config["latitude"]), float(config["longitude"]))
         return bounds_around(*center, float(config["radius_km"])), center
@@ -418,6 +423,9 @@ class ApplicationController:
             view, center = view_from_message(message)
         except (KeyError, TypeError, ValueError, OverflowError):
             return None
+        if (view, center) != self._target():
+            # Home rows still being read must not paint over another target.
+            self._requests.invalidate("cached-startup")
         zoom = message.get("zoom")
         self.current_zoom = (
             float(zoom)
@@ -552,9 +560,17 @@ class ApplicationController:
         return not self._stopped and not self.sensors and bool(self.config.get("api_key"))
 
     def begin_cached_startup(self) -> RequestToken | None:
-        """Authorize one first-paint cache read, or None when none is wanted."""
+        """Authorize one home first-paint cache read, or None when none is wanted.
+
+        A restored view away from home gets no paint: home rows would be the
+        wrong place, and the refresh that follows targets that view directly.
+        """
         if not self.wants_cached_startup():
             return None
+        target = self._home_target()
+        if self._target() != target:
+            return None
+        self._cached_startup_target = target
         return self._requests.begin("cached-startup", generation=self._generation)
 
     def apply_cached_startup(
@@ -562,10 +578,14 @@ class ApplicationController:
     ) -> bool:
         """First paint from cached rows; the following refresh replaces it.
 
-        Only the current read under unchanged configuration may paint, and
-        never after a refresh has published.
+        Only the current read under unchanged configuration and an unchanged
+        target may paint, and never after a refresh has published.
         """
-        current = self._requests.is_current(token) and token.generation == self._generation
+        current = (
+            self._requests.is_current(token)
+            and token.generation == self._generation
+            and self._target() == self._cached_startup_target
+        )
         self._requests.finish(token)
         if not current or not sensors or not self.wants_cached_startup():
             return False
