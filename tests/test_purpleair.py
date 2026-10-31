@@ -337,6 +337,59 @@ class SensorFromValuesTest(unittest.TestCase):
         self.assertEqual([point["aqi"] for point in indoor], [146, 146, 146, 146, 146, 146, 146])
 
 
+class BooleanValueTest(unittest.TestCase):
+    base = {"sensor_index": 7, "latitude": 45.5, "longitude": -122.6, "humidity": 50}
+
+    def test_boolean_pm25_is_unavailable_not_good(self):
+        for value in (False, True):
+            with self.subTest(value=value):
+                sensor = purpleair.sensor_from_values({**self.base, "pm2.5_cf_1": value})
+                self.assertIsNone(sensor.aqi)
+                self.assertIsNone(sensor.pm25)
+
+    def test_boolean_humidity_uses_neutral_assumption(self):
+        sensor = purpleair.sensor_from_values(
+            {**self.base, "pm2.5_cf_1": 20, "humidity": True})
+        neutral = purpleair.sensor_from_values(
+            {**self.base, "pm2.5_cf_1": 20, "humidity": None})
+        self.assertIsNone(sensor.humidity)
+        self.assertEqual(sensor.aqi, neutral.aqi)
+
+    def test_boolean_metadata_and_secondary_measurements_are_missing(self):
+        for key, attribute in (("temperature", "temperature_f"), ("pm1.0", "pm1"),
+                               ("pm10.0", "pm10"), ("confidence", "confidence"),
+                               ("last_seen", "last_seen")):
+            with self.subTest(key=key):
+                sensor = purpleair.sensor_from_values({**self.base, key: True})
+                self.assertIsNone(getattr(sensor, attribute))
+        self.assertIs(
+            purpleair.sensor_from_values({**self.base, "location_type": True}).indoor, False)
+        self.assertEqual(
+            purpleair.trend_from_values(
+                {**self.base, "location_type": True, "pm2.5_60minute": 30.0}),
+            purpleair.trend_from_values(
+                {**self.base, "location_type": 0, "pm2.5_60minute": 30.0}),
+        )
+
+    def test_boolean_coordinates_drop_the_row(self):
+        for key in ("latitude", "longitude"):
+            for value in (True, False):
+                with self.subTest(key=key, value=value):
+                    self.assertIsNone(purpleair.sensor_from_values({**self.base, key: value}))
+
+    def test_boolean_trend_windows_are_unavailable(self):
+        trend = purpleair.trend_from_values(
+            {**self.base, "pm2.5_cf_1": 10.0, "pm2.5_60minute": True, "pm2.5_1week": False})
+        points = {point["label"]: point["aqi"] for point in trend}
+        self.assertIsNone(points["1h"])
+        self.assertIsNone(points["1w"])
+        self.assertIsNotNone(points["Now"])
+
+    def test_boolean_time_stamp_is_not_a_checkpoint(self):
+        result = purpleair.parse_rows({"fields": ["sensor_index"], "data": [], "time_stamp": True})
+        self.assertIsNone(result.time_stamp)
+
+
 class CapBoundsTest(unittest.TestCase):
     def test_small_view_passes_through(self):
         bounds = purpleair.bounds_around(45.5, -122.6, 20.0)

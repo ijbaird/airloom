@@ -234,7 +234,8 @@ def parse_sensor_payload(payload: dict) -> list[Sensor]:
 
 
 def _number(value) -> float | None:
-    if value is None:
+    # JSON booleans are never measurements, though Python treats them as ints.
+    if value is None or isinstance(value, bool):
         return None
     try:
         parsed = float(value)
@@ -244,7 +245,7 @@ def _number(value) -> float | None:
 
 
 def _integer(value) -> int | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
         return int(value) if _INT64_MIN <= value <= _INT64_MAX else None

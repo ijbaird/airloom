@@ -9,7 +9,7 @@ import warnings
 import weakref
 from pathlib import Path
 
-from airloom import cache
+from airloom import cache, purpleair
 from airloom.purpleair import (
     Bounds, bounds_around, DATA_FIELDS, MAP_FIELDS, FetchResult, PurpleAirError,
 )
@@ -740,6 +740,44 @@ class FetchAreaTest(CacheBase):
         self.cache.store_fetch(self.bounds, "outdoor", rows, 1754680000)
         result = cache.fetch_area(FakeClient([]), self.cache, self.bounds, "outdoor", ttl=120)
         self.assertEqual([r["sensor_index"] for r in result.rows], [1])
+
+
+class BooleanCachedValueTest(CacheBase):
+    bounds = bounds_around(45.5, -122.6, 20.0)
+
+    def test_cached_boolean_measurements_stay_unavailable(self):
+        client = FakeClient([FetchResult(
+            [row(1, **{"pm2.5_cf_1": False}), row(2, humidity=True, **{"pm2.5_cf_1": 20.0})],
+            1754680000,
+        )])
+        result = cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        neutral = purpleair.sensor_from_values(row(2, humidity=None, **{"pm2.5_cf_1": 20.0}))
+        for rows in (result.rows, self.cache.sensors_in(self.bounds)):
+            sensors = {r["sensor_index"]: purpleair.sensor_from_values(r) for r in rows}
+            self.assertIsNone(sensors[1].aqi)
+            self.assertEqual(sensors[2].aqi, neutral.aqi)
+
+    def test_boolean_coordinates_are_unresolved_and_not_stored(self):
+        self.assertEqual(self.cache.upsert_rows([row(3, lat=True)]), [3])
+        self.assertEqual(self.cache.sensors_in(self.bounds), [])
+
+    def test_boolean_last_seen_does_not_become_epoch_one(self):
+        self.clock.now = 200000.0
+        self.cache.store_fetch(self.bounds, "outdoor", [row(3, last_seen=200000)], 200000)
+        self.cache.upsert_rows([row(4, last_seen=True)])
+        observed_at = self.cache._db.execute(
+            "SELECT observed_at FROM sensors WHERE sensor_index = 4").fetchone()[0]
+        self.assertEqual(observed_at, self.clock.now)
+        self.cache.prune()
+        self.assertEqual(
+            sorted(r["sensor_index"] for r in self.cache.sensors_in(self.bounds)), [3, 4])
+        self.assertIsNotNone(self.cache.covering_region(self.bounds, "outdoor"))
+
+    def test_boolean_location_type_is_outdoor_for_filters(self):
+        self.cache.store_fetch(
+            self.bounds, "indoor", [row(5, location_type=True)], 1754680000)
+        result = cache.fetch_area(FakeClient([]), self.cache, self.bounds, "indoor", ttl=120)
+        self.assertEqual(result.rows, [])
 
 
 class FetchFavoritesTest(CacheBase):
