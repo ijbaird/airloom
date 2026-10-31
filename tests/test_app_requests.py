@@ -752,6 +752,56 @@ class TrendRequestTest(ApplicationRequestTestCase):
         self.assertNotIn(1, app.controller.trend_unsettled)
 
 
+class CoalescedQueueTest(ApplicationRequestTestCase):
+    def submit(self, app, key, job, run):
+        return app._submit_coalesced("test-kind", key, job, run, name="airloom-test")
+
+    def test_unstarted_same_key_job_is_replaced_in_place_and_keys_run_fifo(self):
+        app = self.make_app()
+        threads = ThreadQueue()
+        ran = []
+
+        with mock.patch.object(app_module.threading, "Thread", new=threads.factory):
+            for key, job in (("a", "a1"), ("b", "b1"), ("a", "a2"), ("c", "c1")):
+                self.assertTrue(self.submit(app, key, job, ran.append))
+            self.assertEqual(len(threads.threads), 1)
+            threads.threads[0].run()
+
+        self.assertEqual(ran, ["a2", "b1", "c1"])
+        self.assertEqual(app._coalesced_jobs, {})
+        self.assertEqual(app._coalesced_running, set())
+        self.assertEqual(app._active_workers, 0)
+        self.assertEqual(app._active_kinds, {})
+
+    def test_failing_job_is_reported_and_later_work_still_runs(self):
+        app = self.make_app()
+        threads = ThreadQueue()
+        ran = []
+        stderr = io.StringIO()
+
+        def run(job):
+            if job == "bad":
+                raise RuntimeError("boom")
+            ran.append(job)
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.sys, "stderr", stderr),
+        ):
+            self.submit(app, "bad", "bad", run)
+            self.submit(app, "good", "good", run)
+            threads.threads[0].run()
+            # A drained kind admits a new worker for later work.
+            self.submit(app, "later", "later", run)
+            self.assertEqual(len(threads.threads), 2)
+            threads.threads[1].run()
+
+        self.assertEqual(ran, ["good", "later"])
+        self.assertIn("test-kind job failed", stderr.getvalue())
+        self.assertIn("boom", stderr.getvalue())
+        self.assertEqual(app._active_workers, 0)
+
+
 MAIN_LOOP_BLOCK_BOUND = 0.25  # seconds; the production busy timeout is 5.0
 
 
