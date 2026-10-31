@@ -490,8 +490,7 @@
     $("#popup-aqi").style.background = sensor.color || "";
     $("#popup-aqi").style.color = sensor.foreground || "";
     $("#popup-name").textContent = sensor.name;
-    $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
-    const badge = stampProvenance("popup-provenance", sensor);
+    const badge = stampPopupAge(sensor);
     $("#popup-favorite").classList.toggle("active", Boolean(sensor.favorite));
     $("#popup-favorite").setAttribute("aria-pressed", String(Boolean(sensor.favorite)));
     const demo = badge === "Demo";
@@ -502,6 +501,12 @@
     state.popupId = sensor.id;
     positionPopup(sensor);
     if (focus) $("#popup-details").focus();
+  }
+
+  // The popup's time-derived text: its age and its provenance badge.
+  function stampPopupAge(sensor) {
+    $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
+    return stampProvenance("popup-provenance", sensor);
   }
 
   function hidePopup(restoreFocus) {
@@ -1227,6 +1232,22 @@
     if (seconds < 3600) return `Updated ${Math.round(seconds / 60)} min ago`;
     return `Updated ${Math.round(seconds / 3600)} hr ago`;
   }
+  // Re-renders only what depends on the clock (ages and Old badges), so
+  // readings age visibly between refreshes without refetching or recomputing AQI.
+  const AGE_TICK_MS = 60000;
+  function tickAges() {
+    const sensor = selectedSensor();
+    if (sensor) {
+      $("#updated-time").textContent = relativeTime(sensor.last_seen);
+      stampProvenance("detail-provenance", sensor);
+    }
+    const popupSensor = state.popupId === null ? null : visibleSensors().find((s) => s.id === state.popupId);
+    if (popupSensor) stampPopupAge(popupSensor);
+    renderSummary();
+    renderLists();
+    renderMapMarkers();
+    setTimeout(tickAges, AGE_TICK_MS);
+  }
   function escapeHtml(value) {
     return String(value).replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   }
@@ -1579,6 +1600,7 @@
   new ResizeObserver(() => renderMap()).observe($("#map-panel"));
   window.matchMedia?.(REDUCED_MOTION_QUERY)?.addEventListener?.("change", applyMotionPreference);
   applyMotionPreference();
+  setTimeout(tickAges, AGE_TICK_MS);
   bridge({ action: "ready" });
   // Makes the interface directly previewable in an ordinary browser while the
   // desktop build continues to receive its state from the Python bridge.

@@ -314,9 +314,9 @@ function loadApp({ reducedMotion = false, preview = false, nowMs } = {}) {
       return id;
     },
     cancelAnimationFrame: (id) => animationFrames.delete(id),
-    setTimeout: (callback) => {
+    setTimeout: (callback, delay) => {
       const id = nextTimer++;
-      timers.set(id, callback);
+      timers.set(id, { callback, delay });
       return id;
     },
     clearTimeout: (id) => timers.delete(id),
@@ -358,8 +358,9 @@ function loadApp({ reducedMotion = false, preview = false, nowMs } = {}) {
     runTimers() {
       const pending = [...timers.values()];
       timers.clear();
-      for (const callback of pending) callback();
+      for (const { callback } of pending) callback();
     },
+    timerDelays() { return [...timers.values()].map(({ delay }) => delay); },
     runAnimationFrames(now) {
       const pending = [...animationFrames.values()];
       animationFrames.clear();
@@ -1324,6 +1325,46 @@ test("a favorite row that shares an area id selects the favorite's own reading",
   assert.equal(app.elements.get("ui-status").textContent, "Sensor 1. AQI 21, Fixture. Stale.");
   assert.equal(popupBadge(app, 1), "Stale", "map markers keep the area reading");
   assert.equal(app.elements.get("detail-provenance").textContent, "Stale");
+});
+
+test("relative ages tick every minute without refetching", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  receiveSensors(app, [fixtureSensor(1, { last_seen: NOW_S - 30, aqi: 42 })]);
+  rowFor(app, "sensor-list", 1).click();
+  assert.equal(app.elements.get("updated-time").textContent, "Updated just now");
+  assert.ok(app.timerDelays().includes(60000));
+  const posted = app.messages.length;
+
+  // Exactly 600 s after the reading, which the product rounds to 10 min.
+  app.setNow((NOW_S - 30 + 600) * 1000);
+  app.runTimers();
+
+  assert.equal(app.elements.get("updated-time").textContent, "Updated 10 min ago");
+  assert.equal(app.elements.get("aqi-number").textContent, "42");
+  const refetches = app.messages.slice(posted).filter((message) => ["refresh", "select", "ready"].includes(message.action));
+  assert.deepEqual(refetches, []);
+  assert.ok(app.timerDelays().includes(60000));
+});
+
+test("the minute tick flips a reading to Old across the 2-hour boundary", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  receiveSensors(app, [fixtureSensor(1, { last_seen: NOW_S - 30, aqi: 42 })]);
+  rowFor(app, "sensor-list", 1).click();
+  markerFor(app, 1).click();
+  assert.equal(app.elements.get("detail-provenance").hidden, true);
+  assert.equal(app.elements.get("popup-provenance").hidden, true);
+
+  app.setNow((NOW_S - 30 + 7201) * 1000);
+  app.runTimers();
+
+  assert.equal(app.elements.get("detail-provenance").textContent, "Old");
+  assert.equal(app.elements.get("popup-provenance").textContent, "Old");
+  assert.match(markerFor(app, 1).getAttribute("aria-label"), / · Old$/);
+  assert.match(rowFor(app, "sensor-list", 1).innerHTML, /class="provenance-badge"[^>]*>Old</);
 });
 
 test("in-interval cached and live readings carry no badge", () => {
