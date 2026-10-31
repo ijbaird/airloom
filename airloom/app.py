@@ -1561,32 +1561,55 @@ class AirloomApplication(Adw.Application):
         if update is None:
             return GLib.SOURCE_REMOVE
         if update.store and self.cache is not None:
-            self._queue_trend_write(sensor_id, trend)
+            self._queue_trend_write(sensor_id, trend, reading_last_seen)
         if update.sensor_changed:
             self._send_sensor_state()
         self._send_trend_state(sensor_id, token, update.status, reading_last_seen, trend)
         return GLib.SOURCE_REMOVE
 
-    def _queue_trend_write(self, sensor_id: int, trend: list) -> None:
-        """Persist a live trend on the trend-cache worker, newest per sensor."""
-        self._submit_coalesced(
+    def _queue_trend_write(
+        self, sensor_id: int, trend: list, reading_last_seen: int | None = None
+    ) -> None:
+        """Persist a live trend on the trend-cache worker, newest per sensor.
+
+        Until the write settles, the controller holds the accepted trend so a
+        reselection of that reading is answered without another paid fetch.
+        """
+        generation = self.controller.credential_generation
+        if self._submit_coalesced(
             "trend-cache",
             sensor_id,
-            (sensor_id, trend, self.controller.credential_generation),
+            (sensor_id, trend, generation, reading_last_seen),
             self._write_trend,
             name="airloom-trend-cache",
-        )
+        ):
+            self.controller.hold_trend(sensor_id, reading_last_seen, generation, trend)
 
     def _write_trend(self, job) -> None:
         """Worker: store one trend unless its key has since been revoked."""
-        sensor_id, trend, generation = job
+        sensor_id, trend, generation, reading_last_seen = job
         cache = self.cache
-        if cache is None or generation != self.controller.credential_generation:
-            return
+        error = None
         try:
-            cache.store_trend(sensor_id, trend)
+            if cache is not None and generation == self.controller.credential_generation:
+                cache.store_trend(sensor_id, trend)
         except Exception as exc:  # noqa: BLE001 — live data remains valid
-            GLib.idle_add(self._report_trend_cache_error, str(exc))
+            error = str(exc)
+        GLib.idle_add(
+            self._settle_trend_write, sensor_id, reading_last_seen, generation, error
+        )
+
+    def _settle_trend_write(
+        self,
+        sensor_id: int,
+        reading_last_seen: int | None,
+        generation: int,
+        error: str | None,
+    ) -> bool:
+        self.controller.settle_trend(sensor_id, reading_last_seen, generation)
+        if error is not None:
+            self._report_trend_cache_error(error)
+        return GLib.SOURCE_REMOVE
 
     def _report_trend_cache_error(self, message: str) -> bool:
         if not self._shutting_down:

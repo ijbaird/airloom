@@ -648,6 +648,109 @@ class TrendRequestTest(ApplicationRequestTestCase):
         self.assertNotIn(5, app._trend_inflight)
         client_type.assert_not_called()
 
+    def run_queued(self, threads, idles, ran, *, hold=None):
+        """Run each queued thread and idle callback not yet run, except ``hold``.
+
+        Repeats until nothing new is queued, so follow-on work runs too.
+        """
+        while True:
+            fresh = [
+                thread for thread in threads.threads
+                if thread is not hold and id(thread) not in ran["threads"]
+            ]
+            if not fresh and ran["idles"] == len(idles.callbacks):
+                return
+            for thread in fresh:
+                ran["threads"].add(id(thread))
+                thread.run()
+            while ran["idles"] < len(idles.callbacks):
+                ran["idles"] += 1
+                idles.run(ran["idles"] - 1)
+
+    def test_reselecting_a_reading_before_its_cache_write_settles_never_refetches(self):
+        trend = [{"label": "Now", "aqi": 50}]
+        with tempfile.TemporaryDirectory() as directory:
+            cache = SensorCache(Path(directory) / "cache.db")
+            self.addCleanup(cache.close)
+            app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+            app.cache = cache
+            threads, idles = ThreadQueue(), IdleQueue()
+            ran = {"threads": set(), "idles": 0}
+            client = mock.Mock()
+            client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+            with (
+                mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+                mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+                mock.patch.object(app_module, "PurpleAirClient", return_value=client),
+                mock.patch.object(app_module, "trend_from_values", return_value=trend),
+            ):
+                # Worker A fetches and completes; its cache write is queued.
+                app._ensure_trend(1)
+                threads.threads[0].run()
+                ran["threads"].add(id(threads.threads[0]))
+                idles.run(0)
+                ran["idles"] = 1
+                writer = threads.threads[1]
+                first_id = self.trend_events(app)[0]["request_id"]
+
+                # Reselect the same reading while the writer is held.
+                app._ensure_trend(1)
+                self.run_queued(threads, idles, ran, hold=writer)
+
+                self.assertEqual(client.fetch_rows.call_count, 1)
+                second = self.trend_events(app)[-1]
+                self.assertEqual(second["status"], "loaded")
+                self.assertEqual(second["trend"], trend)
+                self.assertEqual(second["reading_last_seen"], 1234)
+                self.assertNotEqual(second["request_id"], first_id)
+                self.assertIn(1, app.controller.trend_unsettled)
+
+                # Releasing the writer settles and clears the entry.
+                self.run_queued(threads, idles, ran)
+                self.assertNotIn(1, app.controller.trend_unsettled)
+                self.assertEqual(cache.get_trend(1, 600), trend)
+
+                # Persisted now: a further selection is a cache hit, not a fetch.
+                app._ensure_trend(1)
+                self.run_queued(threads, idles, ran)
+            self.assertEqual(client.fetch_rows.call_count, 1)
+            self.assertEqual(self.trend_events(app)[-1]["status"], "loaded")
+
+    def test_credential_change_revokes_an_unsettled_trend(self):
+        trend = [{"label": "Now", "aqi": 50}]
+        app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+        threads, idles = ThreadQueue(), IdleQueue()
+        client = mock.Mock()
+        client.fetch_rows.return_value = FetchResult([{"sensor_index": 1}], 1)
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "PurpleAirClient", return_value=client),
+            mock.patch.object(app_module, "trend_from_values", return_value=trend),
+        ):
+            app._ensure_trend(1)
+            threads.threads[0].run()
+            idles.run(0)
+            writer = threads.threads[1]
+            app._save_settings(
+                {**TransactionalActionTest.settings_message(), "api_key": "replacement-key"}
+            )
+            self.assertNotIn(1, app.controller.trend_unsettled)
+
+            app._ensure_trend(1)
+            # Not served from memory: a fresh worker is admitted under the new key.
+            self.assertEqual(self.trend_events(app)[-1]["status"], "loading")
+            self.assertIn(1, app._trend_inflight)
+            writer.run()
+            for index in range(1, len(idles.callbacks)):
+                idles.run(index)
+
+        # The revoked write was skipped and its settlement cleared nothing new.
+        self.assertEqual(app.cache.stored, [])
+        self.assertNotIn(1, app.controller.trend_unsettled)
+
 
 MAIN_LOOP_BLOCK_BOUND = 0.25  # seconds; the production busy timeout is 5.0
 

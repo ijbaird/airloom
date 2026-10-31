@@ -92,8 +92,9 @@ class AlertDecision:
 
 @dataclass(frozen=True)
 class TrendPlan:
-    # "idle" (no such sensor), "local" (demo/no key: publish sensor.trend),
-    # or "remote" (consult the trend cache, then fetch).
+    # "idle" (no such sensor), "local" (publish ``trend`` now: demo/no key, or
+    # an accepted result whose cache write is unsettled), or "remote"
+    # (consult the trend cache, then fetch).
     kind: str
     sensor_id: int
     token: RequestToken
@@ -236,6 +237,10 @@ class ApplicationController:
         self.coverage: dict | None = None
         # Trend work by sensor: token, reading last_seen, credential generation.
         self.trend_inflight: dict[int, tuple[RequestToken, int | None, int]] = {}
+        # Accepted trends whose cache write has not settled, by sensor: reading
+        # last_seen, credential generation, trend. Until the write lands, these
+        # (not a cache miss) answer a reselection, so no second fetch is billed.
+        self.trend_unsettled: dict[int, tuple[int | None, int, list]] = {}
         # Advanced by each committed API key change or clear. The lock orders
         # each key commit against trend_credential, never across network I/O.
         self._credential_generation = 0
@@ -738,6 +743,14 @@ class ApplicationController:
             self._requests.finish(token)
             status = "loaded" if sensor.trend else "unavailable"
             return TrendPlan("local", sensor_id, token, reading_last_seen, status, sensor.trend)
+        held = self.trend_unsettled.get(sensor_id)
+        if held is not None:
+            if held[:2] == (reading_last_seen, self._credential_generation):
+                self._requests.finish(token)
+                sensor.trend = held[2]
+                return TrendPlan("local", sensor_id, token, reading_last_seen, "loaded", held[2])
+            # A newer reading supersedes the held result.
+            del self.trend_unsettled[sensor_id]
         return TrendPlan(
             "remote",
             sensor_id,
@@ -813,6 +826,18 @@ class ApplicationController:
         if loaded:
             sensor.trend = trend
         return TrendUpdate(status, trend, store=loaded and not cached, sensor_changed=changed)
+
+    def hold_trend(
+        self, sensor_id: int, reading_last_seen: int | None, generation: int, trend: list
+    ) -> None:
+        """Keep an accepted trend authoritative until its queued write settles."""
+        self.trend_unsettled[sensor_id] = (reading_last_seen, generation, trend)
+
+    def settle_trend(self, sensor_id: int, reading_last_seen: int | None, generation: int) -> None:
+        """A write settled (stored, skipped, or failed); release its hold only."""
+        held = self.trend_unsettled.get(sensor_id)
+        if held is not None and held[:2] == (reading_last_seen, generation):
+            del self.trend_unsettled[sensor_id]
 
     # -- Preference transactions --------------------------------------------
     # Each builds a candidate from committed configuration, persists it, and
@@ -967,6 +992,7 @@ class ApplicationController:
                 for sensor_id in self.trend_inflight:
                     self._requests.invalidate(f"trend:{sensor_id}")
                 self.trend_inflight.clear()
+                self.trend_unsettled.clear()
         home_mode = updates["home_mode"]
         return SettingsResult(
             "success",

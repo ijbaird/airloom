@@ -820,6 +820,40 @@ class TrendDecisionTest(unittest.TestCase):
                 # Neither the old key nor its replacement is spent on a revoked plan.
                 self.assertIsNone(h.controller.trend_credential(plan))
 
+    def test_unsettled_trend_serves_only_its_reading_and_credential(self):
+        trend = [{"label": "Now", "aqi": 9}]
+        h = Harness()
+        sensor = reading(1, last_seen=100)
+        h.controller.sensors = [sensor]
+        plan = h.controller.begin_trend(1)
+        h.controller.track_trend(plan)
+        h.controller.finish_trend(1, 100, plan.token, trend, False)
+        h.controller.hold_trend(1, 100, h.controller.credential_generation, trend)
+
+        served = h.controller.begin_trend(1)
+        self.assertEqual((served.kind, served.status, served.trend), ("local", "loaded", trend))
+        self.assertFalse(h.requests.is_current(served.token))
+
+        # Settling an older write leaves a newer hold in place.
+        h.controller.settle_trend(1, 99, h.controller.credential_generation)
+        self.assertIn(1, h.controller.trend_unsettled)
+        h.controller.settle_trend(1, 100, h.controller.credential_generation)
+        self.assertNotIn(1, h.controller.trend_unsettled)
+        self.assertEqual(h.controller.begin_trend(1).kind, "remote")
+
+        # A newer reading supersedes the hold instead of being served by it.
+        h.controller.hold_trend(1, 100, h.controller.credential_generation, trend)
+        sensor.last_seen = 200
+        self.assertEqual(h.controller.begin_trend(1).kind, "remote")
+        self.assertNotIn(1, h.controller.trend_unsettled)
+
+        # A credential change revokes the hold.
+        sensor.last_seen = 100
+        h.controller.hold_trend(1, 100, h.controller.credential_generation, trend)
+        h.controller.save_settings({**PreferenceTransactionTest.SETTINGS, "api_key": "new"})
+        self.assertNotIn(1, h.controller.trend_unsettled)
+        self.assertEqual(h.controller.begin_trend(1).kind, "remote")
+
 
 class LifecycleTest(unittest.TestCase):
     def test_shutdown_rejects_new_work_and_invalidates_callbacks(self):
