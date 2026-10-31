@@ -1751,10 +1751,17 @@ test("the minute tick flips a reading to Old across the 2-hour boundary", () => 
   markerFor(app, 1).click();
   assert.equal(app.elements.get("detail-provenance").hidden, true);
   assert.equal(app.elements.get("popup-provenance").hidden, true);
+  // The area reading is in view, so the summary displays it.
+  assert.equal(app.elements.get("summary-aqi").textContent, "42");
+  assert.equal(app.elements.get("summary-provenance").hidden, true);
+  assert.match(app.elements.get("popup-meta").textContent, /Updated just now/);
 
   app.setNow((NOW_S - 30 + 7201) * 1000);
   app.runTimers();
 
+  assert.equal(app.elements.get("summary-provenance").hidden, false);
+  assert.equal(app.elements.get("summary-provenance").textContent, "Old");
+  assert.match(app.elements.get("popup-meta").textContent, /Updated 2 hr ago/);
   assert.equal(app.elements.get("detail-provenance").textContent, "Old");
   assert.equal(app.elements.get("popup-provenance").textContent, "Old");
   assert.match(markerFor(app, 1).getAttribute("aria-label"), / · Old$/);
