@@ -1371,6 +1371,29 @@ LAYOUT_STATES_JS = {
     })()""",
 }
 
+HOME_PLACE_ROW_JS = r"""
+(() => {
+  const dialog = document.querySelector("#settings-dialog");
+  if (dialog.open) dialog.close();
+  window.Airloom.receive("open-settings");
+  const form = document.querySelector("#settings-form");
+  const row = document.querySelector("#home-place-row");
+  const shown = () => ({ display: getComputedStyle(row).display, boxes: row.getClientRects().length });
+  const choose = (mode) => {
+    const radio = form.querySelector(`input[name="home_mode"][value="${mode}"]`);
+    radio.checked = true;
+    radio.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+  const out = { mode: form.elements.home_mode.value, auto: shown() };
+  choose("fixed");
+  out.fixed = shown();
+  choose("auto");
+  out.autoAgain = shown();
+  dialog.close();
+  return JSON.stringify(out);
+})()
+"""
+
 PREVIEW_ACTIONS_JS = r"""
 (() => {
   const out = {};
@@ -1585,6 +1608,9 @@ def layout_child(cases: list[dict]) -> int:
             pump(0.3)
             measured = json.loads(run_js(webview, LAYOUT_MEASURE_JS))
             print(json.dumps({**case, "state": name, "outcome": outcome, **measured}), flush=True)
+        home_row = json.loads(run_js(webview, HOME_PLACE_ROW_JS))
+        pump(0.2)
+        print(json.dumps({**case, "state": "home-place-row", "homeRow": home_row}), flush=True)
         if mode == "preview":
             # Computed style alone can't prove a native control renders it:
             # sample the painted background of each Preferences field.
@@ -1648,6 +1674,15 @@ def scenario_layouts(root: Path):
     for row in rows:
         theme_label = " dark" if row.get("theme") == "dark" else ""
         label = f"{row['mode']} {row['width']}px at {row['scale']}x{theme_label} [{row['state']}]"
+        if row["state"] == "home-place-row":
+            home_row = row["homeRow"]
+            expect(home_row["mode"] == "auto", f"{label}: Preferences opens in automatic location mode")
+            for key in ("auto", "autoAgain"):
+                expect(home_row[key]["display"] == "none" and home_row[key]["boxes"] == 0,
+                       f"{label}: fixed-home place row is hidden in automatic mode ({key}: {home_row[key]})")
+            expect(home_row["fixed"]["display"] != "none" and home_row["fixed"]["boxes"] > 0,
+                   f"{label}: fixed-home place row shows in fixed mode ({home_row['fixed']})")
+            continue
         if row["state"] == "preview-actions":
             actions = row["actions"]
             expect("refreshed locally" in actions["refresh"], f"{label}: preview Refresh works without a bridge")

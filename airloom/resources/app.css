@@ -211,6 +211,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: calc(13px * var(--interface-scale)); }
 .form-grid > label:not(.checkbox) { display: flex; flex-direction: column; gap: calc(6px * var(--interface-scale)); color: var(--muted); font-size: calc(11px * var(--interface-scale)); font-weight: 650; }
 .form-grid .wide { grid-column: 1 / -1; }
+#home-place-row[hidden] { display: none; }
 .form-grid input[type="text"], .form-grid input[type="password"], .form-grid input[type="number"], .form-grid input[type="search"], .form-grid select { width: 100%; height: calc(39px * var(--interface-scale)); padding: 0 calc(10px * var(--interface-scale)); border: 1px solid var(--line); border-radius: calc(9px * var(--interface-scale)); outline: none; background: var(--soft); color: var(--ink); }
 /* Disabled (browser preview only): muted text on the dialog surface keeps
    at least 4.5:1 in both themes, unlike muted text on --soft. */

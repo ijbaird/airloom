@@ -2193,6 +2193,12 @@ test("fixed-home search input shares the form input styling", () => {
   }
 });
 
+test("the fixed-home place row stays hidden while its hidden attribute is set", () => {
+  // `.form-grid > label:not(.checkbox)` sets display: flex, which beats the UA [hidden] rule.
+  assert.equal(cssDeclaration(".form-grid > label:not(.checkbox)", "display"), "flex");
+  assert.equal(cssDeclaration("#home-place-row[hidden]", "display"), "none");
+});
+
 test("preview Save ignores unimplemented settings", () => {
   const app = loadApp({ preview: true });
   app.runTimers();
