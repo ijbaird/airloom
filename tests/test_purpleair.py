@@ -73,16 +73,22 @@ class PurpleAirTest(unittest.TestCase):
             '{"fields": ["sensor_index", "latitude", "longitude", "humidity", "pm2.5_cf_1", "last_seen"],'
             ' "data": [[10, 45.0, -122.0, 50, Infinity, 1700000000],'
             '          [11, 45.1, -122.1, NaN, 20, "xyz"],'
-            '          ["abc", 45.2, -122.2, 50, 20, 1700000000],'
-            '          [13, 45.3, -122.3, 50, 20]]}'
+            '          ["abc", 45.2, -122.2, 50, 20, 1700000000]]}'
         )
         sensors = parse_sensor_payload(payload)
         by_id = {sensor.sensor_id: sensor for sensor in sensors}
-        self.assertEqual(sorted(by_id), [10, 11, 13])  # "abc" row dropped
+        self.assertEqual(sorted(by_id), [10, 11])  # "abc" row dropped
         self.assertIsNone(by_id[10].aqi)  # Infinity pm2.5 -> no reading
         self.assertIsNone(by_id[11].last_seen)  # bad last_seen tolerated
         self.assertIsNotNone(by_id[11].aqi)  # NaN humidity -> neutral default
-        self.assertIsNotNone(by_id[13].aqi)  # short row tolerated
+
+    def test_short_row_is_rejected_not_tolerated(self):
+        payload = {
+            "fields": ["sensor_index", "latitude", "longitude", "humidity", "pm2.5_cf_1", "last_seen"],
+            "data": [[10, 45.0, -122.0, 50, 20, 1700000000], [13, 45.3, -122.3, 50, 20]],
+        }
+        with self.assertRaises(PurpleAirError):
+            parse_sensor_payload(payload)
 
     def test_string_sensor_index_is_coerced(self):
         payload = {"fields": ["sensor_index", "latitude", "longitude"], "data": [["42", 45.0, -122.0]]}
@@ -102,7 +108,7 @@ class PurpleAirTest(unittest.TestCase):
             captured["url"] = request.full_url
             import io
             return mock.MagicMock(
-                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __enter__=lambda s: io.StringIO(json.dumps({"fields": list(purpleair.MAP_FIELDS), "data": []})),
                 __exit__=lambda s, *a: False,
             )
 
@@ -119,7 +125,7 @@ class PurpleAirTest(unittest.TestCase):
             captured["url"] = request.full_url
             import io
             return mock.MagicMock(
-                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __enter__=lambda s: io.StringIO(json.dumps({"fields": list(purpleair.MAP_FIELDS), "data": []})),
                 __exit__=lambda s, *a: False,
             )
 
@@ -143,7 +149,7 @@ class PurpleAirTest(unittest.TestCase):
             captured["url"] = request.full_url
             import io
             return mock.MagicMock(
-                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __enter__=lambda s: io.StringIO(json.dumps({"fields": list(purpleair.MAP_FIELDS), "data": []})),
                 __exit__=lambda s, *a: False,
             )
 
@@ -217,7 +223,7 @@ class FetchRowsTest(unittest.TestCase):
         return captured["url"], result
 
     def test_modified_since_and_fields_in_query(self):
-        payload = {"fields": ["sensor_index", "pm2.5_cf_1"], "data": [], "time_stamp": 1754680000}
+        payload = {"fields": list(purpleair.DATA_FIELDS), "data": [], "time_stamp": 1754680000}
         url, result = self._fetch_rows_with_payload(
             payload,
             bounds=Bounds(46.0, -123.0, 45.0, -122.0),
@@ -236,9 +242,56 @@ class FetchRowsTest(unittest.TestCase):
             "data": [[7, 4.0, 40], [8, 9.0, 55]],
             "time_stamp": 1754680000,
         }
-        _, result = self._fetch_rows_with_payload(payload, bounds=Bounds(46.0, -123.0, 45.0, -122.0))
+        _, result = self._fetch_rows_with_payload(
+            payload, bounds=Bounds(46.0, -123.0, 45.0, -122.0),
+            fields=("sensor_index", "pm2.5_cf_1", "humidity"))
         self.assertEqual(result.rows[0]["sensor_index"], 7)
         self.assertEqual(result.rows[1]["humidity"], 55)
+
+
+class ResponseValidationTest(unittest.TestCase):
+    BOUNDS = Bounds(46.0, -123.0, 45.0, -122.0)
+
+    def _fetch(self, payload, **kwargs):
+        return FetchRowsTest._fetch_rows_with_payload(
+            self, payload, clock=lambda: NOW, bounds=self.BOUNDS, **kwargs)[1]
+
+    def _assert_rejected(self, payload, **kwargs):
+        with self.assertRaises(PurpleAirError):
+            self._fetch(payload, **kwargs)
+
+    def test_short_row_rejects_whole_response(self):
+        self._assert_rejected(
+            {"fields": list(purpleair.DATA_FIELDS), "data": [[1, NOW]], "time_stamp": NOW},
+            fields=purpleair.DATA_FIELDS)
+
+    def test_long_row_rejects_whole_response(self):
+        self._assert_rejected(
+            {"fields": list(purpleair.MAP_FIELDS), "data": [map_row(1), [*map_row(2), 99]]})
+
+    def test_non_list_row_rejects_whole_response(self):
+        self._assert_rejected({"fields": list(purpleair.MAP_FIELDS), "data": [map_row(1), "junk"]})
+
+    def test_missing_requested_measurement_field_rejects_response(self):
+        fields = [field for field in purpleair.MAP_FIELDS if field != "pm2.5_cf_1"]
+        rows = [[value for field, value in zip(purpleair.MAP_FIELDS, map_row(1))
+                 if field != "pm2.5_cf_1"]]
+        self._assert_rejected({"fields": fields, "data": rows})
+
+    def test_missing_sensor_index_rejects_response(self):
+        self._assert_rejected({"fields": list(purpleair.MAP_FIELDS[1:]), "data": [map_row(1)[1:]]})
+
+    def test_non_string_field_name_rejects_response(self):
+        self._assert_rejected({"fields": [*purpleair.MAP_FIELDS[:-1], 5], "data": [map_row(1)]})
+
+    def test_omitted_metadata_is_not_required_for_delta(self):
+        result = self._fetch(
+            {"fields": list(purpleair.DATA_FIELDS),
+             "data": [[1, NOW, 50, 70, 1.0, 4.0, 5.0, 99]], "time_stamp": NOW},
+            fields=purpleair.DATA_FIELDS)
+        self.assertEqual(result.rows[0]["sensor_index"], 1)
+        self.assertEqual(result.rows[0]["last_seen"], NOW)
+        self.assertEqual(result.time_stamp, NOW)
 
 
 class FutureTimestampTest(unittest.TestCase):

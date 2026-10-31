@@ -64,6 +64,12 @@ TREND_FIELDS = (
     ("10m", "pm2.5_10minute"),
     ("Now", "pm2.5_cf_1"),
 )
+# Fields whose values describe one observation; a response that drops a
+# requested one could pair an old reading with a new last_seen.
+MEASUREMENT_FIELDS = frozenset(
+    {"last_seen", "humidity", "temperature", "pm1.0", "pm2.5_cf_1", "pm10.0", "confidence"}
+    | {key for _, key in TREND_FIELDS}
+)
 
 
 MAX_FETCH_SPAN_KM = 200.0
@@ -142,7 +148,7 @@ class PurpleAirClient:
         except Exception as exc:
             raise PurpleAirError(f"PurpleAir request failed: {exc}") from exc
         try:
-            return parse_rows(payload, now=self.clock())
+            return parse_rows(payload, fields, now=self.clock())
         except PurpleAirError:
             raise
         except Exception as exc:
@@ -161,7 +167,10 @@ class PurpleAirClient:
 def parse_rows(payload: dict, requested: tuple[str, ...] | None = None, *,
                now: float | None = None) -> FetchResult:
     """Pair each data row with its field names. Observation times and the
-    checkpoint stamp too far in the future to be clock skew become missing."""
+    checkpoint stamp too far in the future to be clock skew become missing.
+
+    A response whose rows don't match its field list, or that omits
+    `sensor_index` or a requested measurement field, is rejected whole."""
     if now is None:
         now = time.time()
     if not isinstance(payload, dict):
@@ -171,7 +180,17 @@ def parse_rows(payload: dict, requested: tuple[str, ...] | None = None, *,
     if not isinstance(fields, list) or not isinstance(rows, list):
         message = payload.get("description") or payload.get("error") or "Unexpected PurpleAir response."
         raise PurpleAirError(str(message))
-    values_list = [dict(zip(fields, row, strict=False)) for row in rows if isinstance(row, list)]
+    if (
+        not all(isinstance(field, str) for field in fields)
+        or not all(isinstance(row, list) and len(row) == len(fields) for row in rows)
+    ):
+        raise PurpleAirError("PurpleAir response rows do not match its fields.")
+    if requested is not None:
+        missing = ({"sensor_index"} | (set(requested) & MEASUREMENT_FIELDS)) - set(fields)
+        if missing:
+            raise PurpleAirError(
+                f"PurpleAir response omitted requested fields: {', '.join(sorted(missing))}.")
+    values_list = [dict(zip(fields, row, strict=True)) for row in rows]
     for values in values_list:
         if "last_seen" in values:
             values["last_seen"] = plausible_observation_time(_integer(values["last_seen"]), now)

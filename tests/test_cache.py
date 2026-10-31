@@ -12,7 +12,7 @@ import weakref
 from pathlib import Path
 from unittest import mock
 
-from airloom import cache, purpleair
+from airloom import cache, presentation, purpleair
 from airloom.purpleair import (
     Bounds, bounds_around, DATA_FIELDS, MAP_FIELDS, FetchResult, PurpleAirClient,
     PurpleAirError,
@@ -867,6 +867,82 @@ class FutureObservationTest(CacheBase):
         self.assertEqual(len(urls), 2)
         self.assertNotIn("modified_since", urls[1])
         self.assertIn("latitude", urls[1].split("fields=")[1].split("&")[0])
+
+
+class MalformedResponseTest(CacheBase):
+    def setUp(self):
+        super().setUp()
+        self.bounds = bounds_around(45.5, -122.6, 20.0)
+
+    def _region(self):
+        return self.cache._db.execute(
+            "SELECT COUNT(*), MAX(fetched_at) FROM regions").fetchone()
+
+    def test_short_delta_row_cannot_refresh_old_measurement_or_alert(self):
+        self.clock.now = 100000.0
+        self.cache.store_fetch(self.bounds, "outdoor", [
+            row(1, humidity=50, last_seen=100000, **{"pm2.5_cf_1": 100.0})], 100000)
+        self.clock.now = 110000.0
+        client = PurpleAirClient("key", clock=self.clock)
+        payload = {"fields": list(DATA_FIELDS), "data": [[1, 110000]], "time_stamp": 110000}
+        with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen([payload], [])):
+            with self.assertRaises(PurpleAirError):
+                cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+        rows = self.cache.sensors_in(self.bounds)
+        self.assertEqual(rows[0]["last_seen"], 100000)
+        self.assertEqual(rows[0]["pm2.5_cf_1"], 100.0)
+        region = self.cache.covering_region(self.bounds, "outdoor")
+        self.assertEqual(region.api_time_stamp, 100000)
+        self.assertEqual(region.fetched_at, 100000.0)
+        sensors = [purpleair.sensor_from_values(r, now=110000) for r in rows]
+        self.assertEqual(
+            presentation.alert_transitions(
+                sensors, favorites={1}, previous={}, threshold=101, now=110000, origin="live"),
+            ([], {}))
+
+    def test_malformed_full_snapshot_preserves_cache_and_checkpoint(self):
+        self.clock.now = 100000.0
+        self.cache.store_fetch(self.bounds, "outdoor", [
+            row(1, last_seen=100000), row(2, last_seen=100000)], None)
+        self.clock.now += 300
+        client = PurpleAirClient("key", clock=self.clock)
+        payloads = {
+            "non-list row": {"fields": list(MAP_FIELDS), "data": ["not a row"]},
+            "short row": {"fields": list(MAP_FIELDS), "data": [[1, "S1"]]},
+            "empty fields": {"fields": [], "data": []},
+        }
+        for label, payload in payloads.items():
+            with self.subTest(label):
+                urls = []
+                with mock.patch("airloom.purpleair.urlopen",
+                                side_effect=fake_urlopen([payload], urls)):
+                    with self.assertRaises(PurpleAirError):
+                        cache.fetch_area(client, self.cache, self.bounds, "outdoor", ttl=120)
+                self.assertNotIn("modified_since", urls[0])
+                self.assertEqual(
+                    sorted(r["sensor_index"] for r in self.cache.sensors_in(self.bounds)), [1, 2])
+                self.assertEqual(self._region(), (1, 100000.0))
+
+    def test_partial_upsert_never_dates_retained_measurement(self):
+        self.clock.now = 100000.0
+        self.cache.store_fetch(self.bounds, "outdoor", [
+            row(1, last_seen=100000, **{"pm2.5_cf_1": 100.0})], 100000)
+        self.clock.now = 100500.0
+        self.cache.upsert_rows([{"sensor_index": 1, "last_seen": 100500}])
+        stored = self.cache.sensors_in(self.bounds)[0]
+        self.assertEqual(stored["last_seen"], 100500)
+        self.assertIsNone(stored["pm2.5_cf_1"])
+        self.assertIsNone(purpleair.sensor_from_values(stored, now=100500).aqi)
+
+    def test_row_without_last_seen_merges_onto_existing_measurements(self):
+        self.clock.now = 100000.0
+        self.cache.store_fetch(self.bounds, "outdoor", [
+            row(1, last_seen=100000, **{"pm2.5_cf_1": 100.0})], 100000)
+        self.cache.upsert_rows([{"sensor_index": 1, "humidity": 60}])
+        stored = self.cache.sensors_in(self.bounds)[0]
+        self.assertEqual(stored["last_seen"], 100000)
+        self.assertEqual(stored["pm2.5_cf_1"], 100.0)
+        self.assertEqual(stored["humidity"], 60)
 
 
 class FetchFavoritesTest(CacheBase):

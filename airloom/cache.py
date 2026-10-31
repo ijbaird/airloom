@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .purpleair import (
-    Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, FetchResult,
-    PurpleAirError, _integer, _number,
+    Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, MEASUREMENT_FIELDS,
+    FetchResult, PurpleAirError, _integer, _number,
 )
 from .models import FUTURE_SKEW_TOLERANCE, plausible_observation_time
 from .validation import sensor_id
@@ -219,11 +219,17 @@ class SensorCache:
             cursor = self._db.execute(
                 "SELECT data, observed_at FROM sensors WHERE sensor_index = ?", (normalized_id,))
             existing = cursor.fetchone()
-            merged = dict(json.loads(existing[0])) if existing else {}
+            previous = json.loads(existing[0]) if existing else {}
+            merged = dict(previous)
             merged.update(values)
             if "last_seen" in values:
-                merged["last_seen"] = plausible_observation_time(
-                    _integer(values["last_seen"]), now)
+                observed = plausible_observation_time(_integer(values["last_seen"]), now)
+                merged["last_seen"] = observed
+                # A new observation time must never date a retained old reading.
+                if observed is not None and observed != _integer(previous.get("last_seen")):
+                    for key in MEASUREMENT_FIELDS - {"last_seen"}:
+                        if key in previous and key not in values:
+                            merged[key] = None
             merged["sensor_index"] = normalized_id
             coordinates = _coordinates(merged)
             if coordinates is None:
