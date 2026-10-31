@@ -293,6 +293,8 @@
     renderAll();
     reconcilePopup();
     if ($("#settings-dialog").open) renderHiddenList();
+    // A publication also answers the header-bar Refresh.
+    retryFailedTiles();
   }
 
   function renderAll() {
@@ -797,7 +799,13 @@
     canvas.hidden = false;
   }
 
-  let tileLayer = { zoom: null, tiles: new Map(), pending: 0 };
+  function newTileLayer(zoom) {
+    return { zoom, tiles: new Map(), pending: 0, failures: new Map(), retryTimer: null };
+  }
+
+  let tileLayer = newTileLayer(null);
+  const TILE_RETRY_BASE_MS = 2000;
+  const TILE_RETRY_MAX_MS = 60000;
   const MARKER_CULL_PAD = 300; // generous cull margin so mid-pan gaps are rare
 
   function tileZoomLevel() { return Math.max(3, Math.min(17, Math.round(state.zoom))); }
@@ -853,6 +861,69 @@
     if (tiles.length && tiles.every((img) => img.classList.contains("loaded"))) clearRetiredTiles();
   }
 
+  function requestTile(owner, key, tx, ty, tz) {
+    const maxTile = 2 ** tz;
+    const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
+    const img = document.createElement("img");
+    img.className = "tile";
+    img.draggable = false;
+    img.alt = "";
+    // Settle against `owner`, the layer this tile belongs to: tileLayer gets
+    // reassigned wholesale on a zoom-level change, and a stale in-flight load
+    // must decrement its own (possibly retired) layer's counter, not
+    // whatever layer happens to be current when it fires.
+    owner.pending++;
+    img.dataset.pending = "true";
+    const settle = (loaded) => {
+      if (loaded) {
+        img.classList.add("loaded");
+        owner.failures.delete(key);
+      } else {
+        img.dataset.failed = "true";
+        owner.failures.set(key, (owner.failures.get(key) || 0) + 1);
+      }
+      delete img.dataset.pending;
+      img.onload = img.onerror = null;
+      owner.pending--;
+      if (!loaded) scheduleTileRetry(owner);
+      clearRetiredTilesWhenCovered(owner);
+    };
+    img.onload = () => settle(true);
+    img.onerror = () => settle(false);
+    img.src = `https://tile.openstreetmap.org/${tz}/${wrappedX}/${ty}.png`;
+    img.style.left = `${tx * 256}px`;
+    img.style.top = `${ty * 256}px`;
+    $("#tiles").appendChild(img);
+    owner.tiles.set(key, img);
+  }
+
+  // One timer per layer, paced by its least-retried failure so a fresh
+  // failure is not held back by a tile that has been failing for a while.
+  function scheduleTileRetry(owner) {
+    if (owner !== tileLayer || owner.retryTimer !== null) return;
+    const failed = [...owner.failures].filter(([key]) => owner.tiles.get(key)?.dataset.failed === "true");
+    if (!failed.length) return;
+    const attempts = Math.min(...failed.map(([, count]) => count));
+    const delay = Math.min(TILE_RETRY_MAX_MS, TILE_RETRY_BASE_MS * 2 ** (attempts - 1));
+    owner.retryTimer = setTimeout(() => retryFailedTiles(owner), delay);
+  }
+
+  // Re-requests the current layer's failed tiles from the same OSM URL. Never
+  // touches the retired layer: that leaves only through
+  // clearRetiredTilesWhenCovered.
+  function retryFailedTiles(owner = tileLayer) {
+    if (owner !== tileLayer) return;
+    clearTimeout(owner.retryTimer);
+    owner.retryTimer = null;
+    for (const key of owner.failures.keys()) {
+      const failed = owner.tiles.get(key);
+      if (!failed || failed.dataset.failed !== "true") continue;
+      failed.remove();
+      const [tx, ty] = key.split("/").map(Number);
+      requestTile(owner, key, tx, ty, owner.zoom);
+    }
+  }
+
   function renderFrame() {
     const view = mapViewport();
     if (!view.width || !view.height) return;
@@ -860,7 +931,8 @@
     const tz = tileZoomLevel();
     if (tileLayer.zoom !== tz) {
       if (tileLayer.zoom !== null) retireTiles();
-      tileLayer = { zoom: tz, tiles: new Map(), pending: 0 };
+      clearTimeout(tileLayer.retryTimer);
+      tileLayer = newTileLayer(tz);
     }
     const scale = 2 ** (state.zoom - tz);
     const maxTile = 2 ** tz;
@@ -874,34 +946,7 @@
       for (let tx = Math.floor(left / 256); tx <= Math.floor(right / 256); tx++) {
         const key = `${tx}/${ty}`;
         needed.add(key);
-        if (!tileLayer.tiles.has(key)) {
-          const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
-          const img = document.createElement("img");
-          img.className = "tile";
-          img.draggable = false;
-          img.alt = "";
-          // Capture the layer this tile belongs to: tileLayer gets reassigned
-          // wholesale on a zoom-level change, and a stale in-flight load must
-          // decrement its own (possibly retired) layer's counter, not
-          // whatever layer happens to be current when it fires.
-          const owner = tileLayer;
-          owner.pending++;
-          img.dataset.pending = "true";
-          const settle = (loaded) => {
-            if (loaded) img.classList.add("loaded");
-            delete img.dataset.pending;
-            img.onload = img.onerror = null;
-            owner.pending--;
-            clearRetiredTilesWhenCovered(owner);
-          };
-          img.onload = () => settle(true);
-          img.onerror = () => settle(false);
-          img.src = `https://tile.openstreetmap.org/${tz}/${wrappedX}/${ty}.png`;
-          img.style.left = `${tx * 256}px`;
-          img.style.top = `${ty * 256}px`;
-          layer.appendChild(img);
-          tileLayer.tiles.set(key, img);
-        }
+        if (!tileLayer.tiles.has(key)) requestTile(tileLayer, key, tx, ty, tz);
       }
     }
     for (const [key, img] of tileLayer.tiles) {
@@ -913,6 +958,7 @@
         img.onload = img.onerror = null;
         img.remove();
         tileLayer.tiles.delete(key);
+        tileLayer.failures.delete(key);
       }
     }
     clearRetiredTilesWhenCovered(tileLayer);
@@ -1421,7 +1467,10 @@
       }
     }
   });
-  $("#footer-refresh").addEventListener("click", () => actions.refresh());
+  $("#footer-refresh").addEventListener("click", () => {
+    actions.refresh();
+    retryFailedTiles();
+  });
   $("#reload-shell").addEventListener("click", () => {
     bridge({ action: "reload-shell" });
     $("#reload-shell").hidden = true;

@@ -866,6 +866,121 @@ test("a completely successful replacement retires the old imagery", () => {
   assert.equal(old.hidden, true);
 });
 
+function liveTileWithSrc(app, src) {
+  return app.elements.get("tiles").childNodes.find((image) => image.src === src) || null;
+}
+
+// Delays scheduled since `before`, as a multiset difference, so unrelated
+// timers (age ticks, view fetches) re-armed by runTimers() don't count.
+function addedDelays(before, after) {
+  const remaining = [...before];
+  return after.filter((delay) => {
+    const index = remaining.indexOf(delay);
+    if (index < 0) return true;
+    remaining.splice(index, 1);
+    return false;
+  });
+}
+
+test("a failed tile is retried at the same center and zoom and then loads", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const { zoom, center } = app.context.Airloom.debugState();
+  const before = { zoom, lat: center.lat, lon: center.lon };
+  const failed = live.childNodes[0];
+  const src = failed.src;
+
+  failed.onerror();
+  assert.ok(app.timerDelays().includes(2000), "a failed tile should schedule a retry");
+  app.runTimers();
+
+  const retried = liveTileWithSrc(app, src);
+  assert.ok(retried, "the failed tile should be requested again");
+  assert.notEqual(retried, failed, "a retry uses a fresh element");
+  assert.equal(retried.dataset.pending, "true");
+  assert.equal(failed.isConnected, false);
+
+  retried.onload();
+  assert.equal(retried.classList.contains("loaded"), true);
+  const after = app.context.Airloom.debugState();
+  assert.equal(after.zoom, before.zoom);
+  assertCenter(app, { lat: before.lat, lon: before.lon });
+});
+
+test("manual Refresh retries failed tiles immediately", () => {
+  const app = loadApp();
+  configureMap(app);
+  const failed = app.elements.get("tiles").childNodes[0];
+  const src = failed.src;
+  failed.onerror();
+
+  app.elements.get("footer-refresh").click();
+
+  assert.ok(app.messages.some((message) => message.action === "refresh"));
+  const retried = liveTileWithSrc(app, src);
+  assert.ok(retried && retried !== failed, "Refresh should re-request the failed tile without waiting");
+  assert.equal(retried.dataset.pending, "true");
+  assert.equal(failed.isConnected, false);
+});
+
+test("a sensors publication retries failed tiles", () => {
+  const app = loadApp();
+  configureMap(app);
+  const failed = app.elements.get("tiles").childNodes[0];
+  const src = failed.src;
+  failed.onerror();
+
+  receiveSensors(app, [fixtureSensor(1)]);
+
+  const retried = liveTileWithSrc(app, src);
+  assert.ok(retried && retried !== failed, "a publication should re-request the failed tile without waiting");
+  assert.equal(retried.dataset.pending, "true");
+  assert.equal(failed.isConnected, false);
+});
+
+test("retained imagery stays until the retried replacement layer fully loads", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const old = app.elements.get("tiles-old");
+  for (const image of [...live.childNodes]) image.onload();
+  app.context.Airloom.debugZoomTo(13);
+  for (const image of [...live.childNodes]) image.onerror();
+  app.runTimers();
+
+  assert.ok(old.childNodes.length > 0, "retries must not discard retained imagery");
+  assert.equal(old.hidden, false);
+  const replacements = [...live.childNodes];
+  assert.ok(replacements.length > 0 && replacements.every((image) => image.dataset.pending === "true"));
+
+  for (const image of replacements) image.onload();
+  assert.equal(old.childNodes.length, 0);
+  assert.equal(old.hidden, true);
+});
+
+test("tile retry backoff is capped and a zoom change cancels the old layer's retry", () => {
+  const app = loadApp();
+  configureMap(app);
+  const src = app.elements.get("tiles").childNodes[0].src;
+  const delays = [];
+  for (let attempt = 0; attempt < 7; attempt++) {
+    const before = app.timerDelays();
+    liveTileWithSrc(app, src).onerror();
+    delays.push(...addedDelays(before, app.timerDelays()));
+    app.runTimers();
+  }
+  assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+
+  const stale = app.elements.get("tiles").childNodes[0];
+  const staleSrc = stale.src;
+  stale.onerror();
+  app.context.Airloom.debugZoomTo(14);
+  app.runTimers();
+  assert.equal(liveTileWithSrc(app, staleSrc), null,
+    "the replaced layer's failed tile must not be re-requested");
+});
+
 test("reconcileKeyed preserves keyed controls and returns removed logical focus", () => {
   const { reconcileKeyed } = require("../../airloom/resources/state.js");
   assert.equal(typeof reconcileKeyed, "function");
