@@ -382,8 +382,9 @@ class ApplicationController:
 
         New view intent is registered even when fresh cached coverage needs no
         worker: the token supersedes active and queued work for the old view.
-        A duplicate report of the current view leaves an outstanding manual
-        Refresh for it alone.
+        A report of the target already being fetched (the current view, or
+        home before any view exists) leaves an outstanding manual Refresh for
+        it alone.
         """
         if self._stopped:
             return None
@@ -391,7 +392,8 @@ class ApplicationController:
             view, center = view_from_message(message)
         except (KeyError, TypeError, ValueError, OverflowError):
             return None
-        if (view, center) == self.current_view and self._forced_outstanding((view, center)):
+        if (view, center) == self._target() and self._forced_outstanding((view, center)):
+            self.current_view = (view, center)
             return None
         if (view, center) != self._forced_target:
             self._forced_target = None

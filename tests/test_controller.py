@@ -393,6 +393,39 @@ class RefreshWorkflowTest(unittest.TestCase):
         self.assertFalse(h.controller.accept_refresh(h.outcome(forced, [reading(2)])).publish)
         self.assertFalse(h.controller.settle_refresh().force)
 
+    def test_home_report_keeps_manual_refresh_for_implicit_and_explicit_home(self):
+        for name, start in (
+            ("implicit", lambda c: c.refresh(force=True)),
+            ("explicit", lambda c: c.refresh_home(force=True)),
+        ):
+            with self.subTest(home=name):
+                h = Harness()
+                forced = start(h.controller)
+                bounds = forced.bounds
+                home = {
+                    "north": bounds.north,
+                    "west": bounds.west,
+                    "south": bounds.south,
+                    "east": bounds.east,
+                    "lat": forced.center[0],
+                    "lon": forced.center[1],
+                }
+
+                self.assertIsNone(h.controller.view_changed(home))
+                self.assertIsNone(h.controller.refresh())
+
+                self.assertIsNone(h.controller.pending_fetch)
+                self.assertIs(h.controller.active_fetch, forced)
+                self.assertTrue(h.finish(forced, [reading(1, aqi=150)]).publish)
+                self.assertEqual(len(h.started), 1)  # one billed poll
+
+    def test_new_target_supersedes_implicit_home_manual_refresh(self):
+        h = Harness()
+        forced = h.controller.refresh(force=True)
+        self.assertEqual(h.controller.view_changed(OTHER), (35.0, -20.0))
+        self.assertFalse(h.controller.accept_refresh(h.outcome(forced, [reading(2)])).publish)
+        self.assertFalse(h.controller.settle_refresh().force)
+
     def test_force_is_sticky_across_an_unforced_filter_refresh(self):
         h = Harness()
         h.controller.refresh(force=True)
