@@ -23,6 +23,8 @@ VERIFY_CLIENT = PROJECT_ROOT / "scripts" / "verify-flatpak-release.sh"
 PUBLISH_REPO = PROJECT_ROOT / "scripts" / "publish-flatpak-repo.sh"
 WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "flatpak.yml"
 PUBLISH_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "publish.yml"
+RELEASE_GUIDE = PROJECT_ROOT / "RELEASE.md"
+README = PROJECT_ROOT / "README.md"
 SOURCE_SHA = "a" * 40
 RUNTIME_COMMIT = "b" * 64
 SDK_COMMIT = "c" * 64
@@ -1822,6 +1824,36 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
             self.source,
             r"ghcr\.io/flathub-infra/flatpak-github-actions@sha256:[0-9a-f]{64}",
         )
+
+
+class ReleaseDocumentationTest(unittest.TestCase):
+    def test_downloaded_bundle_examples_use_published_asset_names(self):
+        self.assertIn("bundle: Airloom-${{ matrix.arch }}.flatpak", WORKFLOW.read_text(encoding="utf-8"))
+        for path in (RELEASE_GUIDE, README):
+            with self.subTest(doc=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("./Airloom-ARCH.flatpak", text)
+                for match in re.finditer(r"(\S*)Airloom-VERSION-ARCH\.flatpak", text):
+                    self.assertTrue(match.group(1).endswith("dist/"), match.group(0))
+
+    def test_release_guide_documents_failed_tag_recovery(self):
+        text = RELEASE_GUIDE.read_text(encoding="utf-8")
+        section = text[text.index("## If a tag run fails"):]
+        for expected in (
+            "gh release view vX.Y.Z --repo ijbaird/airloom",
+            "deployments?environment=github-pages&sha=",
+            "git push --delete origin vX.Y.Z",
+            "git tag -d vX.Y.Z",
+            "never move or delete the tag",
+            "next patch version",
+        ):
+            self.assertIn(expected, section)
+
+    def test_release_guide_states_the_signing_key_rotation_policy(self):
+        text = RELEASE_GUIDE.read_text(encoding="utf-8")
+        self.assertIn("--import-candidate-key", text)
+        self.assertIn("only its origin URL is redirected", text)
+        self.assertIn("fails the protected upgrade gate until a reviewed client migration", text)
 
 
 if __name__ == "__main__":
