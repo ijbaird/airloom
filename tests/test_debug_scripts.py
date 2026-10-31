@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 
 try:
@@ -31,6 +32,7 @@ write_record(os.environ["AIRLOOM_TEST_ENV_RECORD"], json.dumps({
     "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME"),
     "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME"),
     "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": os.environ.get("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"),
+    "AIRLOOM_NOMINATIM_URL": os.environ.get("AIRLOOM_NOMINATIM_URL"),
 }))
 for variable in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
     app_dir = Path(os.environ[variable]) / "airloom"
@@ -157,6 +159,11 @@ class DebugScriptIsolationTest(unittest.TestCase):
     def test_save_refresh_child_is_isolated_and_unrelated_sentinels_survive(self):
         self._exercise_gui_script("test-save-refresh")
 
+    def test_save_refresh_child_never_reaches_live_nominatim(self):
+        child = self._exercise_gui_script("test-save-refresh")
+        url = urllib.parse.urlsplit(child["AIRLOOM_NOMINATIM_URL"] or "")
+        self.assertEqual(url.hostname, "127.0.0.1", f"geocoder URL is not loopback: {url.geturl()!r}")
+
     def test_heatmap_fails_fast_when_the_app_exits_before_its_debug_socket(self):
         self._assert_fails_fast("test-heatmap")
 
@@ -232,6 +239,8 @@ class DebugScriptIsolationTest(unittest.TestCase):
             "AIRLOOM_TEST_SENTINEL_PID": str(unrelated.pid),
             # CI disables WebKit's sandbox for these scripts; it must reach the app.
             "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": "1",
+            # A caller's geocoder setting must not decide where the app looks up places.
+            "AIRLOOM_NOMINATIM_URL": "https://nominatim.openstreetmap.org",
         }
         launched = self._launch_owned_process(
             [sys.executable, str(scripts / script_name)],
@@ -273,6 +282,7 @@ class DebugScriptIsolationTest(unittest.TestCase):
         with self.assertRaises(ProcessLookupError, msg="the launched GUI child was not cleaned up"):
             os.kill(child["pid"], 0)
         self.assertIsNone(unrelated.poll(), "the GUI launcher terminated an unrelated Airloom process")
+        return child
 
     def test_screenshot_session_gets_a_private_compositor_bus_and_directories(self):
         fake_bin = self.root / "fake-bin"

@@ -144,6 +144,9 @@ def main() -> int:
     env = {**os.environ, "AIRLOOM_DEBUG_SOCKET": sock_path}
     env["XDG_CONFIG_HOME"] = str(workdir / "config")
     env["XDG_CACHE_HOME"] = str(workdir / "cache")
+    # Place labels are never asserted here, so point the geocoder at a dead
+    # loopback port rather than letting the app contact live Nominatim.
+    env["AIRLOOM_NOMINATIM_URL"] = "http://127.0.0.1:9/"
     # A fixed home skips GeoClue, so no location fix can move the map
     # mid-test; demo mode (no API key) keeps the data deterministic.
     config_dir = Path(env["XDG_CONFIG_HOME"]) / "airloom"
