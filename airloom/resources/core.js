@@ -81,5 +81,36 @@
     }).sort((a, b) => a.aqi - b.aqi);
   }
 
-  return { splitBounds, boundsContain, nearestLongitude, bandForAQI, summarySensors, BANDS, UNAVAILABLE };
+  // Mirrors W1's shared freshness rule in airloom/models.py: an observation is
+  // fresh from 600 s in the future through 2 h in the past, both inclusive.
+  const MAX_OBSERVATION_AGE = 7200;
+  const FUTURE_SKEW_TOLERANCE = 600;
+
+  function isFreshObservation(lastSeen, nowSeconds) {
+    if (typeof lastSeen !== "number" || !Number.isFinite(lastSeen) || !Number.isFinite(nowSeconds)) return false;
+    const age = nowSeconds - lastSeen;
+    return age >= -FUTURE_SKEW_TOLERANCE && age <= MAX_OBSERVATION_AGE;
+  }
+
+  const PROVENANCE_DESCRIPTIONS = {
+    Demo: "Demo data, not a real sensor reading",
+    Stale: "Cached reading shown after a failed refresh",
+    Old: "Last observation over 2 hours ago or unknown",
+  };
+
+  // Only degraded readings are badged, Demo > Stale > Old. A remote favorite
+  // comes from its own fetch, so it never inherits the area batch's metadata.
+  function readingProvenance(sensor, batch, nowSeconds) {
+    const inBatch = sensor.remote_favorite !== true;
+    if (sensor.origin === "demo" || (inBatch && String(batch.source || "").toLowerCase().includes("demo"))) return "Demo";
+    const legacyStale = batch.stale === undefined && batch.source === "PurpleAir · cached";
+    if (sensor.stale === true || (inBatch && (batch.stale === true || legacyStale))) return "Stale";
+    if (!isFreshObservation(sensor.last_seen, nowSeconds)) return "Old";
+    return "";
+  }
+
+  return {
+    splitBounds, boundsContain, nearestLongitude, bandForAQI, summarySensors, BANDS, UNAVAILABLE,
+    MAX_OBSERVATION_AGE, FUTURE_SKEW_TOLERANCE, isFreshObservation, readingProvenance, PROVENANCE_DESCRIPTIONS,
+  };
 });

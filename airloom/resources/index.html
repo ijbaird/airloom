@@ -19,7 +19,7 @@
           <div class="map-popup" id="map-popup" role="dialog" aria-labelledby="popup-name" hidden>
             <div class="popup-head">
               <span class="popup-aqi" id="popup-aqi">—</span>
-              <div class="popup-copy"><strong id="popup-name"></strong><small id="popup-meta"></small></div>
+              <div class="popup-copy"><strong id="popup-name"></strong><small id="popup-meta"></small><span class="provenance-badge" id="popup-provenance" hidden></span></div>
               <button class="icon-button popup-star" id="popup-favorite" title="Favorite this sensor" aria-label="Favorite this sensor" aria-pressed="false">
                 <svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg>
               </button>
@@ -49,7 +49,7 @@
         <span class="summary-copy">
           <strong id="place-name">Locating…</strong>
           <small id="summary-label">Loading readings</small>
-          <small class="provenance-status" id="summary-provenance" hidden></small>
+          <small class="provenance-badge" id="summary-provenance" hidden></small>
           <small class="coverage-status" id="coverage-status" hidden>Limited coverage</small>
         </span>
         <span class="pulse" id="loading-pulse"></span>
@@ -102,7 +102,7 @@
         <p class="sensor-name"><span id="sensor-name">Choose a sensor</span><span class="indoor-tag" id="detail-indoor" hidden>Indoor</span></p>
         <div class="aqi-row">
           <span class="aqi-number aqi-badge" id="aqi-number">—</span>
-          <div><span class="aqi-unit">US AQI</span><strong id="aqi-category">Unavailable</strong><small class="provenance-status" id="detail-provenance" hidden></small></div>
+          <div><span class="aqi-unit">US AQI</span><strong id="aqi-category">Unavailable</strong><small class="provenance-badge" id="detail-provenance" hidden></small></div>
         </div>
         <section class="chart-card">
           <div class="chart-heading"><div><span>Air quality trend</span><strong id="trend-direction">—</strong></div><div class="chart-comparison"><span class="chart-period" id="chart-period">Rolling averages</span><button type="button" class="trend-retry" id="trend-retry" hidden>Retry</button></div></div>

@@ -808,6 +808,47 @@ test("band tables match Python exactly", () => {
   assert.deepEqual(JSON.parse(output), [...AirloomCore.BANDS, AirloomCore.UNAVAILABLE]);
 });
 
+test("isFreshObservation mirrors the shared Python boundary vectors", () => {
+  const now = 1_800_000_000;
+  assert.equal(AirloomCore.MAX_OBSERVATION_AGE, 7200);
+  assert.equal(AirloomCore.FUTURE_SKEW_TOLERANCE, 600);
+  for (const age of [0, 7200, -600]) {
+    assert.equal(AirloomCore.isFreshObservation(now - age, now), true, `age ${age} is fresh`);
+  }
+  for (const age of [7201, -601]) {
+    assert.equal(AirloomCore.isFreshObservation(now - age, now), false, `age ${age} is not fresh`);
+  }
+  for (const lastSeen of [null, undefined, NaN, true, "7200"]) {
+    assert.equal(AirloomCore.isFreshObservation(lastSeen, now), false, `${String(lastSeen)} is not fresh`);
+  }
+
+  const ages = [0, 7200, 7201, null];
+  const script = "import json; from airloom import models, presentation; "
+    + `now = ${now}; `
+    + `ages = json.loads(${JSON.stringify(JSON.stringify(ages))}); `
+    + "eligible = [bool(presentation.alert_transitions([models.Sensor(1, 'x', 0, 0, 150, 60.0, last_seen=None if age is None else now - age)], "
+    + "favorites={1}, previous={}, threshold=101, now=now, origin='live')[0]) for age in ages]; "
+    + "print(json.dumps({'eligible': eligible, 'max_age': presentation.MAX_ALERT_OBSERVATION_AGE}))";
+  const output = JSON.parse(require("node:child_process").execFileSync(
+    "python3",
+    ["-c", script],
+    { cwd: path.resolve(__dirname, "../.."), encoding: "utf8" },
+  ));
+  assert.equal(output.max_age, 7200);
+  assert.deepEqual(output.eligible, ages.map((age) => AirloomCore.isFreshObservation(age === null ? null : now - age, now)));
+});
+
+test("readingProvenance uses Demo > Stale > Old precedence", () => {
+  const now = 1_800_000_000;
+  const fresh = now - 60;
+  const staleBatch = { source: "PurpleAir · cached", stale: true };
+  assert.equal(AirloomCore.readingProvenance({ origin: "demo", stale: true, last_seen: null }, staleBatch, now), "Demo");
+  assert.equal(AirloomCore.readingProvenance({ origin: "live", last_seen: null }, staleBatch, now), "Stale");
+  assert.equal(AirloomCore.readingProvenance({ origin: "live", remote_favorite: true, last_seen: null }, staleBatch, now), "Old");
+  assert.equal(AirloomCore.readingProvenance({ origin: "live", delivery: "cache", last_seen: fresh }, { source: "PurpleAir · cached startup" }, now), "");
+  assert.deepEqual(Object.keys(AirloomCore.PROVENANCE_DESCRIPTIONS), ["Demo", "Stale", "Old"]);
+});
+
 function contrastRatio(hexA, hexB) {
   const luminance = (hex) => {
     const [r, g, b] = [1, 3, 5].map((index) => {

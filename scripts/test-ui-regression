@@ -414,14 +414,18 @@ def scenario_labels(app: DebugApp):
     check(True, "returning to a fully fetched view clears the coverage label")
 
     # Stale fallback needs a failing live PurpleAir fetch, which these
-    # scenarios never make; replay a stale cached publication instead.
+    # scenarios never make; replay a stale cached publication instead. The
+    # summary badges the median reading it shows, so replay one in view.
     stale = eval_js(sock, """(() => {
-      window.Airloom.receive("sensors", { items: [], area: [], favorites: [],
+      const { lat, lon } = window.Airloom.debugState().center;
+      const reading = { id: 1, name: "Replayed", latitude: lat, longitude: ((lon + 180) % 360 + 360) % 360 - 180,
+        aqi: 42, category: "Good", last_seen: Math.round(Date.now() / 1000), origin: "live", delivery: "cache" };
+      window.Airloom.receive("sensors", { items: [reading], area: [reading], favorites: [],
         source: "PurpleAir · cached", stale: true });
       const e = document.querySelector("#summary-provenance");
       return e.hidden ? "" : e.textContent;
     })()""")
-    check(stale == "Stale cached data", "a stale cached publication is labeled (replayed payload)")
+    check(stale == "Stale", f"a stale cached publication is labeled (replayed payload, {stale!r})")
     eval_js(sock, "document.querySelector('#footer-refresh').click()")
     wait_for(lambda: request(sock, "state")["sensorCount"] > 0, 20, "demo sensors after Refresh")
 
@@ -953,6 +957,19 @@ class FixtureApp(DebugApp):
 
 REFRESH_JS = "document.querySelector('#footer-refresh').click()"
 
+OLD_BADGE_JS = """
+(() => {
+  const rows = {}, markers = {};
+  for (const id of ["1", "2", "4"]) {
+    const row = document.querySelector(`#sensor-list .sensor-row[data-id="${id}"]`);
+    rows[id] = row ? (row.querySelector(".provenance-badge")?.textContent ?? "") : null;
+    const marker = document.querySelector(`.map-marker[data-id="${id}"]`);
+    markers[id] = marker ? marker.getAttribute("aria-label").endsWith(" · Old") : null;
+  }
+  return { rows, markers };
+})()
+"""
+
 
 def scenario_alerts(root: Path, geocoder: GeocoderStub):
     print("— demo, expired, and fresh observations through the alert path —")
@@ -962,7 +979,7 @@ def scenario_alerts(root: Path, geocoder: GeocoderStub):
         sock = app.sock_path
         eval_js(sock, SENSOR_SPY_JS)
         demo = app.publish(REFRESH_JS, "the demo fallback")
-        check(demo["source"] == "Demo data" and demo["label"] == "Demo data",
+        check(demo["source"] == "Demo data" and demo["label"] == "Demo",
               "an outage with an empty cache falls back to labeled demo data")
         check(demo["maxAqi"] >= 101, f"demo favorites include readings above the threshold ({demo['maxAqi']})")
         check(app.notifications() == [], "demo readings raise no alert")
@@ -973,6 +990,11 @@ def scenario_alerts(root: Path, geocoder: GeocoderStub):
         check(live["source"] == "PurpleAir live" and live["ids"] == [1, 2, 4],
               f"live outdoor readings are published ({live['source']}, {live['ids']})")
         check(app.notifications() == [1], f"only the fresh favorite alerts ({app.notifications()})")
+        badges = eval_js(sock, OLD_BADGE_JS)
+        check(badges["rows"] == {"1": "", "2": "Old", "4": ""},
+              f"only the 3 h old reading's row carries the Old badge ({badges['rows']})")
+        check(badges["markers"] == {"1": False, "2": True, "4": False},
+              f"only the 3 h old reading's marker is announced Old ({badges['markers']})")
         live = app.set_filter("both", "all sensors")
         check(live["ids"] == [1, 2, 3, 4], f"the indoor favorite appears with All sensors ({live['ids']})")
         check(app.notifications() == [1, 3], f"the fresh indoor favorite alerts once ({app.notifications()})")
@@ -993,7 +1015,9 @@ def scenario_cache_fallback(root: Path, geocoder: GeocoderStub):
         eval_js(sock, SENSOR_SPY_JS)
         app.publish(REFRESH_JS, "live fixture readings")
         live = app.set_filter("both", "every fixture sensor cached")
-        check(live["ids"] == [1, 2, 3, 4] and live["label"] == "", "live readings carry no fallback label")
+        # The summary badges its median reading, which may be the 3 h old fixture.
+        check(live["ids"] == [1, 2, 3, 4] and live["label"] in ("", "Old"),
+              f"live readings carry no Demo or Stale label ({live['label']!r})")
         alerted = app.notifications()
 
         app.set_fixture(fail=True)
@@ -1005,12 +1029,12 @@ def scenario_cache_fallback(root: Path, geocoder: GeocoderStub):
               f"the outage serves cached readings ({stale['source']})")
         check(stale["ids"] == [1, 2, 4], f"cached fallback still applies the Outdoor filter ({stale['ids']})")
         check(stale["deliveries"] == ["cache"], "every fallback reading is marked as cache delivery")
-        check(stale["label"] == "Stale cached data", f"the summary is labeled stale ({stale['label']!r})")
+        check(stale["label"] == "Stale", f"the summary is labeled stale ({stale['label']!r})")
         check(any("Showing cached readings" in toast for toast in stale["toasts"]),
               "the outage is explained to the user")
         app.set_filter("indoor", "indoor readings")
         stale = app.publish(REFRESH_JS, "stale indoor readings")
-        check(stale["ids"] == [3] and stale["label"] == "Stale cached data",
+        check(stale["ids"] == [3] and stale["label"] == "Stale",
               f"switching to Indoor filters the cached fallback ({stale['ids']})")
         check(app.notifications() == alerted, "cached fallback raises no repeat alerts")
         check(app.alert_states() == {"900000": False, "1": True, "3": True},

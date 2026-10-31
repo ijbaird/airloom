@@ -266,7 +266,9 @@
     }
     state.sensors = [...merged.values()];
     state.areaSensors = Array.isArray(payload.area) ? area : state.sensors;
-    state.favoriteSensors = Array.isArray(payload.favorites) ? favorites : null;
+    // Favorites rows come from their own fetch; marking them remote keeps the
+    // area batch's demo or stale metadata off their provenance.
+    state.favoriteSensors = Array.isArray(payload.favorites) ? favorites.map((favorite) => ({ ...favorite, remote_favorite: true })) : null;
     state.coverage = payload.coverage || null;
     state.fetchedBounds = publicationBounds(payload) || state.fetchedBounds;
     state.selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
@@ -299,42 +301,29 @@
     return hasLimitedCoverage() ? `${base} · Limited coverage` : base;
   }
 
+  // The single page clock, in seconds, for freshness and relative times.
+  const nowSeconds = () => Date.now() / 1000;
+
+  function provenanceOf(sensor) {
+    return AirloomCore.readingProvenance(sensor, { source: state.source, stale: state.stale }, nowSeconds());
+  }
+
+  const categoryOf = (sensor) => sensor.category || AirloomCore.bandForAQI(sensor.aqi).label;
+
   function stampProvenance(id, label) {
     const element = $(`#${id}`);
     element.hidden = !label;
     element.textContent = label;
-  }
-
-  function summaryProvenanceLabel() {
-    const source = (state.source || "").toLowerCase();
-    const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
-    if (source.includes("demo") || state.areaSensors.some((sensor) => sensor.origin === "demo")) return "Demo data";
-    if (state.stale === true || legacyStale) return "Stale cached data";
-    if (source.includes("cached") || state.areaSensors.some((sensor) => sensor.delivery === "cache")) return "Cached data";
-    return "";
-  }
-
-  function detailProvenanceLabel(sensor) {
-    if (!sensor) return "";
-    if (sensor.origin === "demo") return "Demo data";
-    if (sensor.stale === true) return "Stale cached data";
-    if (sensor.remote_favorite === true) return sensor.delivery === "cache" ? "Cached data" : "";
-
-    const source = (state.source || "").toLowerCase();
-    const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
-    if (source.includes("demo")) return "Demo data";
-    if (state.stale === true || legacyStale) return "Stale cached data";
-    if (sensor.delivery === "cache" || source.includes("cached")) return "Cached data";
-    return "";
+    element.title = label ? AirloomCore.PROVENANCE_DESCRIPTIONS[label] : "";
   }
 
   function renderSummary(view = mapViewport()) {
-    stampProvenance("summary-provenance", summaryProvenanceLabel());
     const limited = hasLimitedCoverage();
     $("#coverage-status").hidden = !limited;
     $("#coverage-status").textContent = limited ? "Limited coverage" : "";
     const valid = view.width ? AirloomCore.summarySensors(locationFiltered(state.areaSensors), geographicBounds(view)) : [];
     const sensor = valid[Math.floor(valid.length / 2)];
+    stampProvenance("summary-provenance", sensor ? provenanceOf(sensor) : "");
     if (!sensor) {
       $("#summary-aqi").textContent = "—";
       $("#summary-aqi").style.background = "";
@@ -426,10 +415,12 @@
     row.dataset.id = String(sensor.id);
     row.style.setProperty("--sensor", sensor.color || "");
     row.style.setProperty("--sensor-fg", sensor.foreground || "");
-    row.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}${sensor.favorite ? ", favorite" : ""}`);
+    const badge = provenanceOf(sensor);
+    row.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}, ${categoryOf(sensor)}${badge ? `, ${badge}` : ""}${sensor.favorite ? ", favorite" : ""}`);
     const meta = [formatTemperature(sensor.temperature_f), formatHumidity(sensor.humidity)].filter(Boolean).join(" · ");
+    const badgeMarkup = badge ? `<span class="provenance-badge" title="${AirloomCore.PROVENANCE_DESCRIPTIONS[badge]}">${badge}</span>` : "";
     row.innerHTML = `<span class="sensor-badge">${sensor.aqi ?? "—"}</span>
-      <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small></span>
+      <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small>${badgeMarkup}</span>
       ${sensor.favorite ? '<span class="row-star"><svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg></span>' : ""}`;
   }
 
@@ -446,7 +437,10 @@
       $("#close-detail").focus();
     }
     const sensor = selectedSensor();
-    if (sensor) announce(`${sensor.name}. AQI ${sensor.aqi ?? "unavailable"}.`);
+    if (sensor) {
+      const badge = provenanceOf(sensor);
+      announce(`${sensor.name}. AQI ${sensor.aqi ?? "unavailable"}, ${categoryOf(sensor)}.${badge ? ` ${badge}.` : ""}`);
+    }
   }
 
   function selectedSensor() {
@@ -485,9 +479,11 @@
     $("#popup-aqi").style.color = sensor.foreground || "";
     $("#popup-name").textContent = sensor.name;
     $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
+    const badge = provenanceOf(sensor);
+    stampProvenance("popup-provenance", badge);
     $("#popup-favorite").classList.toggle("active", Boolean(sensor.favorite));
     $("#popup-favorite").setAttribute("aria-pressed", String(Boolean(sensor.favorite)));
-    const demo = (state.source || "").toLowerCase().includes("demo") || sensor.origin === "demo";
+    const demo = badge === "Demo";
     const link = $("#popup-purpleair");
     link.hidden = demo; // demo sensor ids do not exist on the public map
     if (!demo) link.href = `https://map.purpleair.com/1/mAQI/a10/p604800/cC0?select=${sensor.id}#14/${sensor.latitude}/${sensor.longitude}`;
@@ -516,7 +512,7 @@
 
   function renderDetail() {
     const sensor = selectedSensor();
-    stampProvenance("detail-provenance", detailProvenanceLabel(sensor));
+    stampProvenance("detail-provenance", sensor ? provenanceOf(sensor) : "");
     if (!sensor) {
       hideDetail();
       return;
@@ -1016,7 +1012,8 @@
     const point = sensorWorldPoint(sensor);
     marker.className = `map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}`;
     marker.dataset.id = String(sensor.id);
-    marker.title = `${sensor.name} · AQI ${sensor.aqi ?? "unavailable"}`;
+    const badge = provenanceOf(sensor);
+    marker.title = `${sensor.name} · AQI ${sensor.aqi ?? "unavailable"} · ${categoryOf(sensor)}${badge ? ` · ${badge}` : ""}`;
     marker.setAttribute("aria-label", marker.title);
     marker.style.left = `${point.x}px`;
     marker.style.top = `${point.y}px`;
@@ -1212,9 +1209,9 @@
   }
   const formatHumidity = (humidity) => Number.isFinite(humidity) ? `${Math.round(humidity)}%` : "";
   const numberOrDash = (number) => Number.isFinite(number) ? Number(number).toFixed(1) : "—";
-  function relativeTime(timestamp) {
-    if (!timestamp) return "Update time unavailable";
-    const seconds = Math.max(0, Math.round(Date.now() / 1000 - timestamp));
+  function relativeTime(timestamp, now = nowSeconds()) {
+    if (!timestamp || !Number.isFinite(timestamp) || timestamp - now > AirloomCore.FUTURE_SKEW_TOLERANCE) return "Update time unavailable";
+    const seconds = Math.max(0, Math.round(now - timestamp));
     if (seconds < 90) return "Updated just now";
     if (seconds < 3600) return `Updated ${Math.round(seconds / 60)} min ago`;
     return `Updated ${Math.round(seconds / 3600)} hr ago`;
