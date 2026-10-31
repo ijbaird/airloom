@@ -100,6 +100,7 @@
       if (event === "motion") { state.systemReducedMotion = payload.reduced === true; applyMotionPreference(); }
       if (event === "trend") applyTrend(payload);
       if (event === "places") applyPlaces(payload);
+      if (event === "restore-view") restoreView(payload);
     },
     // Small, legitimate debug accessors used by the debug port (see
     // airloom/debugport.py and app.py's _debug_* handlers) to read and
@@ -196,6 +197,17 @@
     if (payload.name) state.config.location_name = payload.name;
     stampPlaceName();
     if (payload.source === "geoclue" || payload.source === "fixed") flyTo(lat, lon);
+  }
+
+  // Shell recovery: adopt the controller's viewport so the reloaded page and
+  // Python target one view before the refresh that follows ready.
+  function restoreView(payload) {
+    const lat = Number(payload.lat), lon = Number(payload.lon), zoom = Number(payload.zoom);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    state.center = { lat, lon };
+    if (payload.zoom !== null && Number.isFinite(zoom)) state.zoom = Math.max(3, Math.min(17, zoom));
+    state.positioned = true;
+    renderMap();
   }
 
   function applyConfig(config) {

@@ -217,6 +217,8 @@ class ApplicationController:
         # Where the user is looking, stamped as one (bounds, center) pair so a
         # refresh can never combine a stale half.
         self.current_view: tuple[Bounds, tuple[float, float]] | None = None
+        # The page's last valid map zoom, restored into a recovered shell.
+        self.current_zoom: float | None = None
         # Fetched coverage that lets a return to a fresh view skip a fetch.
         self.view_bounds: Bounds | None = None
         self.view_fetched_at = 0.0
@@ -411,6 +413,15 @@ class ApplicationController:
             view, center = view_from_message(message)
         except (KeyError, TypeError, ValueError, OverflowError):
             return None
+        zoom = message.get("zoom")
+        self.current_zoom = (
+            float(zoom)
+            if isinstance(zoom, (int, float))
+            and not isinstance(zoom, bool)
+            and 3 <= zoom <= 17
+            and math.isfinite(zoom)
+            else None
+        )
         if (view, center) == self._target() and self._forced_outstanding((view, center)):
             self.current_view = (view, center)
             return None
@@ -429,6 +440,13 @@ class ApplicationController:
             return None
         self._admit(request)
         return center
+
+    def restore_view(self) -> dict | None:
+        """The ``restore-view`` payload for a recovered shell, or None before a view."""
+        if self.current_view is None:
+            return None
+        lat, lon = self.current_view[1]
+        return {"lat": lat, "lon": lon, "zoom": self.current_zoom}
 
     def _admit(self, request: RefreshRequest) -> RefreshRequest | None:
         if self.refreshing:

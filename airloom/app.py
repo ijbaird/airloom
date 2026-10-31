@@ -473,6 +473,9 @@ class AirloomApplication(Adw.Application):
         self.window: Adw.ApplicationWindow | None = None
         self.webview: WebKit.WebView | None = None
         self._shell_recovery_notice: str | None = None
+        # Set while a reloaded shell has not yet sent ready: messages still
+        # arriving from the replaced page must not steer the controller.
+        self._awaiting_shell_ready = False
         self.title: Adw.WindowTitle | None = None
         self.locator: GeoClueLocator | None = None
         self._locator_focus_handler: int | None = None
@@ -857,6 +860,10 @@ class AirloomApplication(Adw.Application):
     def _reload_shell(self) -> None:
         if self._shutting_down or not self.webview:
             return
+        self._awaiting_shell_ready = True
+        # The old page's searches and labels can't apply to the new one.
+        for context in ("place-search:main", "place-search:home", "view-label"):
+            self.requests.invalidate(context)
         self._send(
             "shell-status",
             {
@@ -1098,10 +1105,20 @@ class AirloomApplication(Adw.Application):
             return
 
         action = message.get("action")
+        if self._awaiting_shell_ready and action != "ready":
+            print(f"Airloom: ignored {action!r} from a replaced page", file=sys.stderr)
+            return
         if action == "reload-shell":
             self._reload_shell()
         elif action == "ready":
+            self._awaiting_shell_ready = False
             self._send("config", self.store.public_config())
+            # Hand the new page the controller's view so both target it
+            # before the refresh below.
+            restore = self.controller.restore_view()
+            if restore is not None:
+                self._send("restore-view", restore)
+                self._start_view_label(restore["lat"], restore["lon"])
             self._send_motion_preference()
             recovery_notice = getattr(self, "_shell_recovery_notice", None)
             if recovery_notice:

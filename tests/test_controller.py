@@ -476,6 +476,18 @@ class RefreshWorkflowTest(unittest.TestCase):
         decision = h.finish(h.controller.refresh(), [reading(1), reading(2)])
         self.assertEqual(decision.trend_ids, (2,))
 
+    def test_restore_view_reports_last_valid_view_and_zoom(self):
+        h = Harness()
+        self.assertIsNone(h.controller.restore_view())
+
+        h.controller.view_changed({**VIEW, "zoom": 9})
+        self.assertEqual(
+            h.controller.restore_view(), {"lat": 15.0, "lon": -20.0, "zoom": 9.0}
+        )
+
+        h.controller.view_changed({**VIEW, "lat": 16.0, "zoom": "x"})
+        self.assertIsNone(h.controller.restore_view()["zoom"])
+
 
 class PreferenceTransactionTest(unittest.TestCase):
     SETTINGS = {

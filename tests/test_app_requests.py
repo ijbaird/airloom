@@ -204,6 +204,7 @@ class ApplicationRequestTestCase(unittest.TestCase):
         app.locator = None
         app._locator_focus_handler = None
         app._locator_focus_fallback = None
+        app._awaiting_shell_ready = False
         app.sent = []
         app.sensor_state_sends = 0
         app.refreshed_homes = []

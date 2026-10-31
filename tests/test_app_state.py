@@ -246,6 +246,7 @@ class ApplicationAdapterTestCase(unittest.TestCase):
         app.title = None
         app._cache_error = None
         app._shell_recovery_notice = None
+        app._awaiting_shell_ready = False
         app._captured_notifications = None
         app.sent = []
         app.launched = []
@@ -1047,6 +1048,35 @@ class ShellRecoveryTest(ApplicationAdapterTestCase):
         self.assertEqual(statuses[-1]["status"], "error")
         self.assertIn("reloaded", statuses[-1]["message"].lower())
         self.assertTrue(statuses[-1]["can_reload"])
+
+    def test_crash_away_from_home_restores_view_before_refresh(self):
+        app = self.make_app()
+        app.webview = FakeWebView()
+        app._start_fetch = lambda request: app.sent.append(("fetch", request.center))
+        app.controller.view_changed({**VIEW, "zoom": 9})
+        app.sent.clear()
+        old_search = app.requests.begin("place-search:main")
+        old_label = app.requests.begin("view-label")
+        labels = []
+        app._start_view_label = lambda *center: labels.append(center)
+        app._on_web_process_terminated(None, "crashed")
+        app._on_script_message(None, ScriptMessage({**VIEW, "action": "view-changed", "lat": 0.0, "lon": 0.0}))
+        app._on_script_message(None, ScriptMessage({"action": "refresh"}))
+        app._on_script_message(None, ScriptMessage({"action": "ready"}))
+        events = [event for event, _ in app.sent]
+        self.assertLess(events.index("config"), events.index("restore-view"))
+        self.assertLess(events.index("restore-view"), events.index("fetch"))
+        self.assertEqual(dict(app.sent)["restore-view"], {"lat": 15.0, "lon": -20.0, "zoom": 9.0})
+        self.assertEqual([p for e, p in app.sent if e == "fetch"], [(15.0, -20.0)])
+        self.assertEqual(app.controller.current_view[1], (15.0, -20.0))
+        self.assertFalse(app.requests.is_current(old_search))
+        self.assertFalse(app.requests.is_current(old_label))
+        self.assertEqual(labels, [(15.0, -20.0)])
+
+    def test_first_ready_without_a_view_sends_no_restore(self):
+        app = self.make_app()
+        app._on_script_message(None, ScriptMessage({"action": "ready"}))
+        self.assertNotIn("restore-view", [event for event, _ in app.sent])
 
 
 class DebugFakeWiringTest(ApplicationAdapterTestCase):
