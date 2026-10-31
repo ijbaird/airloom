@@ -1881,8 +1881,8 @@ test("restore-view ignores malformed payloads without throwing or navigating", (
     42,
     { lat: Number.NaN, lon: -20, zoom: 9 },
     { lat: 15, lon: Number.POSITIVE_INFINITY, zoom: 9 },
-    { lat: 0, lon: 1e308, zoom: 9 },
-    { lat: 95, lon: -20, zoom: 9 },
+    { lat: Number.NEGATIVE_INFINITY, lon: -20, zoom: 9 },
+    { lat: 15, lon: Number.NaN, zoom: 9 },
     { lat: 15, lon: -20, zoom: 2 },
     { lat: 15, lon: -20, zoom: 18 },
     { lat: 15, lon: -20, zoom: 2.9 },
@@ -1929,4 +1929,26 @@ test("restore-view rounds a fractional zoom to the nearest whole level", () => {
   assert.deepEqual(mapView(app), { lat: 15, lon: -20, zoom: 12 });
   deliverRestoreView(app, { lat: 16, lon: -21, zoom: 12.6 });
   assert.deepEqual(mapView(app), { lat: 16, lon: -21, zoom: 13 });
+});
+
+test("restore-view clamps latitude and wraps longitude to the place the user saw", () => {
+  const app = loadApp();
+  configureMap(app);
+  deliverRestoreView(app, { lat: 15, lon: 190, zoom: 9 });
+  assert.deepEqual(mapView(app), { lat: 15, lon: -170, zoom: 9 });
+  deliverRestoreView(app, { lat: 15, lon: -200, zoom: 9 });
+  assert.deepEqual(mapView(app), { lat: 15, lon: 160, zoom: 9 });
+  deliverRestoreView(app, { lat: 95, lon: 20, zoom: 9 });
+  closeTo(mapView(app).lat, 85.0511);
+  closeTo(mapView(app).lon, 20);
+
+  // A huge finite longitude wraps arithmetically (the vm timeout bounds a hang).
+  deliverRestoreView(app, { lat: 15, lon: 1e300, zoom: 9 });
+  const wrapped = mapView(app);
+  assert.equal(wrapped.lat, 15);
+  assert.ok(wrapped.lon >= -180 && wrapped.lon < 180, `lon ${wrapped.lon} was not wrapped`);
+  deliverRestoreView(app, { lat: -1e300, lon: -1e300, zoom: 9 });
+  closeTo(mapView(app).lat, -85.0511);
+  app.runTimers();
+  assert.deepEqual(app.messages.filter((message) => message.action === "view-changed"), []);
 });
