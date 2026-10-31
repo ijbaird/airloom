@@ -28,6 +28,7 @@ scenario passes.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import http.server
 import json
 import os
@@ -53,6 +54,7 @@ SCALES = (1.0, 1.25, 1.5)
 # (window width, height) in device pixels; 320 and 375 are the widths whose
 # scaled search control previously overflowed (365.5px and 438px).
 LAYOUT_SIZES = ((320, 640), (375, 700), (1280, 800))
+LAYOUT_THEMES = ("light", "dark")
 
 # Stub geocoder responses. Each query maps to (delay seconds, results).
 GEOCODER_RESPONSES = {
@@ -61,6 +63,12 @@ GEOCODER_RESPONSES = {
     "canceltown": (2.5, [{"display_name": "Canceltown, Oregon", "lat": "44.2", "lon": "-121.2"}]),
     "blockertown": (3.0, [{"display_name": "Blockertown, Oregon", "lat": "44.1", "lon": "-121.1"}]),
     "queuedhome": (0.0, [{"display_name": "Queuedhome, Oregon", "lat": "44.3", "lon": "-121.3"}]),
+    # Sentinels mark when an earlier search has been settled (see
+    # scenario_search). Each check needs its own query: the app caches results
+    # by query, and a cache hit would skip the serialized geocoder path.
+    "sentineltown": (0.0, [{"display_name": "Sentineltown, Oregon", "lat": "44.4", "lon": "-121.4"}]),
+    "sentinelcity": (0.0, [{"display_name": "Sentinelcity, Oregon", "lat": "44.6", "lon": "-121.6"}]),
+    "sentinelville": (0.0, [{"display_name": "Sentinelville, Oregon", "lat": "44.7", "lon": "-121.7"}]),
 }
 
 
@@ -108,7 +116,9 @@ CLOCK = time.monotonic
 SLEEP = time.sleep
 
 
-def wait_for(probe, timeout_s: float, what: str):
+def wait_for(probe, timeout_s: float, what: str, retry=(OSError, ConnectionError, AssertionError)):
+    """Poll probe until it returns a value other than None or False. Errors in
+    `retry` count as not ready yet; any other error propagates at once."""
     deadline = CLOCK() + timeout_s
     last_error = None
     while CLOCK() < deadline:
@@ -118,9 +128,9 @@ def wait_for(probe, timeout_s: float, what: str):
                 return value
         except AppExited:
             raise
-        except (OSError, ConnectionError, AssertionError) as exc:
+        except retry as exc:
             last_error = exc
-        SLEEP(0.2)
+        SLEEP(0.2)  # sleep-ok: polling cadence
     raise AssertionError(f"timed out after {timeout_s}s waiting for {what} (last error: {last_error})")
 
 
@@ -138,10 +148,12 @@ def near(center: dict, place: dict, tolerance: float = 0.01) -> bool:
 # ------------------------------------------------------------ geocoder stub
 
 class GeocoderStub:
-    """Loopback Nominatim stand-in that records every query it receives."""
+    """Loopback Nominatim stand-in that records every query it receives and
+    every search it has finished answering."""
 
     def __init__(self):
         self.queries: list[str] = []
+        self.done: list[str] = []
         self._lock = threading.Lock()
         stub = self
 
@@ -156,13 +168,17 @@ class GeocoderStub:
                     with stub._lock:
                         stub.queries.append(query)
                     delay, body = GEOCODER_RESPONSES.get(query.lower(), (0.0, []))
-                    time.sleep(delay)
+                    time.sleep(delay)  # sleep-ok: simulated server delay
                 data = json.dumps(body).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                self.wfile.flush()
+                if not parsed.path.endswith("/reverse"):
+                    with stub._lock:
+                        stub.done.append(query)
 
             def log_message(self, *_args):
                 pass
@@ -184,6 +200,12 @@ class GeocoderStub:
     def received(self, query: str) -> bool:
         with self._lock:
             return query in self.queries
+
+    def completed(self, query: str) -> bool:
+        """The response to `query` has been written and flushed. The client
+        may read it before this is recorded, so poll rather than assert."""
+        with self._lock:
+            return query in self.done
 
 
 # --------------------------------------------------------- owned processes
@@ -227,12 +249,15 @@ def proc_bytes(pid: int, name: str) -> bytes:
 
 
 def descendants(pid: int) -> list[int]:
+    """Every descendant of pid. A parent that exits mid-walk has no children
+    left and is skipped; any other error, such as a permission or I/O failure
+    on a live process, propagates rather than hiding owned descendants."""
     found, frontier = [], [pid]
     while frontier:
         parent = frontier.pop()
         try:
             children = Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
-        except OSError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         for child in map(int, children):
             found.append(child)
@@ -380,6 +405,25 @@ SEARCH_RESULTS_TEXT_JS = """
 })()
 """
 
+# Records every text the results box shows from now on, so a result that is
+# rendered and then replaced before the next probe still counts as shown.
+# MutationObserver callbacks run as microtasks, ahead of any later probe.
+WATCH_SEARCH_RESULTS_JS = """
+(() => {
+  const box = document.querySelector("#search-results");
+  window.__searchResultsSeen = [];
+  if (!window.__searchResultsObserver) {
+    window.__searchResultsObserver = new MutationObserver(() => {
+      window.__searchResultsSeen.push(box.hidden ? "" : box.textContent);
+    });
+    window.__searchResultsObserver.observe(box, { attributes: true, childList: true, subtree: true, characterData: true });
+  }
+  return "watching";
+})()
+"""
+
+SEARCH_RESULTS_SEEN_JS = "window.__searchResultsSeen.join(' | ')"
+
 
 def location_js(place: dict) -> str:
     return '(() => { window.Airloom.receive("location", %s); return "sent"; })()' % json.dumps(
@@ -414,14 +458,18 @@ def scenario_labels(app: DebugApp):
     check(True, "returning to a fully fetched view clears the coverage label")
 
     # Stale fallback needs a failing live PurpleAir fetch, which these
-    # scenarios never make; replay a stale cached publication instead.
+    # scenarios never make; replay a stale cached publication instead. The
+    # summary badges the median reading it shows, so replay one in view.
     stale = eval_js(sock, """(() => {
-      window.Airloom.receive("sensors", { items: [], area: [], favorites: [],
+      const { lat, lon } = window.Airloom.debugState().center;
+      const reading = { id: 1, name: "Replayed", latitude: lat, longitude: ((lon + 180) % 360 + 360) % 360 - 180,
+        aqi: 42, category: "Good", last_seen: Math.round(Date.now() / 1000), origin: "live", delivery: "cache" };
+      window.Airloom.receive("sensors", { items: [reading], area: [reading], favorites: [],
         source: "PurpleAir · cached", stale: true });
       const e = document.querySelector("#summary-provenance");
       return e.hidden ? "" : e.textContent;
     })()""")
-    check(stale == "Stale cached data", "a stale cached publication is labeled (replayed payload)")
+    check(stale == "Stale", f"a stale cached publication is labeled (replayed payload, {stale!r})")
     eval_js(sock, "document.querySelector('#footer-refresh').click()")
     wait_for(lambda: request(sock, "state")["sensorCount"] > 0, 20, "demo sensors after Refresh")
 
@@ -466,22 +514,49 @@ def scenario_save(app: DebugApp):
     check(True, "retrying after the failure saves and closes Preferences")
 
 
+def search_behind(sock: str, geocoder: GeocoderStub, earlier: str, sentinel: str) -> None:
+    """Return once the earlier search's result has almost certainly been
+    delivered or dropped.
+
+    Python drops a superseded or canceled result without telling the page,
+    so the drop itself is not observable. Geocoder admission is serialized and
+    equal-priority GLib idles run FIFO, so the earlier result almost always
+    reaches the page (or is dropped) before the sentinel's, which is submitted
+    only after the stub answered the earlier query and still needs its own
+    worker, lock, throttle and loopback round trip.
+
+    This is not strictly guaranteed: the earlier worker releases the search
+    lock before it calls GLib.idle_add, and Python's Lock isn't FIFO. A worker
+    descheduled in that gap for longer than the sentinel's whole round trip
+    would let a negative check pass falsely; it can never fail falsely. A
+    strict guarantee would need a test-only hook in app.py, deliberately not
+    added.
+    """
+    wait_for(lambda: geocoder.completed(earlier), 10, f"the {earlier} response to complete")
+    eval_js(sock, type_and_submit("#search", sentinel))
+    wait_for(lambda: sentinel.capitalize() in eval_js(sock, SEARCH_RESULTS_TEXT_JS), 15,
+             f"the later {sentinel} results")
+
+
 def scenario_search(app: DebugApp, geocoder: GeocoderStub):
     print("— delayed, out-of-order, and canceled place search —")
     sock = app.sock_path
+    eval_js(sock, WATCH_SEARCH_RESULTS_JS)
     eval_js(sock, type_and_submit("#search", "slowtown"))
     wait_for(lambda: geocoder.received("slowtown"), 10, "the slow search to reach the geocoder")
     eval_js(sock, type_and_submit("#search", "fasttown"))
     wait_for(lambda: "Fasttown" in eval_js(sock, SEARCH_RESULTS_TEXT_JS), 15, "the newer search results")
-    time.sleep(3.5)  # the delayed older response has now completed
-    text = eval_js(sock, SEARCH_RESULTS_TEXT_JS)
-    check("Fasttown" in text and "Slowtown" not in text, "a delayed older search never replaces newer results")
+    search_behind(sock, geocoder, "slowtown", "sentineltown")
+    seen = eval_js(sock, SEARCH_RESULTS_SEEN_JS)
+    check("Fasttown" in seen and "Slowtown" not in seen, "a delayed older search never replaces newer results")
 
+    eval_js(sock, CLEAR_SEARCH_JS)
+    eval_js(sock, WATCH_SEARCH_RESULTS_JS)
     eval_js(sock, type_and_submit("#search", "canceltown"))
     wait_for(lambda: geocoder.received("canceltown"), 10, "the canceled search to reach the geocoder")
     eval_js(sock, CLEAR_SEARCH_JS)
-    time.sleep(3.5)
-    check("Canceltown" not in eval_js(sock, SEARCH_RESULTS_TEXT_JS), "a canceled search never shows its results")
+    search_behind(sock, geocoder, "canceltown", "sentinelcity")
+    check("Canceltown" not in eval_js(sock, SEARCH_RESULTS_SEEN_JS), "a canceled search never shows its results")
     eval_js(sock, CLEAR_SEARCH_JS)
 
     print("— closing Preferences cancels a queued home search before the network —")
@@ -496,7 +571,17 @@ def scenario_search(app: DebugApp, geocoder: GeocoderStub):
     })()""")
     eval_js(sock, type_and_submit("#home-place-input", "queuedhome"))
     eval_js(sock, "document.querySelector('#cancel-settings').click()")
-    time.sleep(5)
+    # The queued home worker has waited on the geocoder's search lock since
+    # before blockertown finished. Admission is serialized and the sentinel,
+    # submitted only after blockertown completed, renders only after its own
+    # trip through the same lock, so a wrongly admitted home search almost
+    # always reaches the stub first. Not strictly guaranteed: Python's Lock
+    # isn't FIFO, so the sentinel could take the lock first and this negative
+    # check could pass falsely (it can never fail falsely). A strict guarantee
+    # would need a test-only hook in app.py, deliberately not added.
+    wait_for(lambda: geocoder.completed("blockertown"), 10, "the blocking search to complete")
+    eval_js(sock, type_and_submit("#search", "sentinelville"))
+    wait_for(lambda: "Sentinelville" in eval_js(sock, SEARCH_RESULTS_TEXT_JS), 15, "the later sentinel results")
     check(not geocoder.received("queuedhome"), "the queued home search never reached the geocoder")
     eval_js(sock, CLEAR_SEARCH_JS)
 
@@ -509,8 +594,8 @@ def scenario_interrupted_motion(app: DebugApp):
     request(sock, "pinch", phase="begin", scale=1.0, x=100, y=100)
     request(sock, "pinch", phase="change", scale=1.4, x=100, y=100)
     request(sock, "pinch", phase="end")
-    time.sleep(2)
-    state = request(sock, "state")
+    state = wait_for(lambda: (lambda state: state if state["navigationIdle"] else None)(request(sock, "state")),
+                     10, "the interrupted fly and pinch to settle")
     check(not near(state["center"], FLY_TARGET, 0.5), "an interrupted fly never reaches its target")
     check(state["viewportScale"] == 1, "native pinch does not change WebKit page scale")
     eval_js(sock, location_js(AWAY))
@@ -519,8 +604,9 @@ def scenario_interrupted_motion(app: DebugApp):
     zoom = request(sock, "state")["zoom"]
     eval_js(sock, "document.querySelector('#zoom-in').click()")
     eval_js(sock, f"window.Airloom.debugZoomTo({zoom - 1})")
-    time.sleep(1.5)
-    check(abs(request(sock, "state")["zoom"] - (zoom - 1)) < 1e-6,
+    state = wait_for(lambda: (lambda state: state if state["navigationIdle"] else None)(request(sock, "state")),
+                     10, "the interrupted zoom to settle")
+    check(abs(state["zoom"] - (zoom - 1)) < 1e-6,
           "a direct zoom cancels the running zoom animation")
     eval_js(sock, f"window.Airloom.debugZoomTo({start['zoom']})")
 
@@ -574,47 +660,7 @@ def scenario_filters(app: DebugApp):
     check(True, "cycling back to Outdoor restores the original visible sensors")
 
 
-def scenario_trend_retry(app: DebugApp):
-    print("— trend retry asks the backend again —")
-    sock = app.sock_path
-    check(request(sock, "state")["selectedId"] is not None, "a sensor is selected")
-    eval_js(sock, "document.querySelector('#detail-card').hidden = false")
-    # The debug state does not expose readings, so read last_seen from the
-    # sensor list the backend published and replay it with an error status.
-    eval_js(sock, """(() => {
-      if (!window.__trendSpy) {
-        window.__trendSpy = [];
-        const receive = window.Airloom.receive;
-        window.Airloom.receive = (event, payload) => {
-          if (event === "sensors") window.__lastSensors = payload;
-          if (event === "trend") window.__trendSpy.push(payload);
-          return receive(event, payload);
-        };
-      }
-      return "spy";
-    })()""")
-    eval_js(sock, "document.querySelector('#footer-refresh').click()")
-    wait_for(lambda: eval_js(sock, "Boolean(window.__lastSensors)"), 15, "a sensors payload")
-    eval_js(sock, """(() => {
-      const id = window.Airloom.debugState().selectedId;
-      const sensor = window.__lastSensors.items.find((s) => s.id === id);
-      window.__trendSpy.length = 0;
-      window.Airloom.receive("trend", { sensor_id: id, request_id: 1000000, status: "error",
-        reading_last_seen: sensor.last_seen, trend: [] });
-      return "error";
-    })()""")
-    check(eval_js(sock, "document.querySelector('#trend-retry').hidden") is False, "a failed trend offers Retry")
-    eval_js(sock, "document.querySelector('#trend-retry').click()")
-    status = wait_for(lambda: eval_js(sock, """(() => {
-      const spy = window.__trendSpy;
-      return spy.length ? spy[spy.length - 1].status : null;
-    })()"""), 10, "the backend's retried trend")
-    check(status in ("loaded", "unavailable"), f"Retry produced a fresh backend trend ({status})")
-    check(eval_js(sock, "document.querySelector('#trend-retry').hidden") is True, "Retry disappears after recovery")
-    eval_js(sock, "document.querySelector('#close-detail').click()")
-
-
-RESIZE_PROBE_JS = """
+RESIZE_PROBE_JS = r"""
 (() => {
   const popup = document.querySelector("#map-popup");
   const search = document.querySelector(".search-overlay").getBoundingClientRect();
@@ -864,6 +910,194 @@ def scenario_reduced_motion(root: Path, geocoder: GeocoderStub):
         app.stop()
 
 
+# Offline tests swap in fake libX11/libXtst libraries through this seam.
+X11_LIBRARY = ctypes.CDLL
+X11_REQUIREMENT = "keyboard-map needs an X11 display with XTEST (libXtst)"
+
+
+class X11Input:
+    """Real pointer and key input through the X server's XTEST extension."""
+
+    def __init__(self):
+        self.dpy = None
+        if not os.environ.get("DISPLAY"):
+            raise AssertionError(X11_REQUIREMENT)
+        try:
+            self.xlib = X11_LIBRARY("libX11.so.6")
+            self.xtst = X11_LIBRARY("libXtst.so.6")
+        except OSError as exc:
+            raise AssertionError(f"{X11_REQUIREMENT}: {exc}") from exc
+        self.xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.xlib.XOpenDisplay.restype = ctypes.c_void_p
+        self.xlib.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        self.xlib.XStringToKeysym.restype = ctypes.c_ulong
+        self.xlib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self.xlib.XKeysymToKeycode.restype = ctypes.c_ubyte
+        self.xlib.XFlush.argtypes = [ctypes.c_void_p]
+        self.xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        int_out = ctypes.POINTER(ctypes.c_int)
+        self.xtst.XTestQueryExtension.argtypes = [ctypes.c_void_p, int_out, int_out, int_out, int_out]
+        self.xtst.XTestQueryExtension.restype = ctypes.c_int
+        self.xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.xtst.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+        self.xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        for fake in (self.xtst.XTestFakeKeyEvent, self.xtst.XTestFakeMotionEvent, self.xtst.XTestFakeButtonEvent):
+            fake.restype = ctypes.c_int
+        self.dpy = self.xlib.XOpenDisplay(None)
+        if not self.dpy:
+            raise AssertionError(f"{X11_REQUIREMENT}: cannot open {os.environ['DISPLAY']}")
+        # libXtst loading proves nothing about the server; ask it for XTEST.
+        event_base, error_base, major, minor = (ctypes.c_int() for _ in range(4))
+        if not self.xtst.XTestQueryExtension(self.dpy, ctypes.byref(event_base), ctypes.byref(error_base),
+                                             ctypes.byref(major), ctypes.byref(minor)):
+            self.close()
+            raise AssertionError(f"{X11_REQUIREMENT}: the X server on {os.environ['DISPLAY']} lacks the XTEST "
+                                 "extension (Xvfb provides it unless started with -tst or -extension XTEST)")
+
+    @staticmethod
+    def _checked(kind: str, status: int):
+        if not status:
+            raise AssertionError(f"XTEST rejected the fake {kind} event")
+
+    def _keycode(self, name: str) -> int:
+        keysym = self.xlib.XStringToKeysym(name.encode("ascii"))
+        keycode = self.xlib.XKeysymToKeycode(self.dpy, keysym) if keysym else 0
+        if not keycode:
+            raise AssertionError(f"the X keyboard map has no key for {name!r}")
+        return keycode
+
+    def _press(self, keycode: int, down: bool):
+        self._checked("key", self.xtst.XTestFakeKeyEvent(self.dpy, keycode, 1 if down else 0, 0))
+
+    def key(self, name: str, shift: bool = False):
+        keycode = self._keycode(name)
+        shift_code = self._keycode("Shift_L") if shift else None
+        if shift_code:
+            self._press(shift_code, True)
+        try:
+            self._press(keycode, True)
+            self._press(keycode, False)
+        finally:
+            # Never leave Shift held down on the server, even after a rejected key.
+            if shift_code:
+                self._press(shift_code, False)
+            self.xlib.XFlush(self.dpy)
+
+    def move(self, x: int, y: int):
+        self._checked("motion", self.xtst.XTestFakeMotionEvent(self.dpy, -1, x, y, 0))
+        self.xlib.XFlush(self.dpy)
+
+    def click(self, x: int, y: int):
+        self.move(x, y)
+        self._checked("button", self.xtst.XTestFakeButtonEvent(self.dpy, 1, 1, 0))
+        self._checked("button", self.xtst.XTestFakeButtonEvent(self.dpy, 1, 0, 0))
+        self.xlib.XFlush(self.dpy)
+
+    def close(self):
+        if self.dpy:
+            self.xlib.XCloseDisplay(self.dpy)
+            self.dpy = None
+
+
+MOUSE_RECORDER_JS = """
+(() => {
+  window.__lastMouse = null;
+  if (!window.__mouseRecorder) {
+    window.__mouseRecorder = (event) => { window.__lastMouse = { x: event.clientX, y: event.clientY }; };
+    document.addEventListener("mousemove", window.__mouseRecorder, true);
+  }
+  return "installed";
+})()
+"""
+
+
+def page_origin(sock: str, x11: X11Input) -> tuple[int, int]:
+    """Where the page's (0, 0) sits on the X screen, at 100% interface scale."""
+    # Move somewhere else first so the final move is a real motion event.
+    eval_js(sock, MOUSE_RECORDER_JS)
+    x11.move(590, 390)
+    wait_for(lambda: eval_js(sock, "window.__lastMouse"), 5, "a recorded pointer move")
+    eval_js(sock, MOUSE_RECORDER_JS)
+    x11.move(600, 400)
+    mouse = wait_for(lambda: eval_js(sock, "window.__lastMouse"), 5, "a recorded pointer move")
+    return 600 - mouse["x"], 400 - mouse["y"]
+
+
+def element_center(sock: str, selector: str, origin: tuple[int, int]) -> tuple[int, int]:
+    rect = eval_js(sock, f"""(() => {{
+      const r = document.querySelector({json.dumps(selector)}).getBoundingClientRect();
+      return {{ x: r.left + r.width / 2, y: r.top + r.height / 2 }};
+    }})()""")
+    return round(origin[0] + rect["x"]), round(origin[1] + rect["y"])
+
+
+ACTIVE_FOCUS_JS = """
+(() => {
+  const active = document.activeElement;
+  if (!active) return null;
+  return active.id === "map-panel" ? "map-panel" : (active.classList.contains("map-marker") ? active.dataset.id : active.id || active.tagName);
+})()
+"""
+
+
+def scenario_keyboard_map(root: Path, geocoder: GeocoderStub):
+    print("— real keyboard input reaches, pans, and zooms the map —")
+    app = DebugApp(root, "keyboard-map", geocoder.url, extra_env={"GDK_BACKEND": "x11"})
+    x11 = None
+    try:
+        app.start().wait_ready()
+        sock = app.sock_path
+        x11 = X11Input()
+        origin = page_origin(sock, x11)
+
+        x11.click(*element_center(sock, "#search", origin))
+        wait_for(lambda: eval_js(sock, "document.activeElement.id") == "search", 5, "a real click to focus search")
+        expected = eval_js(sock, """[...document.querySelectorAll(".map-marker")].map((m) => m.dataset.id).reverse()""")
+        expected.append("map-panel")
+        reached = []
+        for target in expected:
+            x11.key("Tab", shift=True)
+            wait_for(lambda: eval_js(sock, ACTIVE_FOCUS_JS) == target, 5, f"Shift+Tab to reach {target}")
+            reached.append(target)
+        check(reached == expected, f"Shift+Tab from search crosses {len(expected) - 1} markers to the map")
+        ring = eval_js(sock, """(() => {
+          const panel = document.querySelector("#map-panel");
+          return { focusVisible: panel.matches(":focus-visible"), outline: getComputedStyle(panel).outlineStyle };
+        })()""")
+        check(ring["focusVisible"] and ring["outline"] != "none", f"the focused map shows its focus ring ({ring})")
+
+        check(eval_js(sock, COUNT_SENSOR_PAYLOADS_JS) == "installed", "payload counter installed")
+        before = request(sock, "state")
+        x11.key("Right")
+        wait_for(lambda: request(sock, "state")["center"]["lon"] > before["center"]["lon"], 5, "Right to pan east")
+        wait_for(lambda: eval_js(sock, "window.__sensorsPayloads") >= 1, 20, "the panned view's sensor fetch")
+        panned = request(sock, "state")
+        check(panned["center"]["lon"] > before["center"]["lon"] and panned["zoom"] == before["zoom"],
+              "Right pans the map east and fetches the new view")
+
+        zoom = request(sock, "state")["zoom"]
+        x11.key("equal")
+        wait_for(lambda: (lambda state: state["zoom"] == zoom + 1 and state["navigationIdle"])(request(sock, "state")),
+                 10, "= to zoom in one level and settle")
+        x11.key("minus")
+        wait_for(lambda: (lambda state: state["zoom"] == zoom and state["navigationIdle"])(request(sock, "state")),
+                 10, "- to zoom back out and settle")
+        check(eval_js(sock, "document.activeElement.id") == "map-panel",
+              f"= and - zoom the map from {zoom} to {zoom + 1} and back, keeping focus on it")
+
+        x11.click(*element_center(sock, "#search", origin))
+        wait_for(lambda: eval_js(sock, "document.activeElement.id") == "search", 5, "a real click to refocus search")
+        center = request(sock, "state")["center"]
+        x11.key("Right")
+        x11.key("x")
+        wait_for(lambda: eval_js(sock, "document.querySelector('#search').value.endsWith('x')"), 5, "typing into search")
+        check(request(sock, "state")["center"] == center, "arrow keys in the search field leave the map alone")
+    finally:
+        if x11 is not None:
+            x11.close()
+        app.stop()
+
+
 # ------------------------------------------------- fixture PurpleAir data
 
 DEAD_PROXY_ENV = {name: "http://127.0.0.1:9" for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")}
@@ -899,15 +1133,19 @@ PUBLICATION_JS = """
 
 
 def fixture_rows() -> list[dict]:
-    def row(sensor_id, location_type, age_s, pm):
+    def row(sensor_id, location_type, age_s, pm, **averages):
         return {"sensor_index": sensor_id, "name": f"Fixture {sensor_id}",
                 "latitude": HOME["latitude"] + 0.004 * sensor_id, "longitude": HOME["longitude"] + 0.004,
                 "location_type": location_type, "age_s": age_s, "humidity": 50, "temperature": 70,
-                "pm1.0": 5, "pm2.5_cf_1": pm, "pm10.0": 9, "confidence": 100}
+                "pm1.0": 5, "pm2.5_cf_1": pm, "pm10.0": 9, "confidence": 100, **averages}
+    # Distinct PM values give the summary one median reading: with every
+    # sensor shown, AQI order is 4, 1, 2, 3, so the median is expired fixture 2.
     return [row(1, 0, 30, 150),        # fresh outdoor favorite above the threshold
-            row(2, 0, 3 * 3600, 150),  # expired outdoor favorite above the threshold
-            row(3, 1, 30, 150),        # fresh indoor favorite above the threshold
-            row(4, 0, 30, 5)]          # clean outdoor sensor
+            row(2, 0, 3 * 3600, 160),  # expired outdoor favorite above the threshold
+            row(3, 1, 30, 170),        # fresh indoor favorite above the threshold
+            row(4, 0, 30, 5, **{       # clean outdoor sensor with a rolling-average trend
+                "pm2.5_10minute": 6, "pm2.5_30minute": 7, "pm2.5_60minute": 8,
+                "pm2.5_6hour": 10, "pm2.5_24hour": 12, "pm2.5_1week": 14})]
 
 
 class FixtureApp(DebugApp):
@@ -934,7 +1172,9 @@ class FixtureApp(DebugApp):
         eval_js(self.sock_path, action_js)
         wait_for(lambda: eval_js(self.sock_path, SENSOR_SPY_JS) > before
                  and request(self.sock_path, "state") is not None, 20, what)
-        time.sleep(0.5)  # let alert persistence and toasts settle
+        # No settling wait: _finish_refresh sends the sensors, its errors and
+        # alert persistence in one main-loop callback, and the eval that
+        # observed the new count was queued after that callback returned.
         return eval_js(self.sock_path, PUBLICATION_JS)
 
     def notifications(self) -> list[int]:
@@ -953,6 +1193,19 @@ class FixtureApp(DebugApp):
 
 REFRESH_JS = "document.querySelector('#footer-refresh').click()"
 
+OLD_BADGE_JS = """
+(() => {
+  const rows = {}, markers = {};
+  for (const id of ["1", "2", "4"]) {
+    const row = document.querySelector(`#sensor-list .sensor-row[data-id="${id}"]`);
+    rows[id] = row ? (row.querySelector(".provenance-badge")?.textContent ?? "") : null;
+    const marker = document.querySelector(`.map-marker[data-id="${id}"]`);
+    markers[id] = marker ? marker.getAttribute("aria-label").endsWith(" · Old") : null;
+  }
+  return { rows, markers };
+})()
+"""
+
 
 def scenario_alerts(root: Path, geocoder: GeocoderStub):
     print("— demo, expired, and fresh observations through the alert path —")
@@ -962,7 +1215,7 @@ def scenario_alerts(root: Path, geocoder: GeocoderStub):
         sock = app.sock_path
         eval_js(sock, SENSOR_SPY_JS)
         demo = app.publish(REFRESH_JS, "the demo fallback")
-        check(demo["source"] == "Demo data" and demo["label"] == "Demo data",
+        check(demo["source"] == "Demo data" and demo["label"] == "Demo",
               "an outage with an empty cache falls back to labeled demo data")
         check(demo["maxAqi"] >= 101, f"demo favorites include readings above the threshold ({demo['maxAqi']})")
         check(app.notifications() == [], "demo readings raise no alert")
@@ -973,6 +1226,11 @@ def scenario_alerts(root: Path, geocoder: GeocoderStub):
         check(live["source"] == "PurpleAir live" and live["ids"] == [1, 2, 4],
               f"live outdoor readings are published ({live['source']}, {live['ids']})")
         check(app.notifications() == [1], f"only the fresh favorite alerts ({app.notifications()})")
+        badges = eval_js(sock, OLD_BADGE_JS)
+        check(badges["rows"] == {"1": "", "2": "Old", "4": ""},
+              f"only the 3 h old reading's row carries the Old badge ({badges['rows']})")
+        check(badges["markers"] == {"1": False, "2": True, "4": False},
+              f"only the 3 h old reading's marker is announced Old ({badges['markers']})")
         live = app.set_filter("both", "all sensors")
         check(live["ids"] == [1, 2, 3, 4], f"the indoor favorite appears with All sensors ({live['ids']})")
         check(app.notifications() == [1, 3], f"the fresh indoor favorite alerts once ({app.notifications()})")
@@ -993,7 +1251,8 @@ def scenario_cache_fallback(root: Path, geocoder: GeocoderStub):
         eval_js(sock, SENSOR_SPY_JS)
         app.publish(REFRESH_JS, "live fixture readings")
         live = app.set_filter("both", "every fixture sensor cached")
-        check(live["ids"] == [1, 2, 3, 4] and live["label"] == "", "live readings carry no fallback label")
+        check(live["ids"] == [1, 2, 3, 4] and live["label"] == "Old",
+              f"live readings carry no fallback label; the summary badges its expired median ({live['label']!r})")
         alerted = app.notifications()
 
         app.set_fixture(fail=True)
@@ -1005,16 +1264,75 @@ def scenario_cache_fallback(root: Path, geocoder: GeocoderStub):
               f"the outage serves cached readings ({stale['source']})")
         check(stale["ids"] == [1, 2, 4], f"cached fallback still applies the Outdoor filter ({stale['ids']})")
         check(stale["deliveries"] == ["cache"], "every fallback reading is marked as cache delivery")
-        check(stale["label"] == "Stale cached data", f"the summary is labeled stale ({stale['label']!r})")
+        check(stale["label"] == "Stale", f"the summary is labeled stale ({stale['label']!r})")
         check(any("Showing cached readings" in toast for toast in stale["toasts"]),
               "the outage is explained to the user")
         app.set_filter("indoor", "indoor readings")
         stale = app.publish(REFRESH_JS, "stale indoor readings")
-        check(stale["ids"] == [3] and stale["label"] == "Stale cached data",
+        check(stale["ids"] == [3] and stale["label"] == "Stale",
               f"switching to Indoor filters the cached fallback ({stale['ids']})")
         check(app.notifications() == alerted, "cached fallback raises no repeat alerts")
         check(app.alert_states() == {"900000": False, "1": True, "3": True},
               f"alert state survives the fallback ({app.alert_states()})")
+    finally:
+        app.stop()
+
+
+TREND_PROBE_JS = """
+(() => {
+  const retry = document.querySelector("#trend-retry");
+  return { retryHidden: retry.hidden, retryDisabled: retry.disabled,
+    chartText: document.querySelector("#chart").textContent,
+    rows: [...document.querySelectorAll("#trend-values tr[data-window]")].map(
+      (tr) => [tr.dataset.window, Number(tr.querySelector("td").textContent)]) };
+})()
+"""
+
+
+def terminal_trend(probe: dict) -> dict | None:
+    """The probe once the chart has settled: Retry hidden, no longer loading,
+    and either plotted values or an unavailable message."""
+    if not probe["retryHidden"] or "Loading" in probe["chartText"]:
+        return None
+    if probe["rows"] or "Trend unavailable" in probe["chartText"]:
+        return probe
+    return None
+
+
+def scenario_trend_retry(root: Path, geocoder: GeocoderStub):
+    print("— trend retry recovers from a real backend failure —")
+    if str(PROJECT) not in sys.path:
+        sys.path.insert(0, str(PROJECT))
+    from airloom.purpleair import trend_from_values
+
+    app = FixtureApp(root, "trend-retry", geocoder, fail=False)
+    try:
+        app.start().wait_ready()
+        sock = app.sock_path
+        eval_js(sock, SENSOR_SPY_JS)
+        app.publish(REFRESH_JS, "live fixture readings")
+
+        # The selected reading's own trend fetch meets the outage, so the
+        # error carries the backend's real request identity.
+        app.set_fixture(fail=True)
+        eval_js(sock, """document.querySelector('#sensor-list .sensor-row[data-id="4"]').click()""")
+        failed = wait_for(lambda: (lambda p: p if not p["retryHidden"] and "Trend unavailable" in p["chartText"]
+                                   else None)(eval_js(sock, TREND_PROBE_JS)),
+                          20, "the failed trend fetch to offer Retry")
+        check(failed["rows"] == [] and not failed["retryDisabled"],
+              f"a failed trend fetch shows no values and an enabled Retry ({failed['chartText']!r})")
+
+        app.set_fixture(fail=False)
+        eval_js(sock, "document.querySelector('#trend-retry').click()")
+        settled = wait_for(lambda: terminal_trend(eval_js(sock, TREND_PROBE_JS)), 20,
+                           "the retried trend to render a terminal state")
+        row4 = next(row for row in fixture_rows() if row["sensor_index"] == 4)
+        expected = [[point["label"], point["aqi"]]
+                    for point in trend_from_values({**row4, "last_seen": 0})]
+        check(settled["rows"] == expected,
+              f"Retry renders the fixture's rolling-average values ({settled['rows']})")
+        check("<svg" in eval_js(sock, "document.querySelector('#chart').innerHTML"),
+              "the recovered trend is drawn as a chart")
     finally:
         app.stop()
 
@@ -1034,7 +1352,11 @@ def scenario_stripped_debug(root: Path, geocoder: GeocoderStub):
     app = DebugApp(root, "stripped", geocoder.url, project=stripped, debug_socket=False, private_bus=True)
     try:
         app.start()
-        time.sleep(8)
+        # Retry nothing: enumeration errors other than a vanished process must
+        # fail the scenario rather than read as "not started yet".
+        wait_for(lambda: any(b"WebKitWebProcess" in proc_bytes(pid, "cmdline")
+                             for pid in descendants(app.process.pid)), 30, "the stripped app's web process",
+                 retry=())
         check(app.process.poll() is None, "the app keeps running without the debug module")
         caller_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
         app_pids = [pid for pid in descendants(app.process.pid)
@@ -1074,13 +1396,63 @@ LAYOUT_MEASURE_JS = r"""
     }
   }
   const clipped = [];
-  for (const selector of [".search-overlay", ".search-pill", ".summary-chip", ".corner-buttons", ".map-popup", ".settings-dialog", ".shell-status"]) {
+  const shown = (el) => el && !el.closest("[hidden]") && el.getBoundingClientRect().width;
+  for (const selector of [".search-overlay", ".search-pill", ".summary-chip", ".summary-copy", ".corner-buttons", ".map-popup",
+                          ".detail-card", ".aqi-row", ".settings-dialog", ".shell-status"]) {
     const el = document.querySelector(selector);
-    if (!el || el.closest("[hidden]") || !el.getBoundingClientRect().width) continue;
+    if (!shown(el)) continue;
     if (el.scrollWidth > el.clientWidth + 1) clipped.push(`${selector} ${el.scrollWidth}>${el.clientWidth}`);
+  }
+  // Content may be clipped by an ancestor without scrolling it: every visible
+  // descendant must also sit inside its overlay's box.
+  const escaped = [];
+  for (const selector of [".summary-chip", ".detail-card", ".map-popup", ".sensors-panel"]) {
+    const container = document.querySelector(selector);
+    if (!shown(container)) continue;
+    const box = container.getBoundingClientRect();
+    for (const el of container.querySelectorAll("*")) {
+      if (el.closest(".visually-hidden") || el.closest("[hidden]")) continue;
+      const style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") continue;
+      const rect = el.getBoundingClientRect();
+      if (!rect.width || !rect.height) continue;
+      if (rect.left < box.left - 0.5 || rect.right > box.right + 0.5) {
+        escaped.push(`${selector} ${describe(el)} [${rect.left.toFixed(1)}, ${rect.right.toFixed(1)}] outside [${box.left.toFixed(1)}, ${box.right.toFixed(1)}]`);
+      }
+    }
+  }
+  // Preferences must not scroll sideways, and its title and close button share
+  // one line without squeezing the button.
+  let preferences = null;
+  const dialog = document.querySelector("#settings-dialog");
+  if (dialog.open) {
+    const form = document.querySelector("#settings-form");
+    const heading = document.querySelector("#settings-title");
+    const title = heading.getBoundingClientRect();
+    const close = document.querySelector("#close-settings").getBoundingClientRect();
+    const scale = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--interface-scale"));
+    const text = document.createRange();
+    text.selectNodeContents(heading);
+    // At fractional zoom clientWidth rounds down and scrollWidth up (518.4px
+    // reads as 519>518), so confirm with the real horizontal scroll range.
+    const scrolls = (el) => {
+      if (el.scrollWidth <= el.clientWidth + 0.5) return false;
+      el.scrollLeft = el.scrollWidth;
+      const range = el.scrollLeft;
+      el.scrollLeft = 0;
+      return range > 0;
+    };
+    preferences = {
+      scroll: [dialog, form].filter(scrolls).map((el) => `#${el.id} ${el.scrollWidth}>${el.clientWidth}`),
+      titleLines: new Set([...text.getClientRects()].map((r) => Math.round(r.top))).size,
+      titleRight: title.right, closeLeft: close.left, closeWidth: close.width, closeHeight: close.height,
+      closeTarget: 34 * scale,
+    };
   }
   const input = document.querySelector("#search").getBoundingClientRect();
   return JSON.stringify({
+    preferences,
+    theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
     viewport: width,
     scrollWidth: document.documentElement.scrollWidth,
     cssScale: getComputedStyle(document.documentElement).getPropertyValue("--interface-scale").trim(),
@@ -1089,8 +1461,28 @@ LAYOUT_MEASURE_JS = r"""
     searchInputWidth: input.width,
     overflow: overflow.slice(0, 12),
     clipped,
+    escaped: escaped.slice(0, 12),
   });
 })()
+"""
+
+# Changes while the page is still laying out after a state change.
+LAYOUT_SIGNATURE_JS = """
+(() => {
+  const rect = (selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return [r.left, r.top, r.width, r.height].map(Math.round);
+  };
+  return JSON.stringify([document.documentElement.scrollWidth,
+    ...[".search-overlay", ".summary-chip", ".detail-card", ".map-popup", ".sensors-panel", ".settings-dialog",
+        ".shell-status"].map(rect)]);
+})()
+"""
+
+HOME_PLACE_RESULTS_SHOWN_JS = """
+String(document.querySelectorAll("#home-place-results button").length > 0)
 """
 
 LAYOUT_STATES_JS = {
@@ -1120,6 +1512,30 @@ LAYOUT_STATES_JS = {
       document.querySelector("#sensors-button").click();
       return "sensors";
     })()""",
+    # The widest detail content: a three-digit AQI, a long sensor name with the
+    # indoor tag, a provenance badge and a long place name in the summary.
+    "detail": """(() => {
+      document.querySelector("#close-sensors").click();
+      const band = AirloomCore.bandForAQI(150);
+      const center = window.Airloom.debugState().center;
+      const sensor = { id: 990001, name: "Northeast Martin Luther King Junior Boulevard Community Garden Rooftop Monitor 3",
+        latitude: center.lat, longitude: center.lon, aqi: 150, category: band.label, color: band.color,
+        foreground: band.foreground, guidance: band.guidance, last_seen: Math.round(Date.now() / 1000) - 30,
+        delivery: "cache", indoor: true, favorite: true };
+      // The browser preview filters indoor sensors out of the list; show both
+      // while selecting, then restore the filter the later states expect.
+      const filter = window.Airloom.debugState().location_filter;
+      window.Airloom.receive("config", { location_filter: "both" });
+      window.Airloom.receive("sensors", { items: [sensor], area: [sensor], favorites: [], selected_id: 990001,
+        source: "PurpleAir · cached", stale: true });
+      window.Airloom.receive("view-name", { name: "Llanfairpwllgwyngyllgogerychwyrndrobwllllantysiliogogogoch, Isle of Anglesey, Wales" });
+      const row = document.querySelector("#sensor-list .sensor-row");
+      if (row) row.click();
+      window.Airloom.receive("config", { location_filter: filter });
+      const card = document.querySelector("#detail-card");
+      const visible = !card.hidden && card.getClientRects().length > 0;
+      return visible && document.querySelector("#detail-provenance").textContent === "Stale" ? "detail" : "no-detail";
+    })()""",
     "settings": """(() => {
       document.querySelector("#close-sensors").click();
       window.Airloom.receive("open-settings");
@@ -1136,6 +1552,81 @@ LAYOUT_STATES_JS = {
     })()""",
 }
 
+HOME_PLACE_ROW_JS = r"""
+(() => {
+  const dialog = document.querySelector("#settings-dialog");
+  if (dialog.open) dialog.close();
+  window.Airloom.receive("open-settings");
+  const form = document.querySelector("#settings-form");
+  const row = document.querySelector("#home-place-row");
+  const shown = () => ({ display: getComputedStyle(row).display, boxes: row.getClientRects().length });
+  const choose = (mode) => {
+    const radio = form.querySelector(`input[name="home_mode"][value="${mode}"]`);
+    radio.checked = true;
+    radio.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+  const out = { mode: form.elements.home_mode.value, auto: shown() };
+  choose("fixed");
+  out.fixed = shown();
+  choose("auto");
+  out.autoAgain = shown();
+  dialog.close();
+  return JSON.stringify(out);
+})()
+"""
+
+# Desktop only: types a fixed-home query and submits it; layout_child answers
+# the bridge's place-search with HOME_PLACE_RESULTS, never Nominatim.
+HOME_PLACE_SEARCH_JS = r"""
+(() => {
+  window.Airloom.receive("open-settings");
+  const radio = document.querySelector('#settings-form input[name="home_mode"][value="fixed"]');
+  radio.checked = true;
+  radio.dispatchEvent(new Event("change", { bubbles: true }));
+  const input = document.querySelector("#home-place-input");
+  input.focus();
+  input.value = "Llanfairpwllgwyngyll";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  return "submitted";
+})()
+"""
+
+HOME_PLACE_RESULTS = [
+    {"name": "Llanfairpwllgwyngyllgogerychwyrndrobwllllantysiliogogogoch, Isle of Anglesey, Wales, LL61 5UJ, United Kingdom",
+     "latitude": 53.2239, "longitude": -4.1979},
+    {"name": "Portland, Multnomah County, Oregon, United States", "latitude": 45.5152, "longitude": -122.6784},
+    {"name": "Portland, Cumberland County, Maine, United States", "latitude": 43.6591, "longitude": -70.2568},
+]
+
+HOME_PLACE_SEARCH_MEASURE_JS = r"""
+(() => {
+  const dialog = document.querySelector("#settings-dialog");
+  const input = document.querySelector("#home-place-input");
+  const results = document.querySelector("#home-place-results");
+  const box = (el) => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; };
+  const frame = box(dialog);
+  const escaped = [];
+  for (const el of [input, results, ...results.querySelectorAll("*")]) {
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    if (r.left < frame.left - 0.5 || r.right > frame.right + 0.5) {
+      escaped.push(`${el.id ? "#" + el.id : el.tagName.toLowerCase()} [${r.left.toFixed(1)}, ${r.right.toFixed(1)}] outside [${frame.left.toFixed(1)}, ${frame.right.toFixed(1)}]`);
+    }
+  }
+  const clipped = [];
+  for (const el of [dialog, document.querySelector("#settings-form"), results, ...results.querySelectorAll("button")]) {
+    if (el.scrollWidth > el.clientWidth + 1) clipped.push(`${el.id ? "#" + el.id : el.tagName.toLowerCase()} ${el.scrollWidth}>${el.clientWidth}`);
+  }
+  const out = {
+    open: dialog.open, value: input.value, resultsShown: !results.hidden && results.getClientRects().length > 0,
+    results: results.querySelectorAll("button").length, input: box(input), dropdown: box(results),
+    escaped, clipped, theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+  };
+  return JSON.stringify(out);
+})()
+"""
+
 PREVIEW_ACTIONS_JS = r"""
 (() => {
   const out = {};
@@ -1147,7 +1638,66 @@ PREVIEW_ACTIONS_JS = r"""
   out.filter = chip.textContent;
   chip.click(); chip.click();
   window.Airloom.receive("open-settings");
-  document.querySelector("#settings-form").requestSubmit(document.querySelector("#save-settings"));
+  const form = document.querySelector("#settings-form");
+  out.unsupportedDisabled = ["radius_km", "refresh_minutes", "alert_threshold", "confidence_filter"]
+    .map((name) => form.elements[name]).concat(document.querySelector("#home-fieldset"))
+    .every((control) => control.disabled);
+  const note = document.querySelector("#preview-settings-note");
+  out.noteVisible = !note.hidden && note.getClientRects().length > 0;
+  out.dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  // Disabled controls must look disabled yet stay legible: compare a disabled
+  // field with an enabled field of the same kind, and measure text contrast
+  // against the first opaque background behind it.
+  const rgba = (value) => {
+    const parts = value.match(/[\d.]+/g).map(Number);
+    return [parts[0], parts[1], parts[2], parts.length > 3 ? parts[3] : 1];
+  };
+  const backdrop = (element) => {
+    const layers = [];
+    for (let node = element; node; node = node.parentElement) {
+      const layer = rgba(getComputedStyle(node).backgroundColor);
+      if (layer[3] > 0) layers.push(layer);
+      if (layer[3] >= 1) break;
+    }
+    let color = out.dark ? [0, 0, 0] : [255, 255, 255];
+    for (const [r, g, b, a] of layers.reverse()) color = [r, g, b].map((channel, i) => channel * a + color[i] * (1 - a));
+    return color;
+  };
+  const luminance = (rgb) => {
+    const [r, g, b] = rgb.map((channel) => {
+      const c = channel / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const contrast = (element) => {
+    const style = getComputedStyle(element);
+    const [r, g, b, a] = rgba(style.webkitTextFillColor || style.color);
+    const back = backdrop(element);
+    const text = [r, g, b].map((channel, i) => channel * a + back[i] * (1 - a));
+    const [light, dark] = [luminance(text), luminance(back)].sort((x, y) => y - x);
+    return Math.round((light + 0.05) / (dark + 0.05) * 100) / 100;
+  };
+  const look = (element) => {
+    const style = getComputedStyle(element);
+    return { color: style.color, background: style.backgroundColor, borderStyle: style.borderStyle,
+             appearance: style.appearance || style.webkitAppearance, cursor: style.cursor, opacity: style.opacity,
+             contrast: contrast(element) };
+  };
+  const checkboxLabel = (name) => form.elements[name].closest("label");
+  out.disabledLook = {
+    radius: look(form.elements.radius_km),
+    alert: look(form.elements.alert_threshold),
+    homeInput: look(document.querySelector("#home-place-input")),
+    refresh: look(form.elements.refresh_minutes),
+    homeLabel: look(document.querySelector("#home-fieldset label")),
+    confidenceLabel: look(checkboxLabel("confidence_filter").querySelector("span")),
+    confidenceRow: look(checkboxLabel("confidence_filter")),
+    enabledNumber: look(form.elements.heatmap_threshold_km),
+    enabledSelect: look(form.elements.interface_scale),
+    enabledRadioLabel: look(form.querySelector("fieldset:not(#home-fieldset) label")),
+  };
+  form.requestSubmit(document.querySelector("#save-settings"));
   out.settingsOpen = document.querySelector("#settings-dialog").open;
   out.saveStatus = document.querySelector("#ui-status").textContent;
   return JSON.stringify(out);
@@ -1160,7 +1710,8 @@ def layout_child(cases: list[dict]) -> int:
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("WebKit", "6.0")
-    from gi.repository import GLib, Gtk, WebKit
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf, GLib, Gtk, WebKit
 
     sys.path.insert(0, str(PROJECT))
     from airloom.demo import demo_sensors
@@ -1192,8 +1743,62 @@ def layout_child(cases: list[dict]) -> int:
             raise RuntimeError(box["error"])
         return box["value"]
 
+    def rendered_background(webview, selector: str) -> list[int]:
+        point = json.loads(run_js(webview, """(() => {
+          const element = document.querySelector(%s);
+          element.scrollIntoView({block: "center"});
+          const rect = element.getBoundingClientRect();
+          return JSON.stringify({x: rect.left + 5, y: rect.top + rect.height / 2, width: innerWidth});
+        })()""" % json.dumps(selector)))
+        pump(0.2)  # sleep-ok: lets WebKit paint the scrolled frame; painting is not observable from the page
+        loop = GLib.MainLoop()
+        box = {}
+
+        def done(view, result, _data=None):
+            try:
+                box["texture"] = view.get_snapshot_finish(result)
+            except GLib.Error as exc:
+                box["error"] = str(exc)
+            loop.quit()
+
+        webview.get_snapshot(WebKit.SnapshotRegion.VISIBLE, WebKit.SnapshotOptions.NONE, None, done, None)
+        loop.run()
+        if "error" in box:
+            raise RuntimeError(box["error"])
+        loader = GdkPixbuf.PixbufLoader()
+        loader.write(box["texture"].save_to_png_bytes().get_data())
+        loader.close()
+        pixbuf = loader.get_pixbuf()
+        ratio = pixbuf.get_width() / point["width"]
+        x, y = int(point["x"] * ratio), int(point["y"] * ratio)
+        offset = y * pixbuf.get_rowstride() + x * pixbuf.get_n_channels()
+        return list(pixbuf.get_pixels()[offset:offset + 3])
+
+    def settle_layout(webview, ready_js: str | None = None) -> bool:
+        """Wait (at most 5 s) for ready_js, if given, to report true and for
+        two consecutive layout signatures to match."""
+        deadline = time.monotonic() + 5
+        previous = None
+        while time.monotonic() < deadline:
+            pump(0.05)  # sleep-ok: polling cadence
+            if ready_js is not None and run_js(webview, ready_js) != "true":
+                continue
+            current = run_js(webview, LAYOUT_SIGNATURE_JS)
+            if current == previous:
+                return True
+            previous = current
+        return False
+
     # Callers pass one case per process: a second WebView created in the
     # same process was never given a size under a headless compositor.
+    # WebKitGTK derives prefers-color-scheme from GTK, which otherwise follows
+    # the host's portal preference; pin it so "light" cases really are light.
+    dark = any(case["theme"] == "dark" for case in cases)
+    settings = Gtk.Settings.get_default()
+    if settings.find_property("gtk-interface-color-scheme"):
+        scheme = Gtk.InterfaceColorScheme.DARK if dark else Gtk.InterfaceColorScheme.LIGHT
+        settings.set_property("gtk-interface-color-scheme", scheme)
+    settings.set_property("gtk-application-prefer-dark-theme", dark)
     window = Gtk.Window(title="Airloom layout probe")
     window.set_default_size(1400, 900)
     window.present()
@@ -1217,6 +1822,11 @@ def layout_child(cases: list[dict]) -> int:
                         json.dumps({"items": sensors, "area": sensors, "favorites": [],
                                     "source": "Demo data", "config": config}))
                     holder_view[0].evaluate_javascript(script, -1, None, None, None, None, None)
+                elif message.get("action") == "place-search" and message.get("context") == "home":
+                    reply = {"request_id": message["request_id"], "context": "home", "query": message["query"],
+                             "results": HOME_PLACE_RESULTS}
+                    holder_view[0].evaluate_javascript("window.Airloom.receive('places', %s);" % json.dumps(reply),
+                                                       -1, None, None, None, None, None)
 
             holder_view = [webview]
             manager.connect("script-message-received::airloom", on_message)
@@ -1229,7 +1839,7 @@ def layout_child(cases: list[dict]) -> int:
         webview.load_uri(entry)
         deadline = time.monotonic() + 30
         while True:
-            pump(0.2)
+            pump(0.2)  # sleep-ok: polling cadence
             try:
                 ready = run_js(webview, "String(Boolean(window.Airloom && window.Airloom.debugState().sensorCount > 0 && document.querySelectorAll('.map-marker').length))")
             except RuntimeError:
@@ -1243,31 +1853,80 @@ def layout_child(cases: list[dict]) -> int:
                     detail = str(exc)
                 print(json.dumps({**case, "error": f"page never became ready: {detail}"}), flush=True)
                 return 1
+
+        def settled(what: str) -> bool:
+            if settle_layout(webview):
+                return True
+            print(json.dumps({**case, "error": f"layout never settled {what}"}), flush=True)
+            return False
+
         if mode == "preview":
             run_js(webview, "window.Airloom.receive('config', {interface_scale: %s}); 'ok'" % scale)
-        pump(0.3)
+        if not settled("after loading"):
+            return 1
+        # The page reports its own theme as "theme"; keep the requested one apart.
+        requested = {**case, "case_theme": case["theme"]}
         for name, script in LAYOUT_STATES_JS.items():
             outcome = run_js(webview, script)
-            pump(0.3)
+            if not settled(f"in the {name} state"):
+                return 1
             measured = json.loads(run_js(webview, LAYOUT_MEASURE_JS))
-            print(json.dumps({**case, "state": name, "outcome": outcome, **measured}), flush=True)
+            print(json.dumps({**requested, "state": name, "outcome": outcome, **measured}), flush=True)
+        home_row = json.loads(run_js(webview, HOME_PLACE_ROW_JS))
+        print(json.dumps({**requested, "state": "home-place-row", "homeRow": home_row}), flush=True)
+        if mode == "desktop":
+            run_js(webview, HOME_PLACE_SEARCH_JS)
+            # A missing reply leaves the results hidden; the measurement reports it.
+            settled_search = settle_layout(webview, HOME_PLACE_RESULTS_SHOWN_JS)
+            search = json.loads(run_js(webview, HOME_PLACE_SEARCH_MEASURE_JS))
+            if not settled_search and search["resultsShown"]:
+                print(json.dumps({**case, "error": "layout never settled with the home search results"}), flush=True)
+                return 1
+            run_js(webview, 'document.querySelector("#settings-dialog").close(); "ok"')
+            print(json.dumps({**requested, "state": "home-place-search", "homeSearch": search}), flush=True)
         if mode == "preview":
+            # Computed style alone can't prove a native control renders it:
+            # sample the painted background of each Preferences field.
+            run_js(webview, 'window.Airloom.receive("open-settings"); "ok"')
+            if not settled("with Preferences open"):
+                return 1
+            rendered = {name: rendered_background(webview, selector) for name, selector in (
+                ("radius", "[name=radius_km]"), ("refresh", "[name=refresh_minutes]"),
+                ("enabledSelect", "[name=interface_scale]"))}
+            run_js(webview, 'document.querySelector("#settings-dialog").close(); "ok"')
+            if not settled("after closing Preferences"):
+                return 1
             actions = json.loads(run_js(webview, PREVIEW_ACTIONS_JS))
-            print(json.dumps({**case, "state": "preview-actions", "actions": actions}), flush=True)
+            actions["rendered"] = rendered
+            print(json.dumps({**requested, "state": "preview-actions", "actions": actions}), flush=True)
         window.set_child(None)
-        pump(0.1)
+        pump(0.1)  # sleep-ok: lets GTK drop the view; nothing is measured after it
     window.destroy()
     return 0
 
 
-def scenario_layouts(root: Path):
-    print("— popup/search/settings/shell layouts at every scale, desktop zoom and preview CSS —")
+def layout_cases() -> list[dict]:
+    """Every size at every scale in light, and the narrow sizes again in dark."""
     cases = [
-        {"mode": mode, "width": width, "height": height, "scale": scale}
+        {"mode": mode, "width": width, "height": height, "scale": scale, "theme": "light"}
         for mode in ("desktop", "preview")
         for width, height in LAYOUT_SIZES
         for scale in SCALES
     ]
+    cases += [
+        {"mode": mode, "width": width, "height": height, "scale": scale, "theme": "dark"}
+        for mode in ("desktop", "preview")
+        for width, height in LAYOUT_SIZES if width in (320, 375)
+        for scale in SCALES
+    ]
+    # The wide dark preview keeps the color-scheme checks at desktop width.
+    cases.append({"mode": "preview", "width": 1280, "height": 800, "scale": 1.0, "theme": "dark"})
+    return cases
+
+
+def scenario_layouts(root: Path):
+    print("— popup/search/detail/settings/shell layouts at every scale and theme, desktop zoom and preview CSS —")
+    cases = layout_cases()
     env = {**os.environ, "XDG_CONFIG_HOME": str(root / "layout-config"),
            "XDG_CACHE_HOME": str(root / "layout-cache"), "NO_AT_BRIDGE": "1"}
     rows = []
@@ -1300,22 +1959,89 @@ def scenario_layouts(root: Path):
             problems.append(message)
 
     for row in rows:
-        label = f"{row['mode']} {row['width']}px at {row['scale']}x [{row['state']}]"
+        theme = row["case_theme"]
+        label = f"{row['mode']} {row['width']}px at {row['scale']}x {theme} [{row['state']}]"
+        if row["state"] == "home-place-search":
+            search = row["homeSearch"]
+            expect(search["open"] and search["resultsShown"] and search["results"] == len(HOME_PLACE_RESULTS),
+                   f"{label}: typed fixed-home search shows its {len(HOME_PLACE_RESULTS)} stubbed results ({search['results']})")
+            expect(search["theme"] == theme, f"{label}: Preferences renders the {theme} color scheme ({search['theme']})")
+            expect(not search["escaped"], f"{label}: home search input and results stay inside Preferences {search['escaped']}")
+            expect(not search["clipped"], f"{label}: nothing in Preferences or the results is clipped {search['clipped']}")
+            field, dropdown = search["input"], search["dropdown"]
+            expect(field["right"] - field["left"] >= 120,
+                   f"{label}: populated home search input stays usable ({field['right'] - field['left']:.0f}px)")
+            # Directly under: aligned with the input, with no row in between.
+            expect(abs(dropdown["left"] - field["left"]) <= 1 and abs(dropdown["right"] - field["right"]) <= 1
+                   and 0 <= dropdown["top"] - field["bottom"] <= 16,
+                   f"{label}: results sit directly under the home search input (input {field}, results {dropdown})")
+            continue
+        if row["state"] == "home-place-row":
+            home_row = row["homeRow"]
+            expect(home_row["mode"] == "auto", f"{label}: Preferences opens in automatic location mode")
+            for key in ("auto", "autoAgain"):
+                expect(home_row[key]["display"] == "none" and home_row[key]["boxes"] == 0,
+                       f"{label}: fixed-home place row is hidden in automatic mode ({key}: {home_row[key]})")
+            expect(home_row["fixed"]["display"] != "none" and home_row["fixed"]["boxes"] > 0,
+                   f"{label}: fixed-home place row shows in fixed mode ({home_row['fixed']})")
+            continue
         if row["state"] == "preview-actions":
             actions = row["actions"]
             expect("refreshed locally" in actions["refresh"], f"{label}: preview Refresh works without a bridge")
             expect(actions["filter"] == "Indoor", f"{label}: preview filter chip cycles locally")
             expect(actions["settingsOpen"] is False and "browser preview only" in actions["saveStatus"],
                    f"{label}: preview Save applies locally and closes Preferences")
+            expect(actions["unsupportedDisabled"] is True,
+                   f"{label}: preview disables radius, refresh, alert, confidence and home settings")
+            expect(actions["noteVisible"] is True, f"{label}: preview explains its disabled settings")
+            expect(actions["dark"] is (theme == "dark"), f"{label}: page renders the {theme} color scheme")
+            look = actions["disabledLook"]
+            for name, enabled_name in (("radius", "enabledNumber"), ("alert", "enabledNumber"),
+                                       ("homeInput", "enabledNumber"), ("refresh", "enabledSelect")):
+                field, enabled = look[name], look[enabled_name]
+                for prop in ("background", "borderStyle", "color"):
+                    expect(field[prop] != enabled[prop],
+                           f"{label}: disabled {name} {prop} differs from enabled {enabled_name} ({field[prop]} vs {enabled[prop]})")
+                expect(field["opacity"] == "1", f"{label}: disabled {name} is not faded by opacity ({field['opacity']})")
+            # A native (appearance: auto) menulist ignores author colors and borders.
+            expect(look["refresh"]["appearance"] == "none",
+                   f"{label}: disabled select drops native painting so its style renders ({look['refresh']['appearance']})")
+            rendered = actions["rendered"]
+            expect(max(abs(a - b) for a, b in zip(rendered["refresh"], rendered["radius"])) <= 3,
+                   f"{label}: disabled select renders the disabled-field background ({rendered['refresh']} vs {rendered['radius']})")
+            expect(max(abs(a - b) for a, b in zip(rendered["radius"], rendered["enabledSelect"])) >= 6,
+                   f"{label}: disabled fields render unlike the enabled select ({rendered['radius']} vs {rendered['enabledSelect']})")
+            expect(look["confidenceLabel"]["color"] == look["homeLabel"]["color"] != look["enabledRadioLabel"]["color"],
+                   f"{label}: disabled confidence label is muted like the disabled home labels "
+                   f"({look['confidenceLabel']['color']} vs enabled {look['enabledRadioLabel']['color']})")
+            expect(look["confidenceRow"]["cursor"] == "not-allowed",
+                   f"{label}: disabled confidence row shows a not-allowed cursor ({look['confidenceRow']['cursor']})")
+            for name in ("radius", "alert", "homeInput", "refresh", "homeLabel"):
+                expect(look[name]["cursor"] == "not-allowed", f"{label}: disabled {name} shows a not-allowed cursor ({look[name]['cursor']})")
+            for name in ("radius", "alert", "homeInput", "refresh", "homeLabel", "confidenceLabel"):
+                expect(look[name]["contrast"] >= 4.5, f"{label}: disabled {name} text stays legible in {theme} ({look[name]['contrast']}:1)")
+            for name in ("enabledNumber", "enabledSelect"):
+                expect(look[name]["cursor"] != "not-allowed", f"{label}: {name} keeps its cursor")
             continue
         expected_css = "1" if row["mode"] == "desktop" else ("%g" % row["scale"])
         expect(row["cssScale"] == expected_css and float(row["configuredScale"]) == row["scale"],
                f"{label}: interface scale applied once (css {row['cssScale']})")
-        expect(row["outcome"] not in ("no-marker", "no-popup", "no-results"), f"{label}: state reached ({row['outcome']})")
+        expect(row["theme"] == row["case_theme"], f"{label}: page renders the requested {theme} color scheme ({row['theme']})")
+        expect(row["outcome"] not in ("no-marker", "no-popup", "no-results", "no-detail"), f"{label}: state reached ({row['outcome']})")
         # innerWidth is rounded down at fractional zoom (853.33 -> 853), so allow 1px.
         expect(row["scrollWidth"] <= row["viewport"] + 1, f"{label}: document fits {row['viewport']}px ({row['scrollWidth']}px)")
         expect(not row["overflow"], f"{label}: nothing extends past the {row['viewport']}px viewport {row['overflow']}")
         expect(not row["clipped"], f"{label}: no clipped overlay content {row['clipped']}")
+        expect(not row["escaped"], f"{label}: overlay content stays inside its container {row['escaped']}")
+        prefs = row["preferences"]
+        if prefs is not None:
+            expect(not prefs["scroll"], f"{label}: Preferences has no horizontal scroll {prefs['scroll']}")
+            expect(prefs["titleLines"] == 1 and prefs["titleRight"] <= prefs["closeLeft"] + 0.5,
+                   f"{label}: Preferences title stays on one line beside the close button "
+                   f"({prefs['titleLines']} line(s), title right {prefs['titleRight']:.1f}, close left {prefs['closeLeft']:.1f})")
+            expect(min(prefs["closeWidth"], prefs["closeHeight"]) >= prefs["closeTarget"] - 0.5,
+                   f"{label}: Preferences close button keeps its {prefs['closeTarget']:g}px target "
+                   f"({prefs['closeWidth']:.1f}x{prefs['closeHeight']:.1f})")
         expect(row["searchInputWidth"] >= 40, f"{label}: search input stays usable ({row['searchInputWidth']:.0f}px)")
     if problems:
         raise AssertionError(f"{len(problems)} layout check(s) failed; first: {problems[0]}")
@@ -1343,7 +2069,7 @@ def start_sentinel(root: Path) -> subprocess.Popen:
     project = root / "sentinel-app"
     (project / "airloom").mkdir(parents=True)
     (project / "airloom" / "__init__.py").write_text("", encoding="utf-8")
-    (project / "airloom" / "__main__.py").write_text("import time\nwhile True:\n    time.sleep(1)\n",
+    (project / "airloom" / "__main__.py").write_text("import time\nwhile True:\n    time.sleep(1)\n",  # sleep-ok: keeps the look-alike alive until stopped
                                                      encoding="utf-8")
     return subprocess.Popen([sys.executable, "-m", "airloom"], cwd=project, start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1357,7 +2083,6 @@ APP_SCENARIOS = {
     "motion": scenario_interrupted_motion,
     "focus": scenario_keyboard_focus,
     "filters": scenario_filters,
-    "trend-retry": scenario_trend_retry,
     "resize": scenario_resize,
     "shell-recovery": scenario_shell_recovery,  # reloads the page; keep last
 }
@@ -1366,7 +2091,9 @@ STANDALONE_SCENARIOS = {
     "reduced-motion": scenario_reduced_motion,
     "alerts": scenario_alerts,
     "cache-fallback": scenario_cache_fallback,
+    "trend-retry": scenario_trend_retry,
     "stripped-debug": scenario_stripped_debug,
+    "keyboard-map": scenario_keyboard_map,
 }
 ALL_SCENARIOS = [*APP_SCENARIOS, *STANDALONE_SCENARIOS]
 

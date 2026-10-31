@@ -53,11 +53,11 @@
     { pm_low: 0.0, pm_high: 9.0, aqi_low: 0, aqi_high: 50, label: "Good", color: "#35b779", foreground: "#08271b", guidance: "Air quality is satisfactory. It is a good time to be outside." },
     { pm_low: 9.1, pm_high: 35.4, aqi_low: 51, aqi_high: 100, label: "Moderate", color: "#f6c945", foreground: "#332400", guidance: "Unusually sensitive people may want to reduce prolonged outdoor exertion." },
     { pm_low: 35.5, pm_high: 55.4, aqi_low: 101, aqi_high: 150, label: "Unhealthy for sensitive groups", color: "#f39c3d", foreground: "#341900", guidance: "Sensitive groups should reduce prolonged or heavy outdoor exertion." },
-    { pm_low: 55.5, pm_high: 125.4, aqi_low: 151, aqi_high: 200, label: "Unhealthy", color: "#e65b65", foreground: "#ffffff", guidance: "Everyone should reduce prolonged exertion; sensitive groups should avoid it." },
-    { pm_low: 125.5, pm_high: 225.4, aqi_low: 201, aqi_high: 300, label: "Very unhealthy", color: "#9b6bc3", foreground: "#ffffff", guidance: "Avoid prolonged outdoor exertion. Sensitive groups should remain indoors." },
+    { pm_low: 55.5, pm_high: 125.4, aqi_low: 151, aqi_high: 200, label: "Unhealthy", color: "#e65b65", foreground: "#2a0509", guidance: "Everyone should reduce prolonged exertion; sensitive groups should avoid it." },
+    { pm_low: 125.5, pm_high: 225.4, aqi_low: 201, aqi_high: 300, label: "Very unhealthy", color: "#9b6bc3", foreground: "#12061c", guidance: "Avoid prolonged outdoor exertion. Sensitive groups should remain indoors." },
     { pm_low: 225.5, pm_high: 325.4, aqi_low: 301, aqi_high: 500, label: "Hazardous", color: "#7e394d", foreground: "#ffffff", guidance: "Avoid outdoor activity and keep indoor air as clean as possible." },
   ];
-  const UNAVAILABLE = { pm_low: 0, pm_high: 0, aqi_low: 0, aqi_high: 0, label: "Unavailable", color: "#7d8590", foreground: "#ffffff", guidance: "No recent sensor reading is available." };
+  const UNAVAILABLE = { pm_low: 0, pm_high: 0, aqi_low: 0, aqi_high: 0, label: "Unavailable", color: "#7d8590", foreground: "#0b0e11", guidance: "No recent sensor reading is available." };
 
   function bandForAQI(aqi) {
     if (!Number.isFinite(aqi)) return UNAVAILABLE;
@@ -81,5 +81,50 @@
     }).sort((a, b) => a.aqi - b.aqi);
   }
 
-  return { splitBounds, boundsContain, nearestLongitude, bandForAQI, summarySensors };
+  // Mirrors W1's shared freshness rule in airloom/models.py: an observation is
+  // fresh from 600 s in the future through 2 h in the past, both inclusive.
+  const MAX_OBSERVATION_AGE = 7200;
+  const FUTURE_SKEW_TOLERANCE = 600;
+
+  function isFreshObservation(lastSeen, nowSeconds) {
+    if (typeof lastSeen !== "number" || !Number.isFinite(lastSeen) || !Number.isFinite(nowSeconds)) return false;
+    const age = nowSeconds - lastSeen;
+    return age >= -FUTURE_SKEW_TOLERANCE && age <= MAX_OBSERVATION_AGE;
+  }
+
+  const PROVENANCE_DESCRIPTIONS = {
+    Demo: "Demo data, not a real sensor reading",
+    Stale: "Cached reading shown after a failed refresh",
+    Old: "Last observation over 2 hours ago or unknown",
+  };
+
+  // Whether a reading's time can be shown as an age: a real Unix time no
+  // further ahead than the skew tolerance. Anything else reads as unavailable.
+  function hasObservationTime(lastSeen, nowSeconds) {
+    return typeof lastSeen === "number" && Number.isFinite(lastSeen) && lastSeen > 0
+      && lastSeen - nowSeconds <= FUTURE_SKEW_TOLERANCE;
+  }
+
+  // An Old badge without a usable time must not claim the reading is old.
+  function provenanceDescription(label, lastSeen, nowSeconds) {
+    if (label === "Old" && !hasObservationTime(lastSeen, nowSeconds)) return "Update time unavailable";
+    return PROVENANCE_DESCRIPTIONS[label] || "";
+  }
+
+  // Only degraded readings are badged, Demo > Stale > Old. A remote favorite
+  // comes from its own fetch, so it never inherits the area batch's metadata.
+  function readingProvenance(sensor, batch, nowSeconds) {
+    const inBatch = sensor.remote_favorite !== true;
+    if (sensor.origin === "demo" || (inBatch && String(batch.source || "").toLowerCase().includes("demo"))) return "Demo";
+    const legacyStale = batch.stale === undefined && batch.source === "PurpleAir · cached";
+    if (sensor.stale === true || (inBatch && (batch.stale === true || legacyStale))) return "Stale";
+    if (!isFreshObservation(sensor.last_seen, nowSeconds)) return "Old";
+    return "";
+  }
+
+  return {
+    splitBounds, boundsContain, nearestLongitude, bandForAQI, summarySensors, BANDS, UNAVAILABLE,
+    MAX_OBSERVATION_AGE, FUTURE_SKEW_TOLERANCE, isFreshObservation, readingProvenance, PROVENANCE_DESCRIPTIONS,
+    hasObservationTime, provenanceDescription,
+  };
 });

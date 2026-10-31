@@ -10,6 +10,7 @@ regressions without launching Airloom.
 import errno
 import importlib.machinery
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -22,6 +23,7 @@ import threading
 import time
 import unittest
 import urllib.request
+import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -57,6 +59,7 @@ REQUIRED_COVERAGE = {
     "popup/search/narrow layouts at all scales and preview actions": "layouts",
     "stripped debug module on a private bus": "stripped-debug",
     "live window resize across the narrow breakpoint": "resize",
+    "keyboard map traversal and panning": "keyboard-map",
 }
 REQUIRED_SCENARIOS = set(REQUIRED_COVERAGE.values())
 
@@ -111,6 +114,53 @@ server.close()
 '''
 
 
+class FakeX11:
+    """Stands in for libX11 and libXtst behind the script's X11_LIBRARY seam.
+
+    Records the display calls and injected events, and can simulate a server
+    without XTEST, an unopenable display, or a rejected fake event.
+    """
+
+    DISPLAY = 0x5EED
+    KEYCODES = {"Shift_L": 50, "Tab": 23, "x": 53}
+
+    def __init__(self, *, xtest=True, open_display=True, reject=None, reject_keycode=None):
+        self.xtest = xtest
+        self.open_display = open_display
+        self.reject = reject
+        self.reject_keycode = reject_keycode
+        self.events = []
+        self.closed = []
+
+    def load(self, name):
+        fake = self
+
+        class Library:
+            pass
+
+        library = Library()
+        if name == "libX11.so.6":
+            library.XOpenDisplay = lambda _name: fake.DISPLAY if fake.open_display else None
+            library.XCloseDisplay = lambda display: fake.closed.append(display) or 0
+            library.XStringToKeysym = lambda name: 0xFF00 + fake.KEYCODES[name.decode()] if name.decode() in fake.KEYCODES else 0
+            library.XKeysymToKeycode = lambda _display, keysym: keysym - 0xFF00
+            library.XFlush = lambda _display: fake.events.append(("flush",)) or 1
+        elif name == "libXtst.so.6":
+            library.XTestQueryExtension = lambda *_args: 1 if fake.xtest else 0
+            library.XTestFakeKeyEvent = lambda _d, keycode, press, _delay: fake._event(("key", keycode, press))
+            library.XTestFakeMotionEvent = lambda _d, _screen, x, y, _delay: fake._event(("motion", x, y))
+            library.XTestFakeButtonEvent = lambda _d, button, press, _delay: fake._event(("button", button, press))
+        else:
+            raise OSError(f"{name}: not faked")
+        return library
+
+    def _event(self, event):
+        if event[0] == self.reject and self.reject_keycode in (None, event[1]):
+            return 0
+        self.events.append(event)
+        return 1
+
+
 def process_gone(pid: int, timeout: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -137,12 +187,138 @@ class UiRegressionScriptContractTest(unittest.TestCase):
             self.assertEqual(self.script.main(["--list"]), 0)
         self.assertEqual(set(output.getvalue().split()), REQUIRED_SCENARIOS)
 
+    def test_keyboard_map_scenario_requires_x11_rather_than_skipping(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DISPLAY", None)
+            with self.assertRaisesRegex(AssertionError, "X11 display with XTEST"):
+                self.script.X11Input()
+
+    def test_keyboard_map_scenario_fails_on_a_display_without_xtest_and_closes_it(self):
+        fake = FakeX11(xtest=False)
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+            with self.assertRaisesRegex(AssertionError, r"XTEST.*Xvfb"):
+                self.script.X11Input()
+        self.assertEqual(fake.closed, [FakeX11.DISPLAY])
+
+    def test_keyboard_map_scenario_fails_when_the_display_cannot_open(self):
+        fake = FakeX11(open_display=False)
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+            with self.assertRaisesRegex(AssertionError, "X11 display with XTEST.*cannot open :99"):
+                self.script.X11Input()
+        self.assertEqual(fake.closed, [])
+
+    def test_keyboard_map_scenario_fails_when_libxtst_is_missing(self):
+        def load(name):
+            raise OSError(f"{name}: cannot open shared object file")
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", load):
+            with self.assertRaisesRegex(AssertionError, "X11 display with XTEST"):
+                self.script.X11Input()
+
+    def test_x11_input_sends_exactly_the_requested_real_events(self):
+        fake = FakeX11()
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+            x11 = self.script.X11Input()
+        x11.key("Tab", shift=True)
+        x11.key("x")
+        x11.click(10, 20)
+        x11.close()
+        x11.close()
+        shift, tab, x = FakeX11.KEYCODES["Shift_L"], FakeX11.KEYCODES["Tab"], FakeX11.KEYCODES["x"]
+        self.assertEqual(fake.events, [
+            ("key", shift, 1), ("key", tab, 1), ("key", tab, 0), ("key", shift, 0), ("flush",),
+            ("key", x, 1), ("key", x, 0), ("flush",),
+            ("motion", 10, 20), ("flush",), ("button", 1, 1), ("button", 1, 0), ("flush",),
+        ])
+        self.assertEqual(fake.closed, [FakeX11.DISPLAY])
+
+    def test_x11_input_raises_when_the_server_rejects_an_injected_event(self):
+        for kind, act in (("key", lambda x11: x11.key("Tab")),
+                          ("motion", lambda x11: x11.move(1, 2)),
+                          ("button", lambda x11: x11.click(1, 2))):
+            with self.subTest(kind=kind):
+                fake = FakeX11(reject=kind)
+                with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                        mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+                    x11 = self.script.X11Input()
+                with self.assertRaisesRegex(AssertionError, f"XTEST rejected the fake {kind} event"):
+                    act(x11)
+                x11.close()
+
+    def test_x11_input_releases_shift_when_a_shifted_key_is_rejected(self):
+        fake = FakeX11(reject="key", reject_keycode=FakeX11.KEYCODES["Tab"])
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load):
+            x11 = self.script.X11Input()
+        with self.assertRaisesRegex(AssertionError, "XTEST rejected the fake key event"):
+            x11.key("Tab", shift=True)
+        x11.close()
+        shift = FakeX11.KEYCODES["Shift_L"]
+        self.assertEqual(fake.events[-2:], [("key", shift, 0), ("flush",)])
+
+    def test_keyboard_map_scenario_closes_the_display_when_it_fails_midway(self):
+        fake = FakeX11()
+        stopped = []
+
+        class StubApp:
+            sock_path = "unused.sock"
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                return self
+
+            def wait_ready(self):
+                pass
+
+            def stop(self):
+                stopped.append(True)
+
+        def page_origin(_sock, _x11):
+            raise AssertionError("pointer never arrived")
+
+        with mock.patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                mock.patch.object(self.script, "X11_LIBRARY", fake.load), \
+                mock.patch.object(self.script, "DebugApp", StubApp), \
+                mock.patch.object(self.script, "page_origin", page_origin), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(AssertionError, "pointer never arrived"):
+                self.script.scenario_keyboard_map(self.root, mock.Mock(url="http://127.0.0.1:9"))
+        self.assertEqual(fake.closed, [FakeX11.DISPLAY])
+        self.assertEqual(stopped, [True])
+
     def test_layouts_cover_the_reported_scaled_widths_at_every_scale(self):
         self.assertEqual(self.script.SCALES, (1.0, 1.25, 1.5))
         widths = {width for width, _height in self.script.LAYOUT_SIZES}
         self.assertTrue({320, 375} <= widths)
         for state in ("search", "popup", "settings", "shell"):
             self.assertIn(state, self.script.LAYOUT_STATES_JS)
+        self.assertEqual(self.script.LAYOUT_THEMES, ("light", "dark"))
+        self.assertIn("detail", self.script.LAYOUT_STATES_JS)
+        cases = {(c["mode"], c["width"], c["scale"], c["theme"]) for c in self.script.layout_cases()}
+        for mode in ("desktop", "preview"):
+            for scale in self.script.SCALES:
+                for width in widths:
+                    self.assertIn((mode, width, scale, "light"), cases)
+                for width in (320, 375):
+                    self.assertIn((mode, width, scale, "dark"), cases)
+        self.assertIn("escaped", self.script.LAYOUT_MEASURE_JS)
+        self.assertIn("prefers-color-scheme: dark", self.script.LAYOUT_MEASURE_JS)
+        # The populated fixed-home search runs on desktop cases, including the
+        # narrowest width at the widest scale in both themes.
+        self.assertIn("home-place-input", self.script.HOME_PLACE_SEARCH_JS)
+        self.assertIn("home-place-results", self.script.HOME_PLACE_SEARCH_MEASURE_JS)
+        # Preferences is checked for sideways scroll in every case, and the
+        # home search's clip check covers the whole dialog form.
+        self.assertIn("#settings-title", self.script.LAYOUT_MEASURE_JS)
+        self.assertIn("#settings-form", self.script.LAYOUT_MEASURE_JS)
+        self.assertIn("#settings-form", self.script.HOME_PLACE_SEARCH_MEASURE_JS)
+        for theme in self.script.LAYOUT_THEMES:
+            self.assertIn(("desktop", 320, max(self.script.SCALES), theme), cases)
 
     def test_script_never_kills_by_name(self):
         source = SCRIPT.read_text(encoding="utf-8")
@@ -490,6 +666,50 @@ class UiRegressionScriptContractTest(unittest.TestCase):
                     self.script.proc_bytes(12345, "cmdline")
                 self.assertEqual(raised.exception.errno, error.errno)
 
+    def test_descendants_skip_only_vanished_processes(self):
+        # A parent that exits mid-walk has no children left to own; any other
+        # failure would silently hide live owned descendants, so it propagates.
+        for error in (FileNotFoundError(), ProcessLookupError(errno.ESRCH, "No such process")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(self.script.Path, "read_text", side_effect=error):
+                self.assertEqual(self.script.descendants(12345), [])
+        for error in (PermissionError(errno.EACCES, "Permission denied"), OSError(errno.EIO, "I/O error")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(self.script.Path, "read_text", side_effect=error):
+                with self.assertRaises(type(error)) as raised:
+                    self.script.descendants(12345)
+                self.assertEqual(raised.exception.errno, error.errno)
+        child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertIn(child.pid, self.script.descendants(os.getpid()))
+
+    def test_descendant_enumeration_failure_still_stops_the_owned_app(self):
+        # The error fails the scenario, but the instance it started is still
+        # stopped on the way out.
+        stopped = []
+
+        class FakeApp:
+            def __init__(self, *_args, **_kwargs):
+                self.process = mock.Mock(pid=12345, poll=mock.Mock(return_value=None))
+
+            def start(self):
+                return self
+
+            def stop(self):
+                stopped.append(self)
+
+        error = PermissionError(errno.EACCES, "Permission denied")
+        stripped = self.root / "stripped-project"
+        stripped.mkdir()
+        with mock.patch.object(self.script, "DebugApp", FakeApp), \
+                mock.patch.object(self.script, "make_stripped_tree", return_value=stripped), \
+                mock.patch.object(self.script.Path, "read_text", side_effect=error), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(PermissionError):
+                self.script.scenario_stripped_debug(self.root, mock.Mock(url="http://127.0.0.1:9"))
+        self.assertEqual(len(stopped), 1)
+
     def test_viewport_width_excludes_the_window_frame_before_scaling(self):
         # Under a compositor (mutter) the webview spans the whole window; under
         # Xvfb GTK draws a solid CSD frame inside the requested size.
@@ -516,6 +736,43 @@ class UiRegressionScriptContractTest(unittest.TestCase):
                     mock.patch.object(self.script, "eval_js", return_value={"width": inner}):
                 with self.assertRaises(AssertionError):
                     self.script.measure_window_frame("sock")
+
+    def test_trend_terminal_state_rejects_loading_and_pending_retry(self):
+        terminal = self.script.terminal_trend
+        self.assertIsNone(terminal({"retryHidden": True, "retryDisabled": False,
+                                    "chartText": "Loading trend…", "rows": []}))
+        self.assertIsNone(terminal({"retryHidden": False, "retryDisabled": False,
+                                    "chartText": "Trend unavailable", "rows": []}))
+        loaded = {"retryHidden": True, "retryDisabled": False, "chartText": "", "rows": [["Now", 21]]}
+        self.assertIs(terminal(loaded), loaded)
+
+    def test_trend_retry_uses_a_real_fixture_failure(self):
+        self.assertIn("trend-retry", self.script.STANDALONE_SCENARIOS)
+        self.assertNotIn("trend-retry", self.script.APP_SCENARIOS)
+        self.assertNotIn("1000000", inspect.getsource(self.script.scenario_trend_retry))
+
+    def test_fixed_sleeps_are_justified(self):
+        unjustified = [
+            f"{number}: {line.strip()}"
+            for number, line in enumerate(SCRIPT.read_text(encoding="utf-8").splitlines(), 1)
+            if any(call in line for call in ("time.sleep(", "SLEEP(", "pump("))
+            and not line.lstrip().startswith("def pump(") and "# sleep-ok:" not in line
+        ]
+        self.assertFalse(unjustified, "unjustified sleep: " + "\n".join(unjustified))
+
+    def test_script_compiles_without_syntax_warnings(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            compile(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT), "exec")
+
+    def test_geocoder_stub_records_completion_after_the_response(self):
+        with self.script.GeocoderStub() as stub:
+            with urllib.request.urlopen(f"{stub.url}/search?q=fasttown", timeout=5) as response:
+                response.read()
+            # The handler records completion after flushing, so the client can
+            # read the response first: poll rather than assert at once.
+            self.script.wait_for(lambda: stub.completed("fasttown"), 5, "the stub to record completion")
+            self.assertFalse(stub.completed("slowtown"))
 
     def test_caller_snapshot_detects_any_change(self):
         target = self.root / "airloom"

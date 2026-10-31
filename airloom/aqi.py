@@ -25,8 +25,8 @@ BANDS = (
     AQIBand(0.0, 9.0, 0, 50, "Good", "#35b779", "#08271b", "Air quality is satisfactory. It is a good time to be outside."),
     AQIBand(9.1, 35.4, 51, 100, "Moderate", "#f6c945", "#332400", "Unusually sensitive people may want to reduce prolonged outdoor exertion."),
     AQIBand(35.5, 55.4, 101, 150, "Unhealthy for sensitive groups", "#f39c3d", "#341900", "Sensitive groups should reduce prolonged or heavy outdoor exertion."),
-    AQIBand(55.5, 125.4, 151, 200, "Unhealthy", "#e65b65", "#ffffff", "Everyone should reduce prolonged exertion; sensitive groups should avoid it."),
-    AQIBand(125.5, 225.4, 201, 300, "Very unhealthy", "#9b6bc3", "#ffffff", "Avoid prolonged outdoor exertion. Sensitive groups should remain indoors."),
+    AQIBand(55.5, 125.4, 151, 200, "Unhealthy", "#e65b65", "#2a0509", "Everyone should reduce prolonged exertion; sensitive groups should avoid it."),
+    AQIBand(125.5, 225.4, 201, 300, "Very unhealthy", "#9b6bc3", "#12061c", "Avoid prolonged outdoor exertion. Sensitive groups should remain indoors."),
     AQIBand(225.5, 325.4, 301, 500, "Hazardous", "#7e394d", "#ffffff", "Avoid outdoor activity and keep indoor air as clean as possible."),
 )
 
@@ -63,7 +63,7 @@ def aqi_from_pm25(pm25: float | None) -> int | None:
 
 def band_for_aqi(aqi: int | None) -> AQIBand:
     if aqi is None:
-        return AQIBand(0, 0, 0, 0, "Unavailable", "#7d8590", "#ffffff", "No recent sensor reading is available.")
+        return AQIBand(0, 0, 0, 0, "Unavailable", "#7d8590", "#0b0e11", "No recent sensor reading is available.")
     for band in BANDS:
         if aqi <= band.aqi_high:
             return band

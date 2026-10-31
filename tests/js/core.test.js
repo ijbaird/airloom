@@ -98,7 +98,7 @@ test("bandForAQI keeps unavailable and above-scale behavior compatible", () => {
     const band = AirloomCore.bandForAQI(aqi);
     assert.equal(band.label, "Unavailable");
     assert.equal(band.color, "#7d8590");
-    assert.equal(band.foreground, "#ffffff");
+    assert.equal(band.foreground, "#0b0e11");
   }
   assert.equal(AirloomCore.bandForAQI(501).label, "Hazardous");
 });
@@ -795,4 +795,126 @@ test("the direct-file legend renders all six exact AQI ranges", () => {
     ["#9b6bc3", "Very unhealthy", "201–300"],
     ["#7e394d", "Hazardous", "301–500"],
   ]);
+});
+
+test("band tables match Python exactly", () => {
+  const script = "import dataclasses, json; from airloom.aqi import BANDS, band_for_aqi; "
+    + "print(json.dumps([dataclasses.asdict(b) for b in BANDS] + [dataclasses.asdict(band_for_aqi(None))]))";
+  const output = require("node:child_process").execFileSync(
+    "python3",
+    ["-c", script],
+    { cwd: path.resolve(__dirname, "../.."), encoding: "utf8" },
+  );
+  assert.deepEqual(JSON.parse(output), [...AirloomCore.BANDS, AirloomCore.UNAVAILABLE]);
+});
+
+test("isFreshObservation mirrors the shared Python boundary vectors", () => {
+  const now = 1_800_000_000;
+  assert.equal(AirloomCore.MAX_OBSERVATION_AGE, 7200);
+  assert.equal(AirloomCore.FUTURE_SKEW_TOLERANCE, 600);
+  for (const age of [0, 7200, -600]) {
+    assert.equal(AirloomCore.isFreshObservation(now - age, now), true, `age ${age} is fresh`);
+  }
+  for (const age of [7201, -601]) {
+    assert.equal(AirloomCore.isFreshObservation(now - age, now), false, `age ${age} is not fresh`);
+  }
+  for (const lastSeen of [null, undefined, NaN, true, "7200"]) {
+    assert.equal(AirloomCore.isFreshObservation(lastSeen, now), false, `${String(lastSeen)} is not fresh`);
+  }
+
+  const ages = [0, 7200, 7201, null];
+  const script = "import json; from airloom import models, presentation; "
+    + `now = ${now}; `
+    + `ages = json.loads(${JSON.stringify(JSON.stringify(ages))}); `
+    + "eligible = [bool(presentation.alert_transitions([models.Sensor(1, 'x', 0, 0, 150, 60.0, last_seen=None if age is None else now - age)], "
+    + "favorites={1}, previous={}, threshold=101, now=now, origin='live')[0]) for age in ages]; "
+    + "print(json.dumps({'eligible': eligible, 'max_age': presentation.MAX_ALERT_OBSERVATION_AGE}))";
+  const output = JSON.parse(require("node:child_process").execFileSync(
+    "python3",
+    ["-c", script],
+    { cwd: path.resolve(__dirname, "../.."), encoding: "utf8" },
+  ));
+  assert.equal(output.max_age, 7200);
+  assert.deepEqual(output.eligible, ages.map((age) => AirloomCore.isFreshObservation(age === null ? null : now - age, now)));
+});
+
+test("readingProvenance uses Demo > Stale > Old precedence", () => {
+  const now = 1_800_000_000;
+  const fresh = now - 60;
+  const staleBatch = { source: "PurpleAir · cached", stale: true };
+  assert.equal(AirloomCore.readingProvenance({ origin: "demo", stale: true, last_seen: null }, staleBatch, now), "Demo");
+  assert.equal(AirloomCore.readingProvenance({ origin: "live", last_seen: null }, staleBatch, now), "Stale");
+  assert.equal(AirloomCore.readingProvenance({ origin: "live", remote_favorite: true, last_seen: null }, staleBatch, now), "Old");
+  assert.equal(AirloomCore.readingProvenance({ origin: "live", delivery: "cache", last_seen: fresh }, { source: "PurpleAir · cached startup" }, now), "");
+  assert.deepEqual(Object.keys(AirloomCore.PROVENANCE_DESCRIPTIONS), ["Demo", "Stale", "Old"]);
+});
+
+test("provenanceDescription explains unusable observation times like the age text", () => {
+  const now = 1_800_000_000;
+  const { provenanceDescription, PROVENANCE_DESCRIPTIONS } = AirloomCore;
+  for (const lastSeen of [null, undefined, NaN, "7200", 0, now + 601]) {
+    assert.equal(AirloomCore.hasObservationTime(lastSeen, now), false, `${String(lastSeen)} has no usable time`);
+    assert.equal(provenanceDescription("Old", lastSeen, now), "Update time unavailable", `${String(lastSeen)} explanation`);
+  }
+  for (const lastSeen of [now + 600, now, now - 7201]) {
+    assert.equal(AirloomCore.hasObservationTime(lastSeen, now), true, `${lastSeen} has a usable time`);
+  }
+  assert.equal(provenanceDescription("Old", now - 7201, now), PROVENANCE_DESCRIPTIONS.Old);
+  assert.equal(provenanceDescription("Demo", null, now), PROVENANCE_DESCRIPTIONS.Demo);
+  assert.equal(provenanceDescription("Stale", now + 601, now), PROVENANCE_DESCRIPTIONS.Stale);
+  assert.equal(provenanceDescription("", null, now), "");
+});
+
+function contrastRatio(hexA, hexB) {
+  const luminance = (hex) => {
+    const [r, g, b] = [1, 3, 5].map((index) => {
+      const channel = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
+      return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const [lighter, darker] = [luminance(hexA), luminance(hexB)].sort((a, b) => b - a);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+test("every band foreground passes WCAG contrast in both themes", () => {
+  for (const band of [...AirloomCore.BANDS, AirloomCore.UNAVAILABLE]) {
+    const ratio = contrastRatio(band.color, band.foreground);
+    assert.ok(ratio >= 4.5, `${band.label}: ${ratio.toFixed(2)} >= 4.5`);
+  }
+
+  const css = fs.readFileSync(path.resolve(__dirname, "../../airloom/resources/app.css"), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  const [base, dark] = css.split("@media (prefers-color-scheme: dark) {");
+  assert.ok(dark, "app.css must have a dark color-scheme block");
+  const rules = (source) => [...source.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((match) => ({
+    selectors: match[1].split(",").map((value) => value.trim()),
+    body: match[2],
+  }));
+  const declaration = (body, property) => body
+    .match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+)`))?.[1].trim();
+  const rootProperties = (source) => {
+    const root = rules(source).find((rule) => rule.selectors.includes(":root"));
+    assert.ok(root, "theme must declare :root custom properties");
+    return Object.fromEntries([...root.body.matchAll(/(--[\w-]+)\s*:\s*([^;]+)/g)].map((match) => [match[1], match[2].trim()]));
+  };
+  for (const [theme, source] of [["light", base], ["dark", dark]]) {
+    const properties = rootProperties(source);
+    for (const [background, foreground] of [["--accent", "--on-accent"], ["--soft", "--ink"]]) {
+      assert.ok(properties[foreground], `${theme} ${foreground} is defined`);
+      const ratio = contrastRatio(properties[background], properties[foreground]);
+      assert.ok(ratio >= 4.5, `${theme} ${background}/${foreground}: ${ratio.toFixed(2)} >= 4.5`);
+    }
+  }
+
+  for (const selector of [".dialog-actions .primary", ".shell-status button"]) {
+    const rule = rules(base).find((candidate) => candidate.selectors.includes(selector) && declaration(candidate.body, "color"));
+    assert.equal(rule && declaration(rule.body, "color"), "var(--on-accent)", selector);
+  }
+
+  for (const selector of [".aqi-number", ".sensor-badge", ".map-marker", ".popup-aqi", ".summary-chip .summary-score"]) {
+    for (const rule of rules(dark).filter((candidate) => candidate.selectors.includes(selector))) {
+      assert.equal(declaration(rule.body, "color"), undefined, `dark ${selector} must keep the band foreground`);
+    }
+  }
 });

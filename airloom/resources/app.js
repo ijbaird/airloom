@@ -9,6 +9,9 @@
     coverage: null,
     fetchedBounds: null,
     selectedId: null,
+    // A favorite row can share its id with an area reading from a different
+    // fetch; selecting that row shows the favorite's own reading.
+    selectedFavorite: false,
     previewHidden: [],
     config: { latitude: 45.5152, longitude: -122.6784, location_name: "Portland, Oregon", radius_km: 22, heatmap_threshold_km: 40, temperature_unit: "F", alert_threshold: 101, refresh_minutes: 2, has_api_key: false, api_key_hint: "", location_filter: "outdoor", interface_scale: 1, hidden: [] },
     source: "Starting Airloom",
@@ -59,18 +62,17 @@
       bridge({ action: "place-search", query, request_id: requestId, context });
     },
   };
+  // Preferences the browser preview cannot honor are disabled there; Save
+  // applies only the settings that visibly change the preview.
+  const PREVIEW_UNSUPPORTED_FIELDS = ["radius_km", "refresh_minutes", "alert_threshold", "confidence_filter"];
+  const PREVIEW_SUPPORTED_SETTINGS = ["temperature_unit", "interface_scale", "heatmap_threshold_km"];
   const previewAdapter = {
     favorite(id) { togglePreviewFavorite(id); },
     refresh() { refreshPreview(); },
     saveSettings(settings) {
-      const { api_key, clear_api_key, ...supported } = settings;
-      const config = { ...supported };
-      if (config.home_mode === "fixed") {
-        config.latitude = Number(config.home_lat);
-        config.longitude = Number(config.home_lon);
-      }
-      delete config.home_lat;
-      delete config.home_lon;
+      const config = Object.fromEntries(PREVIEW_SUPPORTED_SETTINGS.map((name) => [name, settings[name]]));
+      config.heatmap_threshold_km = Number(config.heatmap_threshold_km);
+      config.interface_scale = Number(config.interface_scale);
       applyConfig(config);
       renderAll();
       $("#settings-dialog").close();
@@ -120,6 +122,7 @@
       source: state.source,
       viewportScale: window.visualViewport ? window.visualViewport.scale : null,
       reducedMotion: prefersReducedMotion(),
+      navigationIdle: navigationIdle(),
     }),
     debugSearch(query) {
       const input = $("#search");
@@ -241,8 +244,13 @@
     return Number.isFinite(timestamp) ? timestamp : 0;
   }
 
+  // Trend state belongs to a reading, not a sensor id: a favorite fetched on
+  // its own can share an id with an area reading yet carry another last_seen.
+  const trendKey = (sensor) => `${sensor.remote_favorite ? "favorite" : "area"}:${sensor.id}`;
+
   function syncTrendWithSensor(sensor) {
-    const previous = state.trends.get(sensor.id);
+    const key = trendKey(sensor);
+    const previous = state.trends.get(key);
     const readingLastSeen = readingVersion(sensor.last_seen);
     // An explicit event is authoritative for its reading. Only a genuinely
     // newer sensor publication may replace it with inline data or idle state.
@@ -251,9 +259,9 @@
     }
     const inlineSuccess = Array.isArray(sensor.trend) && sensor.trend.some((point) => Number.isFinite(point.aqi));
     if (inlineSuccess) {
-      state.trends.set(sensor.id, { status: "loaded", trend: sensor.trend, retries: 0, readingLastSeen, requestId: 0, source: "inline" });
+      state.trends.set(key, { status: "loaded", trend: sensor.trend, retries: 0, readingLastSeen, requestId: 0, source: "inline" });
     } else if (!previous || readingLastSeen > previous.readingLastSeen) {
-      state.trends.set(sensor.id, { status: "idle", trend: [], retries: previous?.retries ?? 0, readingLastSeen, requestId: 0, source: "publication" });
+      state.trends.set(key, { status: "idle", trend: [], retries: previous?.retries ?? 0, readingLastSeen, requestId: 0, source: "publication" });
     }
   }
 
@@ -276,30 +284,47 @@
     return null;
   }
 
+  // Python flags every favorite: remote_favorite is false for a favorited area
+  // reading, which shares the area batch's provenance, and true for a separate
+  // fetch, which never inherits it. Only a missing flag is inferred: a copy of
+  // the area's same observation is that area reading; anything else is remote.
+  function favoriteReading(favorite, areaById) {
+    if (typeof favorite.remote_favorite === "boolean") return favorite;
+    const local = areaById.get(favorite.id);
+    const areaCopy = Boolean(local) && readingVersion(local.last_seen) === readingVersion(favorite.last_seen);
+    return { ...favorite, remote_favorite: !areaCopy };
+  }
+
   function applySensors(payload) {
     const area = Array.isArray(payload.area) ? payload.area : (payload.items || []);
-    const favorites = Array.isArray(payload.favorites) ? payload.favorites : [];
-    const merged = new Map(area.map((sensor) => [sensor.id, sensor]));
+    const areaById = new Map(area.map((sensor) => [sensor.id, sensor]));
+    const favorites = (Array.isArray(payload.favorites) ? payload.favorites : []).map((favorite) => favoriteReading(favorite, areaById));
+    const merged = new Map(areaById);
     for (const favorite of favorites) {
       const local = merged.get(favorite.id);
-      merged.set(favorite.id, local ? { ...local, favorite: local.favorite || favorite.favorite } : { ...favorite, remote_favorite: true });
+      merged.set(favorite.id, local ? { ...local, favorite: local.favorite || favorite.favorite } : favorite);
     }
     state.sensors = [...merged.values()];
     state.areaSensors = Array.isArray(payload.area) ? area : state.sensors;
     state.favoriteSensors = Array.isArray(payload.favorites) ? favorites : null;
     state.coverage = payload.coverage || null;
     state.fetchedBounds = publicationBounds(payload) || state.fetchedBounds;
-    state.selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
+    const selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;
+    if (selectedId !== state.selectedId) state.selectedFavorite = false;
+    state.selectedId = selectedId;
     state.source = payload.source || "Demo data";
     state.stale = payload.stale;
     state.config = { ...state.config, ...(payload.config || {}) };
-    for (const sensor of state.sensors) syncTrendWithSensor(sensor);
+    for (const sensor of [...state.sensors, ...(state.favoriteSensors || [])]) syncTrendWithSensor(sensor);
     stampPlaceName();
     applyInterfaceScale();
     $("#data-source").textContent = state.source;
     renderAll();
     reconcilePopup();
+    refreshSearchResults();
     if ($("#settings-dialog").open) renderHiddenList();
+    // A publication also answers the header-bar Refresh.
+    retryFailedTiles();
   }
 
   function renderAll() {
@@ -319,42 +344,35 @@
     return hasLimitedCoverage() ? `${base} · Limited coverage` : base;
   }
 
-  function stampProvenance(id, label) {
+  // The single page clock, in seconds, for freshness and relative times.
+  const nowSeconds = () => Date.now() / 1000;
+
+  function provenanceOf(sensor) {
+    return AirloomCore.readingProvenance(sensor, { source: state.source, stale: state.stale }, nowSeconds());
+  }
+
+  const categoryOf = (sensor) => sensor.category || AirloomCore.bandForAQI(sensor.aqi).label;
+
+  const explainProvenance = (sensor, label) => AirloomCore.provenanceDescription(label, sensor.last_seen, nowSeconds());
+  const badgeMarkup = (sensor, label) => label ? `<span class="provenance-badge" title="${explainProvenance(sensor, label)}">${label}</span>` : "";
+
+  // Shows the reading's badge (or hides it with no reading) and returns it.
+  function stampProvenance(id, sensor) {
+    const label = sensor ? provenanceOf(sensor) : "";
     const element = $(`#${id}`);
     element.hidden = !label;
     element.textContent = label;
-  }
-
-  function summaryProvenanceLabel() {
-    const source = (state.source || "").toLowerCase();
-    const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
-    if (source.includes("demo") || state.areaSensors.some((sensor) => sensor.origin === "demo")) return "Demo data";
-    if (state.stale === true || legacyStale) return "Stale cached data";
-    if (source.includes("cached") || state.areaSensors.some((sensor) => sensor.delivery === "cache")) return "Cached data";
-    return "";
-  }
-
-  function detailProvenanceLabel(sensor) {
-    if (!sensor) return "";
-    if (sensor.origin === "demo") return "Demo data";
-    if (sensor.stale === true) return "Stale cached data";
-    if (sensor.remote_favorite === true) return sensor.delivery === "cache" ? "Cached data" : "";
-
-    const source = (state.source || "").toLowerCase();
-    const legacyStale = state.stale === undefined && state.source === "PurpleAir · cached";
-    if (source.includes("demo")) return "Demo data";
-    if (state.stale === true || legacyStale) return "Stale cached data";
-    if (sensor.delivery === "cache" || source.includes("cached")) return "Cached data";
-    return "";
+    element.title = label ? explainProvenance(sensor, label) : "";
+    return label;
   }
 
   function renderSummary(view = mapViewport()) {
-    stampProvenance("summary-provenance", summaryProvenanceLabel());
     const limited = hasLimitedCoverage();
     $("#coverage-status").hidden = !limited;
     $("#coverage-status").textContent = limited ? "Limited coverage" : "";
     const valid = view.width ? AirloomCore.summarySensors(locationFiltered(state.areaSensors), geographicBounds(view)) : [];
     const sensor = valid[Math.floor(valid.length / 2)];
+    stampProvenance("summary-provenance", sensor);
     if (!sensor) {
       $("#summary-aqi").textContent = "—";
       $("#summary-aqi").style.background = "";
@@ -446,15 +464,17 @@
     row.dataset.id = String(sensor.id);
     row.style.setProperty("--sensor", sensor.color || "");
     row.style.setProperty("--sensor-fg", sensor.foreground || "");
-    row.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}${sensor.favorite ? ", favorite" : ""}`);
+    const badge = provenanceOf(sensor);
+    row.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}, ${categoryOf(sensor)}${badge ? `, ${badge}` : ""}${sensor.favorite ? ", favorite" : ""}`);
     const meta = [formatTemperature(sensor.temperature_f), formatHumidity(sensor.humidity)].filter(Boolean).join(" · ");
     row.innerHTML = `<span class="sensor-badge">${sensor.aqi ?? "—"}</span>
-      <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small></span>
+      <span class="sensor-copy"><strong>${escapeHtml(sensor.name)}</strong><small>${meta || "Recent outdoor reading"}</small>${badgeMarkup(sensor, badge)}</span>
       ${sensor.favorite ? '<span class="row-star"><svg viewBox="0 0 24 24"><path d="m12 17.3-6.2 3.5 1.4-6.9-5.1-4.7 7-.8L12 2l2.9 6.4 7 .8-5.1 4.7 1.4 6.9-6.2-3.5Z"/></svg></span>' : ""}`;
   }
 
   function selectSensor(id, revealDetail = false, origin = null) {
     state.selectedId = id;
+    state.selectedFavorite = origin?.surface === "favorites-list";
     bridge({ action: "select", id });
     renderLists();
     renderMapMarkers();
@@ -466,11 +486,15 @@
       $("#close-detail").focus();
     }
     const sensor = selectedSensor();
-    if (sensor) announce(`${sensor.name}. AQI ${sensor.aqi ?? "unavailable"}.`);
+    if (sensor) {
+      const badge = provenanceOf(sensor);
+      announce(`${sensor.name}. AQI ${sensor.aqi ?? "unavailable"}, ${categoryOf(sensor)}.${badge ? ` ${badge}.` : ""}`);
+    }
   }
 
   function selectedSensor() {
-    return state.sensors.find((sensor) => sensor.id === state.selectedId);
+    const favorite = state.selectedFavorite && state.favoriteSensors?.find((sensor) => sensor.id === state.selectedId);
+    return favorite || state.sensors.find((sensor) => sensor.id === state.selectedId);
   }
 
   function positionPopup(sensor, view = mapViewport()) {
@@ -504,10 +528,10 @@
     $("#popup-aqi").style.background = sensor.color || "";
     $("#popup-aqi").style.color = sensor.foreground || "";
     $("#popup-name").textContent = sensor.name;
-    $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
+    const badge = stampPopupAge(sensor);
     $("#popup-favorite").classList.toggle("active", Boolean(sensor.favorite));
     $("#popup-favorite").setAttribute("aria-pressed", String(Boolean(sensor.favorite)));
-    const demo = (state.source || "").toLowerCase().includes("demo") || sensor.origin === "demo";
+    const demo = badge === "Demo";
     const link = $("#popup-purpleair");
     link.hidden = demo; // demo sensor ids do not exist on the public map
     if (!demo) link.href = `https://map.purpleair.com/1/mAQI/a10/p604800/cC0?select=${sensor.id}#14/${sensor.latitude}/${sensor.longitude}`;
@@ -515,6 +539,12 @@
     state.popupId = sensor.id;
     positionPopup(sensor);
     if (focus) $("#popup-details").focus();
+  }
+
+  // The popup's time-derived text: its age and its provenance badge.
+  function stampPopupAge(sensor) {
+    $("#popup-meta").textContent = [sensor.category, sensor.indoor ? "Indoor" : "Outdoor", relativeTime(sensor.last_seen)].filter(Boolean).join(" · ");
+    return stampProvenance("popup-provenance", sensor);
   }
 
   function hidePopup(restoreFocus) {
@@ -536,7 +566,7 @@
 
   function renderDetail() {
     const sensor = selectedSensor();
-    stampProvenance("detail-provenance", detailProvenanceLabel(sensor));
+    stampProvenance("detail-provenance", sensor);
     if (!sensor) {
       hideDetail();
       return;
@@ -544,7 +574,8 @@
     $("#sensor-name").textContent = sensor.name;
     $("#detail-indoor").hidden = !sensor.indoor;
     $("#aqi-number").textContent = sensor.aqi ?? "—";
-    $("#aqi-number").style.color = sensor.color;
+    $("#aqi-number").style.background = sensor.color || AirloomCore.UNAVAILABLE.color;
+    $("#aqi-number").style.color = sensor.foreground || AirloomCore.UNAVAILABLE.foreground;
     $("#aqi-category").textContent = sensor.category;
     $("#temperature").textContent = formatTemperature(sensor.temperature_f) || "—";
     $("#humidity").textContent = formatHumidity(sensor.humidity) || "—";
@@ -562,37 +593,47 @@
     const sensorId = Number(payload.sensor_id);
     const requestId = Number(payload.request_id);
     if (!Number.isInteger(sensorId) || !Number.isInteger(requestId) || payload.reading_last_seen === undefined || !["idle", "loading", "loaded", "unavailable", "error"].includes(payload.status)) return;
-    const sensor = state.sensors.find((item) => item.id === sensorId);
-    if (!sensor) return;
     const readingLastSeen = readingVersion(payload.reading_last_seen);
-    if (readingLastSeen !== readingVersion(sensor.last_seen)) return;
-    const previous = state.trends.get(sensorId);
-    if (previous) {
-      if (readingLastSeen < previous.readingLastSeen) return;
-      if (readingLastSeen === previous.readingLastSeen && previous.source === "event" && requestId < previous.requestId) return;
-    }
     let status = payload.status;
     const trend = Array.isArray(payload.trend) ? payload.trend : [];
     if (status === "loaded" && !trend.some((point) => Number.isFinite(point.aqi))) status = "unavailable";
-    const retries = status === "loaded" ? 0 : (previous?.retries ?? 0);
-    state.trends.set(sensorId, { status, trend, retries, readingLastSeen, requestId, source: "event" });
-    if (status === "loaded") sensor.trend = trend;
-    if (sensorId === state.selectedId) renderDetail();
+    // The event names one observation; it applies to each collection's
+    // reading of that observation and to no other.
+    const readings = new Map([...state.sensors, ...(state.favoriteSensors || [])]
+      .filter((sensor) => sensor.id === sensorId && readingVersion(sensor.last_seen) === readingLastSeen)
+      .map((sensor) => [trendKey(sensor), sensor]));
+    let accepted = false;
+    for (const [key, sensor] of readings) {
+      const previous = state.trends.get(key);
+      if (previous) {
+        if (readingLastSeen < previous.readingLastSeen) continue;
+        if (readingLastSeen === previous.readingLastSeen && previous.source === "event" && requestId < previous.requestId) continue;
+      }
+      const retries = status === "loaded" ? 0 : (previous?.retries ?? 0);
+      state.trends.set(key, { status, trend, retries, readingLastSeen, requestId, source: "event" });
+      if (status === "loaded") sensor.trend = trend;
+      accepted = true;
+    }
+    if (accepted && sensorId === state.selectedId) renderDetail();
   }
 
   function retryTrend() {
-    const sensorId = state.selectedId;
-    const trend = state.trends.get(sensorId);
+    const sensor = selectedSensor();
+    const trend = sensor && state.trends.get(trendKey(sensor));
     if (!trend || trend.status !== "error" || trend.retries >= 3) return;
     trend.retries++;
     trend.requestId++;
     trend.status = "loading";
-    if (desktopMode) bridge({ action: "select", id: sensorId });
+    if (desktopMode) bridge({ action: "select", id: sensor.id });
     renderDetail();
   }
 
+  // Spoken and tabulated names for each rolling-average window.
+  const WINDOW_LABELS = { "1w": "1-week average", "1d": "1-day average", "6h": "6-hour average", "1h": "1-hour average", "30m": "30-minute average", "10m": "10-minute average", Now: "Current" };
+  const windowName = (label) => Object.hasOwn(WINDOW_LABELS, label) ? WINDOW_LABELS[label] : escapeHtml(label);
+
   function renderChart(sensor) {
-    const trendState = state.trends.get(sensor.id);
+    const trendState = state.trends.get(trendKey(sensor));
     const status = trendState?.status || (state.config.has_api_key ? "loading" : "unavailable");
     const retries = trendState?.retries || 0;
     const retry = $("#trend-retry");
@@ -620,17 +661,23 @@
     const line = coordinates.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
     const area = `${line} L${coordinates.at(-1).x},${height - padBottom} L${coordinates[0].x},${height - padBottom} Z`;
     const labels = coordinates.map((point) => `<text x="${point.x}" y="${height - 4}" text-anchor="middle">${escapeHtml(point.label)}</text>`).join("");
+    const values = coordinates.map((point) => `<text class="point-value" x="${point.x}" y="${point.y - 7}" text-anchor="middle">${point.aqi}</text>`).join("");
     const dots = coordinates.map((point) => `<circle class="dot" cx="${point.x}" cy="${point.y}" r="3.5" fill="${sensor.color}"/>`).join("");
-    $("#chart").innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-      <line class="grid" x1="0" y1="${height - padBottom}" x2="${width}" y2="${height - padBottom}"/>
-      <path class="area" d="${area}" fill="${sensor.color}"/><path class="line" d="${line}" stroke="${sensor.color}"/>${dots}${labels}
-    </svg>`;
-    const comparisonLabels = { "1w": "1-week average", "1d": "1-day average", "6h": "6-hour average", "1h": "1-hour average", "30m": "30-minute average", "10m": "10-minute average" };
-    if (points.at(-1).label === "Now" && comparisonLabels[points[0].label]) {
-      $("#chart-period").textContent = `Current vs ${comparisonLabels[points[0].label]}`;
+    const baseline = points[0].label;
+    if (points.at(-1).label === "Now" && baseline !== "Now" && Object.hasOwn(WINDOW_LABELS, baseline)) {
+      $("#chart-period").textContent = `Current vs ${WINDOW_LABELS[baseline]}`;
     }
     const delta = points.at(-1).aqi - points[0].aqi;
-    $("#trend-direction").textContent = Math.abs(delta) < 4 ? "Holding steady" : delta > 0 ? `Up ${delta} points` : `Down ${Math.abs(delta)} points`;
+    const direction = Math.abs(delta) < 4 ? "Holding steady" : delta > 0 ? `Up ${delta} points` : `Down ${Math.abs(delta)} points`;
+    $("#trend-direction").textContent = direction;
+    const windows = points.map((point) => ({ label: escapeHtml(point.label), name: windowName(point.label), aqi: point.aqi, category: AirloomCore.bandForAQI(point.aqi).label }));
+    const items = windows.map((point) => `${point.name} AQI ${point.aqi}, ${point.category}`).join("; ");
+    const rows = windows.map((point) => `<tr data-window="${point.label}"><th scope="row">${point.name}</th><td>${point.aqi}</td><td>${point.category}</td></tr>`).join("");
+    $("#chart").innerHTML = `<svg role="img" aria-labelledby="trend-chart-title" aria-describedby="trend-chart-desc" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      <title id="trend-chart-title">${escapeHtml($("#chart-period").textContent)}</title><desc id="trend-chart-desc">${direction}. ${items}.</desc>
+      <line class="grid" x1="0" y1="${height - padBottom}" x2="${width}" y2="${height - padBottom}"/>
+      <path class="area" d="${area}" fill="${sensor.color}"/><path class="line" d="${line}" stroke="${sensor.color}"/>${dots}${values}${labels}
+    </svg><table class="visually-hidden" id="trend-values"><caption>Rolling-average AQI values</caption><thead><tr><th scope="col">Window</th><th scope="col">AQI</th><th scope="col">Category</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   // Minimal slippy-map renderer: bundled code, standard OSM raster tiles, no JS CDN.
@@ -782,7 +829,13 @@
     canvas.hidden = false;
   }
 
-  let tileLayer = { zoom: null, tiles: new Map(), pending: 0 };
+  function newTileLayer(zoom) {
+    return { zoom, tiles: new Map(), pending: 0, failures: new Map(), retryTimer: null };
+  }
+
+  let tileLayer = newTileLayer(null);
+  const TILE_RETRY_BASE_MS = 2000;
+  const TILE_RETRY_MAX_MS = 60000;
   const MARKER_CULL_PAD = 300; // generous cull margin so mid-pan gaps are rare
 
   function tileZoomLevel() { return Math.max(3, Math.min(17, Math.round(state.zoom))); }
@@ -838,6 +891,69 @@
     if (tiles.length && tiles.every((img) => img.classList.contains("loaded"))) clearRetiredTiles();
   }
 
+  function requestTile(owner, key, tx, ty, tz) {
+    const maxTile = 2 ** tz;
+    const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
+    const img = document.createElement("img");
+    img.className = "tile";
+    img.draggable = false;
+    img.alt = "";
+    // Settle against `owner`, the layer this tile belongs to: tileLayer gets
+    // reassigned wholesale on a zoom-level change, and a stale in-flight load
+    // must decrement its own (possibly retired) layer's counter, not
+    // whatever layer happens to be current when it fires.
+    owner.pending++;
+    img.dataset.pending = "true";
+    const settle = (loaded) => {
+      if (loaded) {
+        img.classList.add("loaded");
+        owner.failures.delete(key);
+      } else {
+        img.dataset.failed = "true";
+        owner.failures.set(key, (owner.failures.get(key) || 0) + 1);
+      }
+      delete img.dataset.pending;
+      img.onload = img.onerror = null;
+      owner.pending--;
+      if (!loaded) scheduleTileRetry(owner);
+      clearRetiredTilesWhenCovered(owner);
+    };
+    img.onload = () => settle(true);
+    img.onerror = () => settle(false);
+    img.src = `https://tile.openstreetmap.org/${tz}/${wrappedX}/${ty}.png`;
+    img.style.left = `${tx * 256}px`;
+    img.style.top = `${ty * 256}px`;
+    $("#tiles").appendChild(img);
+    owner.tiles.set(key, img);
+  }
+
+  // One timer per layer, paced by its least-retried failure so a fresh
+  // failure is not held back by a tile that has been failing for a while.
+  function scheduleTileRetry(owner) {
+    if (owner !== tileLayer || owner.retryTimer !== null) return;
+    const failed = [...owner.failures].filter(([key]) => owner.tiles.get(key)?.dataset.failed === "true");
+    if (!failed.length) return;
+    const attempts = Math.min(...failed.map(([, count]) => count));
+    const delay = Math.min(TILE_RETRY_MAX_MS, TILE_RETRY_BASE_MS * 2 ** (attempts - 1));
+    owner.retryTimer = setTimeout(() => retryFailedTiles(owner), delay);
+  }
+
+  // Re-requests the current layer's failed tiles from the same OSM URL. Never
+  // touches the retired layer: that leaves only through
+  // clearRetiredTilesWhenCovered.
+  function retryFailedTiles(owner = tileLayer) {
+    if (owner !== tileLayer) return;
+    clearTimeout(owner.retryTimer);
+    owner.retryTimer = null;
+    for (const key of owner.failures.keys()) {
+      const failed = owner.tiles.get(key);
+      if (!failed || failed.dataset.failed !== "true") continue;
+      failed.remove();
+      const [tx, ty] = key.split("/").map(Number);
+      requestTile(owner, key, tx, ty, owner.zoom);
+    }
+  }
+
   function renderFrame() {
     const view = mapViewport();
     if (!view.width || !view.height) return;
@@ -845,7 +961,8 @@
     const tz = tileZoomLevel();
     if (tileLayer.zoom !== tz) {
       if (tileLayer.zoom !== null) retireTiles();
-      tileLayer = { zoom: tz, tiles: new Map(), pending: 0 };
+      clearTimeout(tileLayer.retryTimer);
+      tileLayer = newTileLayer(tz);
     }
     const scale = 2 ** (state.zoom - tz);
     const maxTile = 2 ** tz;
@@ -859,34 +976,7 @@
       for (let tx = Math.floor(left / 256); tx <= Math.floor(right / 256); tx++) {
         const key = `${tx}/${ty}`;
         needed.add(key);
-        if (!tileLayer.tiles.has(key)) {
-          const wrappedX = ((tx % maxTile) + maxTile) % maxTile;
-          const img = document.createElement("img");
-          img.className = "tile";
-          img.draggable = false;
-          img.alt = "";
-          // Capture the layer this tile belongs to: tileLayer gets reassigned
-          // wholesale on a zoom-level change, and a stale in-flight load must
-          // decrement its own (possibly retired) layer's counter, not
-          // whatever layer happens to be current when it fires.
-          const owner = tileLayer;
-          owner.pending++;
-          img.dataset.pending = "true";
-          const settle = (loaded) => {
-            if (loaded) img.classList.add("loaded");
-            delete img.dataset.pending;
-            img.onload = img.onerror = null;
-            owner.pending--;
-            clearRetiredTilesWhenCovered(owner);
-          };
-          img.onload = () => settle(true);
-          img.onerror = () => settle(false);
-          img.src = `https://tile.openstreetmap.org/${tz}/${wrappedX}/${ty}.png`;
-          img.style.left = `${tx * 256}px`;
-          img.style.top = `${ty * 256}px`;
-          layer.appendChild(img);
-          tileLayer.tiles.set(key, img);
-        }
+        if (!tileLayer.tiles.has(key)) requestTile(tileLayer, key, tx, ty, tz);
       }
     }
     for (const [key, img] of tileLayer.tiles) {
@@ -898,6 +988,7 @@
         img.onload = img.onerror = null;
         img.remove();
         tileLayer.tiles.delete(key);
+        tileLayer.failures.delete(key);
       }
     }
     clearRetiredTilesWhenCovered(tileLayer);
@@ -968,6 +1059,13 @@
     document.documentElement.classList.toggle("reduce-motion", prefersReducedMotion());
   }
   let zoomAnim = null;
+  let flightToken = null;
+
+  // True once no flight, zoom animation, or pinch can still move the map.
+  function navigationIdle() {
+    const flying = flightToken !== null && navigation.isCurrent("fly", flightToken);
+    return zoomAnim === null && !flying && pinch === null && nativePinchStartZoom === null;
+  }
 
   function cancelZoomAnimation() {
     navigation.cancel("zoom");
@@ -1035,7 +1133,8 @@
     const point = sensorWorldPoint(sensor);
     marker.className = `map-marker${sensor.indoor ? " indoor" : ""}${sensor.id === state.selectedId ? " selected" : ""}`;
     marker.dataset.id = String(sensor.id);
-    marker.title = `${sensor.name} · AQI ${sensor.aqi ?? "unavailable"}`;
+    const badge = provenanceOf(sensor);
+    marker.title = `${sensor.name} · AQI ${sensor.aqi ?? "unavailable"} · ${categoryOf(sensor)}${badge ? ` · ${badge}` : ""}`;
     marker.setAttribute("aria-label", marker.title);
     marker.style.left = `${point.x}px`;
     marker.style.top = `${point.y}px`;
@@ -1094,7 +1193,9 @@
     nativePinchStartZoom = null;
     cancelZoomAnimation();
     const token = navigation.begin("fly");
+    flightToken = token;
     if (prefersReducedMotion() || durationMs <= 0) {
+      flightToken = null;
       state.center = { lat, lon: targetLon };
       renderMap();
       scheduleViewChanged();
@@ -1108,7 +1209,7 @@
       state.center = { lat: from.lat + (lat - from.lat) * ease, lon: from.lon + (targetLon - from.lon) * ease };
       renderFrame();
       if (t < 1) requestAnimationFrame(step);
-      else { renderMapMarkers(); scheduleViewChanged(); }
+      else { flightToken = null; renderMapMarkers(); scheduleViewChanged(); }
     }
     requestAnimationFrame(step);
   }
@@ -1137,6 +1238,13 @@
       : "Browser preview preferences apply to this tab only. PurpleAir keys and remote place search require the desktop app.";
     form.elements.api_key.disabled = !desktopMode;
     form.elements.clear_api_key.disabled = !desktopMode;
+    const unsupported = [...PREVIEW_UNSUPPORTED_FIELDS.map((name) => form.elements[name]), $("#home-fieldset"), $("#home-place-input")];
+    for (const control of unsupported) {
+      control.disabled = !desktopMode;
+      if (desktopMode) control.removeAttribute("aria-describedby");
+      else control.setAttribute("aria-describedby", "preview-settings-note");
+    }
+    $("#preview-settings-note").hidden = desktopMode;
     for (const field of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;
@@ -1157,15 +1265,48 @@
     $("#settings-dialog").showModal();
   }
 
+  // Reconciled by sensor ID so a background refresh keeps the focused Unhide
+  // button, and an unhidden row hands focus to a neighbour instead of dropping it.
   function renderHiddenList() {
     const items = state.config.hidden || [];
-    $("#hidden-list").innerHTML = items.length
-      ? items.map((item) => `<div class="hidden-row"><span>${escapeHtml(item.name || `Sensor ${item.id}`)}</span><button type="button" class="unhide-button" data-id="${item.id}">Unhide</button></div>`).join("")
-      : '<div class="empty-state small">No hidden sensors.</div>';
+    const list = $("#hidden-list");
     const all = $("#unhide-all");
+    const previousKeys = [...list.children].map((row) => row.dataset.key).filter((key) => key !== undefined);
+    const unhideAllFocused = document.activeElement === all;
+    const result = AirloomState.reconcileKeyed(list, items, (item) => item.id, createHiddenRow, updateHiddenRow);
+    if (!items.length) list.innerHTML = '<div class="empty-state small">No hidden sensors.</div>';
     all.hidden = !items.length;
     all.textContent = `Unhide all (${items.length})`;
-    document.querySelectorAll("#hidden-list .unhide-button").forEach((button) => button.addEventListener("click", () => requestUnhide(Number(button.dataset.id))));
+    if (result.removedFocus) focusHiddenSuccessor(previousKeys, result.removedFocus.key);
+    else if (unhideAllFocused && all.hidden) $("#close-settings").focus();
+  }
+
+  function createHiddenRow() {
+    const row = document.createElement("div");
+    row.className = "hidden-row";
+    row.appendChild(document.createElement("span"));
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "unhide-button";
+    button.textContent = "Unhide";
+    button.addEventListener("click", () => requestUnhide(Number(row.dataset.key)));
+    row.appendChild(button);
+    return row;
+  }
+
+  function updateHiddenRow(row, item) {
+    row.querySelector("span").textContent = item.name || `Sensor ${item.id}`;
+  }
+
+  // The next surviving row in the previous order, else the previous one,
+  // else Close once the list is empty.
+  function focusHiddenSuccessor(previousKeys, removedKey) {
+    const rows = [...$("#hidden-list").children];
+    const surviving = (key) => rows.find((row) => row.dataset.key === key);
+    const index = previousKeys.indexOf(removedKey);
+    const successor = previousKeys.slice(index + 1).map(surviving).find(Boolean)
+      || previousKeys.slice(0, index).reverse().map(surviving).find(Boolean);
+    (successor?.querySelector(".unhide-button") || $("#close-settings")).focus();
   }
 
   // Bridge mode: Python owns hiding and answers with a fresh sensors payload.
@@ -1231,12 +1372,29 @@
   }
   const formatHumidity = (humidity) => Number.isFinite(humidity) ? `${Math.round(humidity)}%` : "";
   const numberOrDash = (number) => Number.isFinite(number) ? Number(number).toFixed(1) : "—";
-  function relativeTime(timestamp) {
-    if (!timestamp) return "Update time unavailable";
-    const seconds = Math.max(0, Math.round(Date.now() / 1000 - timestamp));
+  function relativeTime(timestamp, now = nowSeconds()) {
+    if (!AirloomCore.hasObservationTime(timestamp, now)) return "Update time unavailable";
+    const seconds = Math.max(0, Math.round(now - timestamp));
     if (seconds < 90) return "Updated just now";
     if (seconds < 3600) return `Updated ${Math.round(seconds / 60)} min ago`;
     return `Updated ${Math.round(seconds / 3600)} hr ago`;
+  }
+  // Re-renders only what depends on the clock (ages and Old badges), so
+  // readings age visibly between refreshes without refetching or recomputing AQI.
+  const AGE_TICK_MS = 60000;
+  function tickAges() {
+    const sensor = selectedSensor();
+    if (sensor) {
+      $("#updated-time").textContent = relativeTime(sensor.last_seen);
+      stampProvenance("detail-provenance", sensor);
+    }
+    const popupSensor = state.popupId === null ? null : visibleSensors().find((s) => s.id === state.popupId);
+    if (popupSensor) stampPopupAge(popupSensor);
+    renderSummary();
+    renderLists();
+    renderMapMarkers();
+    refreshSearchResults();
+    setTimeout(tickAges, AGE_TICK_MS);
   }
   function escapeHtml(value) {
     return String(value).replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
@@ -1244,7 +1402,14 @@
 
   function invalidatePlaceSearch(context) {
     state.placeRequests[context] = null;
-    if (context === "main") state.placeResults = [];
+    if (context === "main") { state.placeResults = []; state.placeError = undefined; }
+  }
+
+  function cancelMainSearch() {
+    const pending = state.placeRequests.main !== null;
+    invalidatePlaceSearch("main");
+    // Also stop a queued main search before it reaches the network.
+    if (pending) bridge({ action: "cancel-place-search", context: "main" });
   }
 
   function submitPlaceSearch(context) {
@@ -1268,18 +1433,55 @@
     else renderSearchResults(payload.results || [], payload.error);
   }
 
+  function sensorResultMatches() {
+    const query = state.query.trim().toLowerCase();
+    return query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query)).slice(0, 4) : [];
+  }
+
+  const sensorResultButtons = (box) => [...box.querySelectorAll("button")].filter((button) => button.dataset.kind === "sensor");
+
+  // A sensor result shows an individual reading, so it carries the same
+  // category and degraded-only badge as the list rows.
+  function stampSensorResult(button, sensor) {
+    const badge = provenanceOf(sensor);
+    const category = categoryOf(sensor);
+    button.setAttribute("aria-label", `${sensor.name}, AQI ${sensor.aqi ?? "unavailable"}, ${category}${badge ? `, ${badge}` : ""}`);
+    button.innerHTML = `${escapeHtml(sensor.name)} · AQI ${sensor.aqi ?? "—"} · ${escapeHtml(category)}${badgeMarkup(sensor, badge)}`;
+  }
+
+  // Keeps open sensor results current on publications and minute ticks, in
+  // place when the matches are unchanged so focus stays put. It never reopens
+  // dismissed results or touches a pending place search.
+  function refreshSearchResults() {
+    const box = $("#search-results");
+    if (box.hidden) return;
+    const sensors = sensorResultMatches();
+    const buttons = sensorResultButtons(box);
+    if (buttons.length === sensors.length && buttons.every((button, index) => button.dataset.id === String(sensors[index].id))) {
+      buttons.forEach((button, index) => stampSensorResult(button, sensors[index]));
+      return;
+    }
+    const active = box.contains(document.activeElement) ? document.activeElement.dataset : null;
+    const focused = active && { kind: active.kind, key: active.id ?? active.index };
+    renderSearchResults(state.placeResults, state.placeError);
+    if (!focused) return;
+    const match = [...box.querySelectorAll("button")].find((button) => button.dataset.kind === focused.kind && (button.dataset.id ?? button.dataset.index) === focused.key);
+    (!box.hidden && match ? match : $("#search")).focus();
+  }
+
   function renderSearchResults(places, error) {
     const box = $("#search-results");
     state.placeResults = places;
-    const query = state.query.trim().toLowerCase();
-    const sensors = query ? state.sensors.filter((s) => s.name.toLowerCase().includes(query)).slice(0, 4) : [];
+    state.placeError = error;
+    const sensors = sensorResultMatches();
     if (!sensors.length && !places.length && !error) { box.hidden = true; box.innerHTML = ""; return; }
     let html = "";
-    if (sensors.length) html += '<div class="group">Sensors</div>' + sensors.map((s) => `<button data-kind="sensor" data-id="${s.id}">${escapeHtml(s.name)} · AQI ${s.aqi ?? "—"}</button>`).join("");
+    if (sensors.length) html += '<div class="group">Sensors</div>' + sensors.map((s) => `<button data-kind="sensor" data-id="${s.id}"></button>`).join("");
     if (places.length) html += '<div class="group">Places</div>' + places.map((p, i) => `<button data-kind="place" data-index="${i}">${escapeHtml(p.name)}</button>`).join("");
     if (error) html += `<div class="group">${escapeHtml(error)}</div>`;
     box.innerHTML = html;
     box.hidden = false;
+    sensorResultButtons(box).forEach((button, index) => stampSensorResult(button, sensors[index]));
     box.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
       if (button.dataset.kind === "sensor") { selectSensor(Number(button.dataset.id), true, { surface: "search" }); }
       else {
@@ -1355,7 +1557,7 @@
 
   $("#search").addEventListener("input", (event) => {
     state.query = event.target.value;
-    invalidatePlaceSearch("main");
+    cancelMainSearch();
     renderLists();
     renderMapMarkers();
     reconcilePopup();
@@ -1371,7 +1573,11 @@
     if ((event.ctrlKey || event.metaKey) && event.key === ",") { event.preventDefault(); openSettings(); }
     if (event.key === "Escape" && !$("#settings-dialog").open) {
       if (!$("#map-popup").hidden) hidePopup(true);
-      else if (!$("#search-results").hidden) { $("#search-results").hidden = true; $("#search").focus(); }
+      else if (!$("#search-results").hidden || (document.activeElement === $("#search") && state.placeRequests.main !== null)) {
+        cancelMainSearch();
+        $("#search-results").hidden = true;
+        $("#search").focus();
+      }
       else if (!$("#detail-card").hidden) hideDetail();
       else if (!$("#sensors-panel").hidden) {
         $("#sensors-panel").hidden = true;
@@ -1380,7 +1586,10 @@
       }
     }
   });
-  $("#footer-refresh").addEventListener("click", () => actions.refresh());
+  $("#footer-refresh").addEventListener("click", () => {
+    actions.refresh();
+    retryFailedTiles();
+  });
   $("#reload-shell").addEventListener("click", () => {
     bridge({ action: "reload-shell" });
     $("#reload-shell").hidden = true;
@@ -1456,6 +1665,35 @@
   // for marker presses (pointerdown early-returns on buttons).
   $("#map-panel").addEventListener("pointerup", (event) => { const dragged = state.drag !== null; state.drag = null; event.currentTarget.classList.remove("dragging"); if (dragged) renderMapMarkers(); });
   $("#map-panel").addEventListener("pointercancel", (event) => { state.drag = null; event.currentTarget.classList.remove("dragging"); });
+
+  // Keyboard panning shares pointer dragging's cancellation and view-fetch
+  // path. Keys act only while the map itself has focus, so markers, the
+  // popup, inputs, and Preferences keep their own keys.
+  const MAP_KEY_PAN_FRACTION = 0.2;
+  const MAP_KEY_PAN_SHIFT_FRACTION = 0.6;
+  const MAP_KEY_PAN = { ArrowRight: [-1, 0], ArrowLeft: [1, 0], ArrowDown: [0, -1], ArrowUp: [0, 1] };
+  const MAP_KEY_ZOOM = { "+": 1, "=": 1, "-": -1, "_": -1 };
+  function onMapKeydown(event) {
+    if (event.target !== $("#map-panel") || event.ctrlKey || event.altKey || event.metaKey || $("#settings-dialog").open) return;
+    const pan = MAP_KEY_PAN[event.key];
+    if (pan) {
+      event.preventDefault();
+      const panel = $("#map-panel");
+      const fraction = event.shiftKey ? MAP_KEY_PAN_SHIFT_FRACTION : MAP_KEY_PAN_FRACTION;
+      beginDirectManipulation();
+      hideTransientOverlays();
+      panBy(pan[0] * fraction * panel.clientWidth, pan[1] * fraction * panel.clientHeight);
+      renderMapMarkers();
+      return;
+    }
+    const zoom = MAP_KEY_ZOOM[event.key];
+    if (zoom) {
+      event.preventDefault();
+      animateZoomTo((zoomAnim ? zoomAnim.target : Math.round(state.zoom)) + zoom, centerAnchor());
+    }
+  }
+  $("#map-panel").addEventListener("keydown", onMapKeydown);
+
   function isZoomWheel(event) {
     return Boolean(event.deltaY) && Math.abs(event.deltaX) <= Math.abs(event.deltaY);
   }
@@ -1590,6 +1828,7 @@
   new ResizeObserver(() => renderMap()).observe($("#map-panel"));
   window.matchMedia?.(REDUCED_MOTION_QUERY)?.addEventListener?.("change", applyMotionPreference);
   applyMotionPreference();
+  setTimeout(tickAges, AGE_TICK_MS);
   bridge({ action: "ready" });
   // Makes the interface directly previewable in an ordinary browser while the
   // desktop build continues to receive its state from the Python bridge.

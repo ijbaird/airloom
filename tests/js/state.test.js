@@ -206,6 +206,7 @@ class FakeElement {
     } else this[name] = setting;
   }
   getAttribute(name) { return this.attributes[name] ?? null; }
+  removeAttribute(name) { delete this.attributes[name]; }
   setPointerCapture() {}
   getBoundingClientRect() {
     return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight };
@@ -237,8 +238,10 @@ class FakeElement {
   }
 }
 
-function loadApp({ reducedMotion = false, preview = false } = {}) {
+function loadApp({ reducedMotion = false, preview = false, nowMs } = {}) {
   const html = fs.readFileSync(indexPath, "utf8");
+  const clock = { nowMs };
+  const realNow = Date.now;
   const elements = new Map();
   for (const match of html.matchAll(/<([a-z][\w-]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)) {
     const element = new FakeElement(match[1], match[2]);
@@ -302,7 +305,7 @@ function loadApp({ reducedMotion = false, preview = false } = {}) {
     Boolean,
     Map,
     Set,
-    Date,
+    Date: class extends Date { static now() { return clock.nowMs ?? realNow(); } },
     JSON,
     performance: { now: () => 0 },
     matchMedia: (query) => ({ media: query, matches: reducedMotion }),
@@ -312,9 +315,9 @@ function loadApp({ reducedMotion = false, preview = false } = {}) {
       return id;
     },
     cancelAnimationFrame: (id) => animationFrames.delete(id),
-    setTimeout: (callback) => {
+    setTimeout: (callback, delay) => {
       const id = nextTimer++;
-      timers.set(id, callback);
+      timers.set(id, { callback, delay });
       return id;
     },
     clearTimeout: (id) => timers.delete(id),
@@ -352,11 +355,13 @@ function loadApp({ reducedMotion = false, preview = false } = {}) {
     document,
     elements,
     messages,
+    setNow(ms) { clock.nowMs = ms; },
     runTimers() {
       const pending = [...timers.values()];
       timers.clear();
-      for (const callback of pending) callback();
+      for (const { callback } of pending) callback();
     },
+    timerDelays() { return [...timers.values()].map(({ delay }) => delay); },
     runAnimationFrames(now) {
       const pending = [...animationFrames.values()];
       animationFrames.clear();
@@ -487,6 +492,129 @@ test("native pinch cancels an in-flight recenter", () => {
 
   app.runAnimationFrames(600);
   assertCenter(app, expected);
+});
+
+// Dispatches a keydown on #map-panel (as if it held focus) and reports
+// whether the handler claimed the key with preventDefault().
+function pressMapKey(app, key, extra = {}) {
+  const panel = app.elements.get("map-panel");
+  let prevented = false;
+  panel.dispatch("keydown", {
+    key,
+    target: panel,
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+    preventDefault() { prevented = true; },
+    ...extra,
+  });
+  return prevented;
+}
+
+test("the map is a named focusable region with keyboard help", () => {
+  const app = loadApp();
+  const panel = app.elements.get("map-panel");
+  assert.equal(panel.getAttribute("tabindex"), "0");
+  assert.equal(panel.getAttribute("aria-label"), "Air quality sensor map");
+  assert.equal(panel.getAttribute("aria-describedby"), "map-keyboard-help");
+  // The fake DOM does not parse text content, so read the help from the page source.
+  const help = fs.readFileSync(indexPath, "utf8").match(/<p\b[^>]*\bid="map-keyboard-help"[^>]*>([^<]*)<\/p>/);
+  assert.ok(help, "index.html needs a #map-keyboard-help paragraph");
+  assert.match(help[1], /arrow keys.*plus or minus/);
+  assert.notEqual(cssDeclaration(".map-panel:focus-visible", "outline"), null);
+});
+
+test("arrow keys pan the focused map by a fifth of the viewport and schedule a view fetch", () => {
+  const app = loadApp();
+  configureMap(app);
+  app.runTimers();
+  app.messages.length = 0;
+  const worldSize = 256 * 2 ** 12;
+  const expectedLon = 0.2 * 512 / worldSize * 360;
+
+  const prevented = pressMapKey(app, "ArrowRight");
+  closeTo(app.context.Airloom.debugState().center.lon, expectedLon);
+  closeTo(app.context.Airloom.debugState().center.lat, 0);
+  assert.equal(prevented, true);
+
+  app.runTimers();
+  const views = app.messages.filter((item) => item.action === "view-changed");
+  assert.equal(views.length, 1);
+  closeTo(views[0].lon, expectedLon);
+
+  assert.equal(pressMapKey(app, "ArrowDown", { shiftKey: true }), true);
+  const expectedLat = Math.atan(Math.sinh(-2 * Math.PI * 0.6 * 512 / worldSize)) * 180 / Math.PI;
+  assertCenter(app, { lat: expectedLat, lon: expectedLon });
+  assert.ok(expectedLat < 0);
+});
+
+test("map keyboard panning cancels an in-flight recenter", () => {
+  const app = loadApp();
+  configureMap(app);
+  startFlight(app);
+  assert.equal(pressMapKey(app, "ArrowLeft"), true);
+  const expected = { ...app.context.Airloom.debugState().center };
+
+  app.runAnimationFrames(10000);
+  assertCenter(app, expected);
+});
+
+test("plus and minus zoom the focused map", () => {
+  const app = loadApp({ reducedMotion: true });
+  configureMap(app);
+  assert.equal(app.context.Airloom.debugState().zoom, 12);
+  assert.equal(pressMapKey(app, "+"), true);
+  assert.equal(app.context.Airloom.debugState().zoom, 13);
+  assert.equal(pressMapKey(app, "="), true);
+  assert.equal(app.context.Airloom.debugState().zoom, 14);
+  assert.equal(pressMapKey(app, "-"), true);
+  assert.equal(app.context.Airloom.debugState().zoom, 13);
+});
+
+test("map keys are ignored outside the focused map, with modifiers, and while Preferences is open", () => {
+  const app = loadApp({ reducedMotion: true });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1)]);
+  const marker = markerFor(app, 1);
+  assert.ok(marker, "the fixture sensor renders a marker");
+  const before = () => {
+    const { center, zoom } = app.context.Airloom.debugState();
+    return { center: { ...center }, zoom };
+  };
+  const assertIgnored = (label, press) => {
+    const expected = before();
+    for (const key of ["ArrowRight", "ArrowUp", "+", "-"]) {
+      assert.equal(press(key), false, `${label}: ${key} must not be prevented`);
+    }
+    assertCenter(app, expected.center);
+    assert.equal(app.context.Airloom.debugState().zoom, expected.zoom, `${label}: zoom`);
+  };
+
+  assertIgnored("search target", (key) => pressMapKey(app, key, { target: app.elements.get("search") }));
+  assertIgnored("marker target", (key) => pressMapKey(app, key, { target: marker }));
+  assertIgnored("Ctrl", (key) => pressMapKey(app, key, { ctrlKey: true }));
+  openSettings(app);
+  assertIgnored("Preferences open", (key) => pressMapKey(app, key));
+});
+
+test("debugState reports navigation idle only after flights and zoom animations settle", () => {
+  const app = loadApp();
+  configureMap(app);
+  assert.equal(app.context.Airloom.debugState().navigationIdle, true);
+
+  startFlight(app);
+  assert.equal(app.context.Airloom.debugState().navigationIdle, false);
+  app.runAnimationFrames(10000);
+  assert.equal(app.context.Airloom.debugState().navigationIdle, true);
+
+  app.elements.get("zoom-in").click();
+  assert.equal(app.context.Airloom.debugState().navigationIdle, false);
+  for (let frame = 0; frame < 100 && !app.context.Airloom.debugState().navigationIdle; frame += 1) {
+    app.runAnimationFrames(10000 + frame * 16);
+  }
+  assert.equal(app.context.Airloom.debugState().navigationIdle, true);
+  assert.equal(app.context.Airloom.debugState().zoom, 13);
 });
 
 test("flight invalidates active DOM pinch changes and end settlement", () => {
@@ -739,6 +867,179 @@ test("a completely successful replacement retires the old imagery", () => {
   assert.equal(old.hidden, true);
 });
 
+function liveTileWithSrc(app, src) {
+  return app.elements.get("tiles").childNodes.find((image) => image.src === src) || null;
+}
+
+// Delays scheduled since `before`, as a multiset difference, so unrelated
+// timers (age ticks, view fetches) re-armed by runTimers() don't count.
+function addedDelays(before, after) {
+  const remaining = [...before];
+  return after.filter((delay) => {
+    const index = remaining.indexOf(delay);
+    if (index < 0) return true;
+    remaining.splice(index, 1);
+    return false;
+  });
+}
+
+test("a failed tile is retried at the same center and zoom and then loads", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const { zoom, center } = app.context.Airloom.debugState();
+  const before = { zoom, lat: center.lat, lon: center.lon };
+  const failed = live.childNodes[0];
+  const src = failed.src;
+
+  failed.onerror();
+  assert.ok(app.timerDelays().includes(2000), "a failed tile should schedule a retry");
+  app.runTimers();
+
+  const retried = liveTileWithSrc(app, src);
+  assert.ok(retried, "the failed tile should be requested again");
+  assert.notEqual(retried, failed, "a retry uses a fresh element");
+  assert.equal(retried.dataset.pending, "true");
+  assert.equal(failed.isConnected, false);
+
+  retried.onload();
+  assert.equal(retried.classList.contains("loaded"), true);
+  const after = app.context.Airloom.debugState();
+  assert.equal(after.zoom, before.zoom);
+  assertCenter(app, { lat: before.lat, lon: before.lon });
+});
+
+test("manual Refresh retries failed tiles immediately", () => {
+  const app = loadApp();
+  configureMap(app);
+  const failed = app.elements.get("tiles").childNodes[0];
+  const src = failed.src;
+  failed.onerror();
+
+  app.elements.get("footer-refresh").click();
+
+  assert.ok(app.messages.some((message) => message.action === "refresh"));
+  const retried = liveTileWithSrc(app, src);
+  assert.ok(retried && retried !== failed, "Refresh should re-request the failed tile without waiting");
+  assert.equal(retried.dataset.pending, "true");
+  assert.equal(failed.isConnected, false);
+});
+
+test("a sensors publication retries failed tiles", () => {
+  const app = loadApp();
+  configureMap(app);
+  const failed = app.elements.get("tiles").childNodes[0];
+  const src = failed.src;
+  failed.onerror();
+
+  receiveSensors(app, [fixtureSensor(1)]);
+
+  const retried = liveTileWithSrc(app, src);
+  assert.ok(retried && retried !== failed, "a publication should re-request the failed tile without waiting");
+  assert.equal(retried.dataset.pending, "true");
+  assert.equal(failed.isConnected, false);
+});
+
+test("retained imagery stays until the retried replacement layer fully loads", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const old = app.elements.get("tiles-old");
+  for (const image of [...live.childNodes]) image.onload();
+  app.context.Airloom.debugZoomTo(13);
+  for (const image of [...live.childNodes]) image.onerror();
+  app.runTimers();
+
+  assert.ok(old.childNodes.length > 0, "retries must not discard retained imagery");
+  assert.equal(old.hidden, false);
+  const replacements = [...live.childNodes];
+  assert.ok(replacements.length > 0 && replacements.every((image) => image.dataset.pending === "true"));
+
+  for (const image of replacements) image.onload();
+  assert.equal(old.childNodes.length, 0);
+  assert.equal(old.hidden, true);
+});
+
+test("staggered tile failures across repeated publications never duplicate pending tiles or retry timers", () => {
+  const app = loadApp();
+  configureMap(app);
+  const live = app.elements.get("tiles");
+  const tileCount = live.childNodes.length;
+  const [a, b, c] = live.childNodes;
+  assert.ok(c, "the viewport needs at least three tiles");
+  const baseline = app.timerDelays();
+  const posted = app.messages.length;
+  // Age ticks are 60 s; these early retries stay well below that.
+  const retryTimers = () => addedDelays(baseline, app.timerDelays()).filter((delay) => delay < 60000);
+  const copies = (src) => live.childNodes.filter((image) => image.src === src).length;
+  const assertNoAccumulation = (when) => {
+    assert.equal(live.childNodes.length, tileCount, `no extra tiles ${when}`);
+    for (const image of [a, b, c]) assert.equal(copies(image.src), 1, `one element per key ${when}`);
+  };
+
+  a.onerror();
+  assert.deepEqual(retryTimers(), [2000]);
+  receiveSensors(app, [fixtureSensor(1)]);
+  const a1 = liveTileWithSrc(app, a.src);
+  assert.notEqual(a1, a);
+  assert.equal(a1.dataset.pending, "true");
+  assert.deepEqual(retryTimers(), [], "a publication retry replaces the scheduled one");
+
+  receiveSensors(app, [fixtureSensor(1)]);
+  assert.equal(liveTileWithSrc(app, a.src), a1, "a pending replacement is not requested again");
+  assert.equal(liveTileWithSrc(app, b.src), b);
+  assert.equal(liveTileWithSrc(app, c.src), c);
+  assertNoAccumulation("after a repeated publication");
+
+  b.onerror();
+  a1.onerror();
+  assert.deepEqual(retryTimers(), [2000], "staggered failures share one layer timer");
+  receiveSensors(app, [fixtureSensor(1)]);
+  const a2 = liveTileWithSrc(app, a.src);
+  const b1 = liveTileWithSrc(app, b.src);
+  assert.ok(a2 !== a1 && b1 !== b && a2.dataset.pending === "true" && b1.dataset.pending === "true");
+  assert.equal(liveTileWithSrc(app, c.src), c, "a still-pending tile keeps its element");
+  receiveSensors(app, [fixtureSensor(1)]);
+  assert.equal(liveTileWithSrc(app, a.src), a2);
+  assert.equal(liveTileWithSrc(app, b.src), b1);
+  assertNoAccumulation("after staggered failures");
+
+  c.onerror();
+  assert.deepEqual(retryTimers(), [2000]);
+  assert.equal(app.messages.length, posted, "failures and publication retries post nothing to the bridge");
+  const beforeTimers = app.messages.length;
+  app.runTimers();
+  const c1 = liveTileWithSrc(app, c.src);
+  assert.ok(c1 !== c && c1.dataset.pending === "true");
+  assert.equal(liveTileWithSrc(app, a.src), a2);
+  assert.equal(liveTileWithSrc(app, b.src), b1);
+  assertNoAccumulation("after the timed retry");
+  assert.deepEqual(app.messages.slice(beforeTimers), [],
+    "a timed retry posts nothing to the bridge");
+});
+
+test("tile retry backoff is capped and a zoom change cancels the old layer's retry", () => {
+  const app = loadApp();
+  configureMap(app);
+  const src = app.elements.get("tiles").childNodes[0].src;
+  const delays = [];
+  for (let attempt = 0; attempt < 7; attempt++) {
+    const before = app.timerDelays();
+    liveTileWithSrc(app, src).onerror();
+    delays.push(...addedDelays(before, app.timerDelays()));
+    app.runTimers();
+  }
+  assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+
+  const stale = app.elements.get("tiles").childNodes[0];
+  const staleSrc = stale.src;
+  stale.onerror();
+  app.context.Airloom.debugZoomTo(14);
+  app.runTimers();
+  assert.equal(liveTileWithSrc(app, staleSrc), null,
+    "the replaced layer's failed tile must not be re-requested");
+});
+
 test("reconcileKeyed preserves keyed controls and returns removed logical focus", () => {
   const { reconcileKeyed } = require("../../airloom/resources/state.js");
   assert.equal(typeof reconcileKeyed, "function");
@@ -856,6 +1157,60 @@ test("removing a focused row during refresh advances to the remaining row", () =
   assert.equal(app.document.activeElement, remaining);
 });
 
+// Keyed rows carry the sensor ID on the row; the older innerHTML-built list
+// carried it as data-id on the button (and the fake DOM only materialises its
+// buttons). Accepting both lets this regression reach its focus assertions
+// against either implementation.
+function hiddenUnhideButton(app, id) {
+  return app.elements.get("hidden-list").querySelectorAll(".unhide-button")
+    .find((button) => (button.parentNode.dataset.key ?? button.dataset.id) === String(id));
+}
+
+test("hidden list keeps focus through refreshes and Unhide moves to a successor", () => {
+  const app = loadApp();
+  configureMap(app);
+  const publish = (hidden) => receiveSensors(app, [fixtureSensor(9)], { config: { hidden } });
+  const unhideButton = (id) => hiddenUnhideButton(app, id);
+  const [a, b, c] = [{ id: 1, name: "A" }, { id: 2, name: "B" }, { id: 3, name: "C" }];
+  publish([a, b, c]);
+  openSettings(app);
+  const buttonB = unhideButton(2);
+  buttonB.focus();
+
+  publish([a, b, c]);
+  assert.equal(app.document.activeElement, buttonB);
+  assert.equal(unhideButton(2), buttonB);
+
+  buttonB.click();
+  assert.deepEqual(app.messages.at(-1), { action: "unhide", id: 2 });
+  publish([a, c]);
+  assert.equal(app.document.activeElement, unhideButton(3));
+
+  unhideButton(3).click();
+  publish([a]);
+  assert.equal(app.document.activeElement, unhideButton(1));
+
+  unhideButton(1).click();
+  publish([]);
+  assert.equal(app.document.activeElement, app.elements.get("close-settings"));
+});
+
+test("hidden list stays enabled in preview and Unhide all hands focus to Close", () => {
+  const app = loadApp({ preview: true });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(9)], { config: { hidden: [{ id: 1, name: "A" }] } });
+  openSettings(app);
+  const unhideAll = app.elements.get("unhide-all");
+  assert.equal(hiddenUnhideButton(app, 1).disabled, false);
+  assert.equal(unhideAll.disabled, false);
+  unhideAll.focus();
+
+  unhideAll.click();
+
+  assert.equal(unhideAll.hidden, true);
+  assert.equal(app.document.activeElement, app.elements.get("close-settings"));
+});
+
 test("search and settings have accessible names and Ctrl K focuses search", () => {
   const app = loadApp();
   const search = app.elements.get("search");
@@ -876,6 +1231,22 @@ test("status and error feedback expose live regions", () => {
   assert.equal(status.getAttribute("aria-live"), "polite");
   assert.equal(errors.getAttribute("role"), "alert");
   assert.equal(errors.getAttribute("aria-live"), "assertive");
+});
+
+test("detail AQI sits on a band-colored badge with the band foreground", () => {
+  const app = loadApp();
+  configureMap(app);
+  const band = app.context.AirloomCore.bandForAQI(250);
+  receiveSensors(app, [fixtureSensor(1, { aqi: 250, color: band.color, foreground: band.foreground })]);
+  const number = app.elements.get("aqi-number");
+  assert.equal(number.style.background, "#9b6bc3");
+  assert.equal(number.style.color, "#12061c");
+
+  const unavailable = app.context.AirloomCore.bandForAQI(null);
+  receiveSensors(app, [fixtureSensor(1, { aqi: null, color: unavailable.color, foreground: unavailable.foreground })]);
+  assert.equal(number.style.background, "#7d8590");
+  assert.equal(number.style.color, "#0b0e11");
+  assert.notEqual(cssDeclaration(".aqi-number", "border-radius"), null);
 });
 
 test("favorite controls expose synchronized pressed state", () => {
@@ -1024,35 +1395,63 @@ test("scaled narrow controls shrink inside the viewport instead of overflowing",
   assert.equal(cssDeclaration("fieldset", "min-width"), "0");
 });
 
+const NOW_S = 1_800_000_000;
+const FRESH = NOW_S - 60;
+
+function keyed(container, id) {
+  return container.children.find((node) => node.dataset.id === String(id));
+}
+
+function markerFor(app, id) {
+  return keyed(app.elements.get("markers"), id);
+}
+
+function rowFor(app, list, id) {
+  return keyed(app.elements.get(list), id);
+}
+
+function popupBadge(app, id) {
+  markerFor(app, id).click();
+  const badge = app.elements.get("popup-provenance");
+  return badge.hidden ? "" : badge.textContent;
+}
+
+function detailBadge(app, list, id) {
+  rowFor(app, list, id).click();
+  const badge = app.elements.get("detail-provenance");
+  return badge.hidden ? "" : badge.textContent;
+}
+
 test("demo and coverage provenance remain visible near AQI", () => {
-  const app = loadApp();
+  const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);
   const summary = app.elements.get("summary-provenance");
   const detail = app.elements.get("detail-provenance");
   assert.ok(summary);
   assert.ok(detail);
 
-  receiveSensors(app, [fixtureSensor(1, { origin: "demo" })], { source: "Demo data" });
+  receiveSensors(app, [fixtureSensor(1, { origin: "demo", last_seen: FRESH })], { source: "Demo data" });
   assert.equal(summary.hidden, false);
-  assert.equal(summary.textContent, "Demo data");
+  assert.equal(summary.textContent, "Demo");
+  assert.equal(summary.title, "Demo data, not a real sensor reading");
   assert.equal(detail.hidden, false);
-  assert.equal(detail.textContent, "Demo data");
+  assert.equal(detail.textContent, "Demo");
 
-  receiveSensors(app, [fixtureSensor(1)], { coverage: { capped: true, complete: false } });
+  receiveSensors(app, [fixtureSensor(1, { last_seen: FRESH })], { coverage: { capped: true, complete: false } });
   assert.equal(summary.hidden, true);
   assert.equal(detail.hidden, true);
   assert.equal(app.elements.get("coverage-status").hidden, false);
-  receiveSensors(app, [fixtureSensor(1)], { coverage: { capped: false, complete: true } });
+  receiveSensors(app, [fixtureSensor(1, { last_seen: FRESH })], { coverage: { capped: false, complete: true } });
   assert.equal(app.elements.get("coverage-status").hidden, true);
 });
 
 test("selecting a demo favorite does not inherit the live area summary provenance", () => {
-  const app = loadApp();
+  const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);
   app.elements.get("sensors-panel").hidden = false;
   app.context.Airloom.receive("sensors", {
-    area: [fixtureSensor(1, { origin: "live", delivery: "network" })],
-    favorites: [fixtureSensor(2, { origin: "demo", delivery: "network", favorite: true })],
+    area: [fixtureSensor(1, { origin: "live", delivery: "network", last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { origin: "demo", delivery: "network", favorite: true, last_seen: FRESH })],
     selected_id: 1,
     source: "PurpleAir live",
     stale: false,
@@ -1066,61 +1465,425 @@ test("selecting a demo favorite does not inherit the live area summary provenanc
 
   assert.equal(summary.hidden, true, "a remote favorite must not change the area summary label");
   assert.equal(detail.hidden, false);
-  assert.equal(detail.textContent, "Demo data");
+  assert.equal(detail.textContent, "Demo");
 });
 
 test("mixed stale area and cached favorite publications retain their own provenance", () => {
-  const app = loadApp();
+  const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);
   app.elements.get("sensors-panel").hidden = false;
   app.context.Airloom.receive("sensors", {
-    area: [fixtureSensor(1, { origin: "live", delivery: "cache" })],
-    favorites: [fixtureSensor(2, { origin: "live", delivery: "cache", favorite: true })],
+    area: [fixtureSensor(1, { origin: "live", delivery: "cache", last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { origin: "live", delivery: "cache", favorite: true, last_seen: FRESH })],
     selected_id: 2,
     source: "PurpleAir · cached",
     stale: true,
   });
   const summary = app.elements.get("summary-provenance");
   const detail = app.elements.get("detail-provenance");
-  assert.equal(summary.textContent, "Stale cached data");
-  assert.equal(detail.textContent, "Cached data", "area stale metadata must not relabel a separate favorite fetch");
+  assert.equal(summary.textContent, "Stale");
+  assert.equal(detail.hidden, true, "area stale metadata must not relabel a separate favorite fetch");
 
   app.elements.get("sensor-list").querySelectorAll(".sensor-row")[0].click();
-  assert.equal(summary.textContent, "Stale cached data");
-  assert.equal(detail.textContent, "Stale cached data", "selecting the area reading applies the area stale metadata");
+  assert.equal(summary.textContent, "Stale");
+  assert.equal(detail.textContent, "Stale", "selecting the area reading applies the area stale metadata");
 });
 
 test("actual legacy cached fallback payload is labeled stale", () => {
-  const app = loadApp();
+  const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);
-  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached" });
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache", last_seen: FRESH })], { source: "PurpleAir · cached" });
 
-  assert.equal(app.elements.get("summary-provenance").textContent, "Stale cached data");
-  assert.equal(app.elements.get("detail-provenance").textContent, "Stale cached data");
+  assert.equal(app.elements.get("summary-provenance").textContent, "Stale");
+  assert.equal(app.elements.get("detail-provenance").textContent, "Stale");
 });
 
 test("explicit stale provenance overrides the legacy source label", () => {
-  const app = loadApp();
+  const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);
-  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached", stale: true });
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache", last_seen: FRESH })], { source: "PurpleAir · cached", stale: true });
 
-  assert.equal(app.elements.get("summary-provenance").textContent, "Stale cached data");
-  assert.equal(app.elements.get("detail-provenance").textContent, "Stale cached data");
+  assert.equal(app.elements.get("summary-provenance").textContent, "Stale");
+  assert.equal(app.elements.get("detail-provenance").textContent, "Stale");
 });
 
-test("ordinary cached payloads remain cached instead of becoming stale", () => {
-  const app = loadApp();
+test("ordinary in-interval cached payloads carry no provenance badge", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);
   const summary = app.elements.get("summary-provenance");
   const detail = app.elements.get("detail-provenance");
 
-  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached", stale: false });
-  assert.equal(summary.textContent, "Cached data");
-  assert.equal(detail.textContent, "Cached data");
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache", last_seen: FRESH })], { source: "PurpleAir · cached", stale: false });
+  assert.equal(summary.hidden, true);
+  assert.equal(detail.hidden, true);
 
-  receiveSensors(app, [fixtureSensor(1, { delivery: "cache" })], { source: "PurpleAir · cached startup" });
-  assert.equal(summary.textContent, "Cached data");
-  assert.equal(detail.textContent, "Cached data");
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache", last_seen: FRESH })], { source: "PurpleAir · cached startup" });
+  assert.equal(summary.hidden, true);
+  assert.equal(detail.hidden, true);
+});
+
+test("live area and demo favorite carry their own badges on every reading surface", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { origin: "demo", favorite: true, last_seen: FRESH })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    stale: false,
+  });
+
+  const areaRow = rowFor(app, "sensor-list", 1);
+  assert.doesNotMatch(areaRow.innerHTML, /provenance-badge/);
+  assert.equal(markerFor(app, 1).getAttribute("aria-label"), "Sensor 1 · AQI 21 · Fixture");
+
+  const favoriteRow = rowFor(app, "favorites-list", 2);
+  assert.match(favoriteRow.innerHTML, /class="provenance-badge"[^>]*>Demo</);
+  assert.equal(favoriteRow.getAttribute("aria-label"), "Sensor 2, AQI 22, Fixture, Demo, favorite");
+
+  favoriteRow.click();
+  assert.equal(app.elements.get("ui-status").textContent, "Sensor 2. AQI 22, Fixture. Demo.");
+  assert.equal(app.elements.get("detail-provenance").textContent, "Demo");
+  assert.equal(app.elements.get("summary-provenance").hidden, true);
+});
+
+test("stale area and fresh favorite: only area readings say Stale", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { delivery: "cache", last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { delivery: "network", favorite: true, last_seen: FRESH })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+
+  assert.equal(app.elements.get("summary-provenance").textContent, "Stale");
+  assert.match(rowFor(app, "sensor-list", 1).innerHTML, /class="provenance-badge"[^>]*>Stale</);
+  assert.equal(popupBadge(app, 1), "Stale");
+  assert.equal(detailBadge(app, "sensor-list", 1), "Stale");
+
+  assert.doesNotMatch(rowFor(app, "favorites-list", 2).innerHTML, /provenance-badge/);
+  assert.equal(detailBadge(app, "favorites-list", 2), "");
+});
+
+test("fresh area and Old favorite: only the favorite says Old", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { favorite: true, last_seen: NOW_S - 7201 })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    stale: false,
+  });
+
+  assert.doesNotMatch(rowFor(app, "sensor-list", 1).innerHTML, /provenance-badge/);
+  assert.equal(app.elements.get("summary-provenance").hidden, true);
+  const favoriteRow = rowFor(app, "favorites-list", 2);
+  assert.match(favoriteRow.innerHTML, /class="provenance-badge" title="Last observation over 2 hours ago or unknown">Old</);
+  assert.equal(detailBadge(app, "favorites-list", 2), "Old");
+  assert.equal(app.elements.get("detail-provenance").title, "Last observation over 2 hours ago or unknown");
+  assert.equal(app.elements.get("ui-status").textContent, "Sensor 2. AQI 22, Fixture. Old.");
+  assert.equal(app.elements.get("summary-provenance").hidden, true);
+});
+
+test("missing and far-future observation times are Old on every surface", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [
+    fixtureSensor(1, { last_seen: null }),
+    fixtureSensor(2, { last_seen: NOW_S + 601 }),
+    fixtureSensor(3, { last_seen: NOW_S + 600 }),
+  ]);
+  const meta = app.elements.get("popup-meta");
+
+  assert.match(markerFor(app, 1).getAttribute("aria-label"), / · Old$/);
+  assert.equal(popupBadge(app, 1), "Old");
+  assert.match(meta.textContent, /Update time unavailable/);
+
+  assert.equal(popupBadge(app, 2), "Old");
+  assert.doesNotMatch(meta.textContent, /just now/);
+  assert.match(meta.textContent, /Update time unavailable/);
+
+  assert.equal(popupBadge(app, 3), "");
+  assert.doesNotMatch(markerFor(app, 3).getAttribute("aria-label"), /Old/);
+});
+
+test("Old badge explanations match the age text for unusable observation times", () => {
+  const aged = "Last observation over 2 hours ago or unknown";
+  for (const [lastSeen, explanation] of [
+    [null, "Update time unavailable"],
+    ["soon", "Update time unavailable"],
+    [NOW_S + 601, "Update time unavailable"],
+    [NOW_S - 7201, aged],
+  ]) {
+    const app = loadApp({ nowMs: NOW_S * 1000 });
+    configureMap(app);
+    app.elements.get("sensors-panel").hidden = false;
+    receiveSensors(app, [fixtureSensor(1, { last_seen: lastSeen })]);
+    const label = `last_seen ${String(lastSeen)}`;
+
+    assert.equal(app.elements.get("summary-provenance").title, explanation, `${label}: summary`);
+    assert.match(rowFor(app, "sensor-list", 1).innerHTML, new RegExp(`class="provenance-badge" title="${explanation}">Old<`), `${label}: row`);
+    assert.equal(popupBadge(app, 1), "Old");
+    assert.equal(app.elements.get("popup-provenance").title, explanation, `${label}: popup`);
+    assert.equal(detailBadge(app, "sensor-list", 1), "Old");
+    assert.equal(app.elements.get("detail-provenance").title, explanation, `${label}: detail`);
+    if (explanation !== aged) {
+      assert.equal(app.elements.get("updated-time").textContent, explanation, `${label}: detail age text`);
+      assert.match(app.elements.get("popup-meta").textContent, /Update time unavailable/, `${label}: popup age text`);
+    }
+  }
+});
+
+test("a favorite row that shares an area id selects the favorite's own reading", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { delivery: "cache", last_seen: FRESH - 600 })],
+    favorites: [fixtureSensor(1, { aqi: 77, delivery: "network", favorite: true, last_seen: FRESH })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+
+  assert.doesNotMatch(rowFor(app, "favorites-list", 1).innerHTML, /provenance-badge/);
+  assert.equal(detailBadge(app, "favorites-list", 1), "", "the favorite row opens its own unbadged reading");
+  assert.equal(app.elements.get("aqi-number").textContent, "77");
+  assert.equal(app.elements.get("updated-time").textContent, "Updated just now");
+  assert.equal(app.elements.get("ui-status").textContent, "Sensor 1. AQI 77, Fixture.");
+
+  // A refresh keeps the selection on the favorite's reading.
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { delivery: "cache", last_seen: FRESH - 600 })],
+    favorites: [fixtureSensor(1, { aqi: 78, delivery: "network", favorite: true, last_seen: FRESH })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+  assert.equal(app.elements.get("detail-provenance").hidden, true);
+  assert.equal(app.elements.get("aqi-number").textContent, "78");
+
+  assert.match(rowFor(app, "sensor-list", 1).innerHTML, /class="provenance-badge"[^>]*>Stale</);
+  assert.equal(detailBadge(app, "sensor-list", 1), "Stale", "the area row opens the area reading");
+  assert.equal(app.elements.get("aqi-number").textContent, "21");
+  assert.equal(app.elements.get("updated-time").textContent, "Updated 11 min ago");
+  assert.equal(app.elements.get("ui-status").textContent, "Sensor 1. AQI 21, Fixture. Stale.");
+  assert.equal(popupBadge(app, 1), "Stale", "map markers keep the area reading");
+  assert.equal(app.elements.get("detail-provenance").textContent, "Stale");
+});
+
+// The real controller's sensors payload for one favorited area reading served
+// from the cache after a failed refresh.
+function staleFallbackPublication() {
+  const script = `import json
+from airloom.controller import ApplicationController
+from airloom.models import Sensor
+now = ${NOW_S}
+controller = ApplicationController({"latitude": 0, "longitude": 0, "radius_km": 22, "favorites": [1],
+    "location_filter": "both", "confidence_filter": False}, wall_clock=lambda: now)
+controller.sensors = [Sensor(1, "Real cached favorite", 0.0, 0.0, 42, 10.0, last_seen=now - 60,
+    favorite=True, origin="live", delivery="cache")]
+controller.area_ids = {1}
+controller.monitoring_ids = {1}
+controller.last_source = "PurpleAir · cached"
+controller.last_stale = True
+print(json.dumps(controller.publication()))`;
+  return JSON.parse(require("node:child_process").execFileSync(
+    "python3",
+    ["-c", script],
+    { cwd: path.resolve(__dirname, "../.."), encoding: "utf8" },
+  ));
+}
+
+test("a favorited area reading from a stale fallback says Stale in both lists, its detail, and after a tick", () => {
+  const payload = staleFallbackPublication();
+  assert.equal(payload.favorites[0].remote_favorite, false);
+  assert.equal(payload.favorites[0].stale, undefined, "stale fallback is a batch flag, not a per-reading one");
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", payload);
+
+  const expectStale = (when) => {
+    assert.equal(rowFor(app, "sensor-list", 1).getAttribute("aria-label"), "Real cached favorite, AQI 42, Good, Stale, favorite", `Nearby ${when}`);
+    assert.equal(rowFor(app, "favorites-list", 1).getAttribute("aria-label"), "Real cached favorite, AQI 42, Good, Stale, favorite", `Favorites ${when}`);
+    assert.match(rowFor(app, "favorites-list", 1).innerHTML, /class="provenance-badge"[^>]*>Stale</, `Favorites badge ${when}`);
+    assert.equal(app.elements.get("detail-provenance").hidden, false, `detail ${when}`);
+    assert.equal(app.elements.get("detail-provenance").textContent, "Stale", `detail ${when}`);
+  };
+  rowFor(app, "favorites-list", 1).click();
+  assert.equal(app.elements.get("ui-status").textContent, "Real cached favorite. AQI 42, Good. Stale.");
+  expectStale("after selecting the favorite");
+
+  app.setNow((NOW_S + 60) * 1000);
+  app.runTimers();
+  expectStale("after a minute tick");
+});
+
+test("explicit remote favorites stay independent; a missing flag follows the matching area observation", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  const publish = (favorite) => app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { delivery: "cache", last_seen: FRESH })],
+    favorites: [fixtureSensor(1, { favorite: true, ...favorite })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+  const favoriteBadge = () => rowFor(app, "favorites-list", 1).innerHTML.match(/class="provenance-badge"[^>]*>(\w+)</)?.[1] ?? "";
+
+  publish({ delivery: "cache", last_seen: FRESH, remote_favorite: true });
+  assert.equal(favoriteBadge(), "", "an explicit remote favorite ignores the area batch");
+  publish({ delivery: "cache", last_seen: FRESH, remote_favorite: false });
+  assert.equal(favoriteBadge(), "Stale", "an explicit area favorite inherits the area batch");
+  publish({ delivery: "cache", last_seen: FRESH });
+  assert.equal(favoriteBadge(), "Stale", "an unflagged copy of the area observation is the area reading");
+  publish({ delivery: "network", last_seen: FRESH - 600 });
+  assert.equal(favoriteBadge(), "", "an unflagged different observation is an independent fetch");
+});
+
+test("a selected favorite accepts trend events for its own reading, not the area's", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app, { has_api_key: true });
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { last_seen: FRESH })],
+    favorites: [fixtureSensor(1, { aqi: 77, favorite: true, last_seen: FRESH - 600 })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    config: { has_api_key: true },
+  });
+  rowFor(app, "favorites-list", 1).click();
+  assert.equal(app.elements.get("aqi-number").textContent, "77");
+
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: 1,
+    status: "loaded",
+    reading_last_seen: FRESH - 600,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+  assert.match(app.elements.get("chart").innerHTML, /<svg/);
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+
+  // The area row keeps its own, still-unloaded reading.
+  rowFor(app, "sensor-list", 1).click();
+  assert.equal(app.elements.get("aqi-number").textContent, "21");
+  assert.match(app.elements.get("chart").innerHTML, /Trend not loaded/);
+});
+
+test("a selected favorite ignores area trend events and older requests for its own reading", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app, { has_api_key: true });
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { last_seen: FRESH })],
+    favorites: [fixtureSensor(1, { aqi: 77, favorite: true, last_seen: FRESH - 600 })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    config: { has_api_key: true },
+  });
+  rowFor(app, "favorites-list", 1).click();
+  const trend = (requestId, readingLastSeen, now) => app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: requestId,
+    status: "loaded",
+    reading_last_seen: readingLastSeen,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: now }],
+  });
+
+  // The area's reading loads while the favorite stays selected.
+  trend(1, FRESH, 60);
+  assert.equal(app.elements.get("aqi-number").textContent, "77");
+  assert.match(app.elements.get("chart").innerHTML, /Trend not loaded/);
+
+  trend(3, FRESH - 600, 48);
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+  trend(2, FRESH - 600, 70);
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points", "an older request cannot replace a newer one");
+
+  rowFor(app, "sensor-list", 1).click();
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 20 points", "the area keeps its own event");
+});
+
+test("relative ages tick every minute without refetching", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  receiveSensors(app, [fixtureSensor(1, { last_seen: NOW_S - 30, aqi: 42 })]);
+  rowFor(app, "sensor-list", 1).click();
+  assert.equal(app.elements.get("updated-time").textContent, "Updated just now");
+  assert.ok(app.timerDelays().includes(60000));
+  const posted = app.messages.length;
+
+  // Exactly 600 s after the reading, which the product rounds to 10 min.
+  app.setNow((NOW_S - 30 + 600) * 1000);
+  app.runTimers();
+
+  assert.equal(app.elements.get("updated-time").textContent, "Updated 10 min ago");
+  assert.equal(app.elements.get("aqi-number").textContent, "42");
+  const refetches = app.messages.slice(posted).filter((message) => ["refresh", "select", "ready"].includes(message.action));
+  assert.deepEqual(refetches, []);
+  assert.ok(app.timerDelays().includes(60000));
+});
+
+test("the minute tick flips a reading to Old across the 2-hour boundary", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  receiveSensors(app, [fixtureSensor(1, { last_seen: NOW_S - 30, aqi: 42 })]);
+  rowFor(app, "sensor-list", 1).click();
+  markerFor(app, 1).click();
+  assert.equal(app.elements.get("detail-provenance").hidden, true);
+  assert.equal(app.elements.get("popup-provenance").hidden, true);
+  // The area reading is in view, so the summary displays it.
+  assert.equal(app.elements.get("summary-aqi").textContent, "42");
+  assert.equal(app.elements.get("summary-provenance").hidden, true);
+  assert.match(app.elements.get("popup-meta").textContent, /Updated just now/);
+
+  app.setNow((NOW_S - 30 + 7201) * 1000);
+  app.runTimers();
+
+  assert.equal(app.elements.get("summary-provenance").hidden, false);
+  assert.equal(app.elements.get("summary-provenance").textContent, "Old");
+  assert.match(app.elements.get("popup-meta").textContent, /Updated 2 hr ago/);
+  assert.equal(app.elements.get("detail-provenance").textContent, "Old");
+  assert.equal(app.elements.get("popup-provenance").textContent, "Old");
+  assert.match(markerFor(app, 1).getAttribute("aria-label"), / · Old$/);
+  assert.match(rowFor(app, "sensor-list", 1).innerHTML, /class="provenance-badge"[^>]*>Old</);
+});
+
+test("in-interval cached and live readings carry no badge", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  receiveSensors(app, [fixtureSensor(1, { delivery: "cache", last_seen: FRESH })], { source: "PurpleAir · cached", stale: false });
+
+  assert.equal(popupBadge(app, 1), "");
+  assert.equal(detailBadge(app, "sensor-list", 1), "");
+  const surfaces = [
+    app.elements.get("summary-provenance"),
+    app.elements.get("detail-provenance"),
+    app.elements.get("popup-provenance"),
+  ];
+  for (const badge of surfaces) assert.equal(badge.hidden, true);
+  const texts = [
+    ...surfaces.map((badge) => badge.textContent),
+    rowFor(app, "sensor-list", 1).innerHTML,
+    rowFor(app, "sensor-list", 1).getAttribute("aria-label"),
+    markerFor(app, 1).getAttribute("aria-label"),
+    app.elements.get("popup-meta").textContent,
+    app.elements.get("ui-status").textContent,
+  ];
+  assert.doesNotMatch(rowFor(app, "sensor-list", 1).innerHTML, /provenance-badge/);
+  for (const text of texts) assert.doesNotMatch(text, /Cached/);
 });
 
 test("Sensors count matches nearby rows when favorites are a separate collection", () => {
@@ -1166,6 +1929,147 @@ test("reconcileKeyed tolerates text and comment children", () => {
   assert.doesNotThrow(() => reconcileKeyed(container, [{ id: 1, name: "One" }], (item) => item.id, create, () => {}));
   assert.deepEqual(container.childNodes.map((node) => node.dataset.key), ["1"]);
   assert.equal(container.childNodes[0].textContent, "One");
+});
+
+function typeSearch(app, query) {
+  const search = app.elements.get("search");
+  search.value = query;
+  search.dispatch("input", { target: search });
+}
+
+function sensorResults(app) {
+  return app.elements.get("search-results").children.filter((button) => button.dataset.kind === "sensor");
+}
+
+function resultBadge(button) {
+  return button.innerHTML.match(/class="provenance-badge"[^>]*>(\w+)</)?.[1] ?? "";
+}
+
+test("sensor search results carry the category and a Demo badge for a synthetic favorite", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { name: "Live area", last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { name: "Synthetic remote", origin: "demo", favorite: true, last_seen: FRESH })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    stale: false,
+  });
+
+  typeSearch(app, "Synthetic");
+  const [synthetic] = sensorResults(app);
+  assert.equal(synthetic.getAttribute("aria-label"), "Synthetic remote, AQI 22, Fixture, Demo");
+  assert.match(synthetic.innerHTML, /Synthetic remote · AQI 22 · Fixture/);
+  assert.equal(resultBadge(synthetic), "Demo");
+  assert.match(synthetic.innerHTML, /title="Demo data, not a real sensor reading"/);
+
+  typeSearch(app, "Live");
+  const [live] = sensorResults(app);
+  assert.equal(live.getAttribute("aria-label"), "Live area, AQI 21, Fixture");
+  assert.equal(resultBadge(live), "");
+});
+
+test("sensor search results badge Stale and Old readings", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { name: "Stale one", delivery: "cache", last_seen: FRESH })],
+    favorites: [fixtureSensor(2, { name: "Old one", favorite: true, remote_favorite: true, last_seen: NOW_S - 7201 })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+
+  typeSearch(app, "one");
+  const results = sensorResults(app);
+  assert.deepEqual(results.map((button) => button.getAttribute("aria-label")), [
+    "Stale one, AQI 21, Fixture, Stale",
+    "Old one, AQI 22, Fixture, Old",
+  ]);
+  assert.deepEqual(results.map(resultBadge), ["Stale", "Old"]);
+});
+
+test("live and in-interval cached sensor search results carry no badge", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [
+    fixtureSensor(1, { name: "Shop one", delivery: "cache", last_seen: FRESH }),
+    fixtureSensor(2, { name: "Live one", last_seen: FRESH }),
+  ], { source: "PurpleAir · cached", stale: false });
+
+  typeSearch(app, "one");
+  const results = sensorResults(app);
+  assert.deepEqual(results.map((button) => button.getAttribute("aria-label")), ["Shop one, AQI 21, Fixture", "Live one, AQI 22, Fixture"]);
+  for (const button of results) {
+    assert.equal(resultBadge(button), "");
+    assert.doesNotMatch(button.innerHTML, /Cached|provenance-badge/);
+  }
+});
+
+test("an open sensor result gains Old on the minute tick without losing focus or its pending place search", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1, { name: "Ticking", last_seen: NOW_S - 30 })]);
+  typeSearch(app, "Ticking");
+  app.elements.get("search").dispatch("keydown", { key: "Enter" });
+  const [request] = app.messages.filter((message) => message.action === "place-search");
+  const [result] = sensorResults(app);
+  result.focus();
+  assert.equal(resultBadge(result), "");
+
+  app.setNow((NOW_S - 30 + 7201) * 1000);
+  app.runTimers();
+  receiveSensors(app, [fixtureSensor(1, { name: "Ticking", last_seen: NOW_S - 30 })]);
+
+  assert.equal(sensorResults(app)[0], result, "the result keeps its element");
+  assert.equal(app.document.activeElement, result, "focus stays on the result");
+  assert.equal(result.getAttribute("aria-label"), "Ticking, AQI 21, Fixture, Old");
+  assert.equal(resultBadge(result), "Old");
+  assert.equal(app.messages.filter((message) => message.action === "cancel-place-search").length, 0);
+  app.context.Airloom.receive("places", {
+    context: "main",
+    request_id: request.request_id,
+    query: request.query,
+    results: [{ name: "Ticking, Oregon", latitude: 1, longitude: 1 }],
+  });
+  assert.match(app.elements.get("search-results").innerHTML, /Ticking, Oregon/, "the pending place search still answers");
+});
+
+test("a publication that changes open sensor matches keeps focus on the same sensor's result", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(2, { name: "Station two", last_seen: FRESH })]);
+  typeSearch(app, "Station");
+  sensorResults(app)[0].focus();
+
+  receiveSensors(app, [
+    fixtureSensor(1, { name: "Station one", last_seen: FRESH }),
+    fixtureSensor(2, { name: "Station two", last_seen: NOW_S - 7201 }),
+  ]);
+  const results = sensorResults(app);
+  assert.deepEqual(results.map((button) => button.dataset.id), ["1", "2"]);
+  assert.equal(app.document.activeElement, results[1]);
+  assert.equal(resultBadge(results[1]), "Old");
+
+  receiveSensors(app, [fixtureSensor(3, { name: "Elsewhere", last_seen: FRESH })]);
+  assert.equal(app.elements.get("search-results").hidden, true);
+  assert.equal(app.document.activeElement, app.elements.get("search"), "focus falls back to the search field");
+});
+
+test("minute ticks and publications do not reopen dismissed sensor results", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(1, { name: "Ticking", last_seen: NOW_S - 30 })]);
+  typeSearch(app, "Ticking");
+  const results = app.elements.get("search-results");
+  assert.equal(results.hidden, false);
+  app.document.dispatch("keydown", { key: "Escape", ctrlKey: false, metaKey: false });
+  assert.equal(results.hidden, true);
+
+  app.setNow((NOW_S - 30 + 7201) * 1000);
+  app.runTimers();
+  receiveSensors(app, [fixtureSensor(1, { name: "Ticking", last_seen: NOW_S - 30 })]);
+  assert.equal(results.hidden, true);
 });
 
 test("main search typing filters locally without remote geocoding", () => {
@@ -1355,6 +2259,60 @@ test("closing Preferences invalidates pending home search responses", () => {
   assert.equal(app.elements.get("search-results").hidden, true);
 });
 
+function mainCancellations(app) {
+  return app.messages.filter((message) => message.action === "cancel-place-search" && message.context === "main");
+}
+
+test("Escape while a main search is pending cancels it and a late result cannot reopen results", () => {
+  const app = loadApp();
+  configureMap(app);
+  const search = app.elements.get("search");
+  search.value = "Paris";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+  search.focus();
+
+  app.document.dispatch("keydown", { key: "Escape", ctrlKey: false, metaKey: false });
+
+  assert.deepEqual(mainCancellations(app), [{ action: "cancel-place-search", context: "main" }]);
+  assert.equal(app.document.activeElement, search);
+  app.context.Airloom.receive("places", {
+    request_id: 1,
+    context: "main",
+    query: "Paris",
+    results: [{ name: "Late Paris", latitude: 48.85, longitude: 2.35 }],
+  });
+  assert.equal(app.elements.get("search-results").hidden, true);
+});
+
+test("editing a submitted query cancels its pending remote search once", () => {
+  const app = loadApp();
+  const search = app.elements.get("search");
+  search.value = "Portland";
+  search.dispatch("input", { target: search });
+  search.dispatch("keydown", { key: "Enter" });
+
+  for (const value of ["Paris", "Pari"]) {
+    search.value = value;
+    search.dispatch("input", { target: search });
+  }
+
+  assert.equal(mainCancellations(app).length, 1);
+});
+
+test("clearing search with nothing pending sends no cancellation", () => {
+  const app = loadApp();
+  const search = app.elements.get("search");
+  search.value = "Paris";
+  search.dispatch("input", { target: search });
+  search.value = "";
+  search.dispatch("input", { target: search });
+  search.focus();
+  app.document.dispatch("keydown", { key: "Escape", ctrlKey: false, metaKey: false });
+
+  assert.equal(mainCancellations(app).length, 0);
+});
+
 test("trend unavailable is terminal instead of indefinite loading", () => {
   const app = loadApp();
   configureMap(app, { has_api_key: true });
@@ -1418,6 +2376,27 @@ test("rolling-average charts name the actual current comparison", () => {
   assert.equal(app.elements.get("trend-direction").textContent, "Holding steady");
 });
 
+test("trend values are exposed as accessible text and visible point labels", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  receiveSensors(app, [fixtureSensor(1, { last_seen: 100 })], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: 1,
+    status: "loaded",
+    reading_last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "1d", aqi: 45 }, { label: "Now", aqi: 48 }],
+  });
+
+  const chart = app.elements.get("chart").innerHTML;
+  assert.match(chart, /<svg[^>]*role="img"[^>]*aria-labelledby="trend-chart-title"[^>]*aria-describedby="trend-chart-desc"/);
+  assert.ok(chart.includes('<title id="trend-chart-title">Current vs 1-week average</title>'));
+  assert.ok(chart.includes('<desc id="trend-chart-desc">Up 8 points. 1-week average AQI 40, Good; 1-day average AQI 45, Good; Current AQI 48, Good.</desc>'));
+  assert.ok(chart.includes('<tr data-window="1d"><th scope="row">1-day average</th><td>45</td><td>Good</td></tr>'));
+  assert.deepEqual([...chart.matchAll(/<text class="point-value"[^>]*>([^<]*)<\/text>/g)].map((match) => match[1]), ["40", "45", "48"]);
+  assert.doesNotMatch(chart, /history/i);
+});
+
 test("preview detail favorite toggles local state and pressed state", () => {
   const app = loadApp({ preview: true });
   app.runTimers();
@@ -1462,6 +2441,107 @@ test("preview settings disable unsupported API-key persistence with an explanati
 
   assert.equal(app.elements.get("settings-form").elements.api_key.disabled, true);
   assert.match(app.elements.get("settings-intro").textContent, /browser preview/i);
+});
+
+const PREVIEW_UNSUPPORTED_FIELDS = ["radius_km", "refresh_minutes", "alert_threshold", "confidence_filter"];
+
+function unsupportedControls(app) {
+  const form = app.elements.get("settings-form");
+  return [
+    ...PREVIEW_UNSUPPORTED_FIELDS.map((name) => [name, form.elements[name]]),
+    ["home-fieldset", app.elements.get("home-fieldset")],
+    ["home-place-input", app.elements.get("home-place-input")],
+  ];
+}
+
+test("preview disables unimplemented settings with a visible explanation", () => {
+  const preview = loadApp({ preview: true });
+  preview.runTimers();
+  openSettings(preview);
+  for (const [name, control] of unsupportedControls(preview)) {
+    assert.ok(control, `${name} must exist`);
+    assert.equal(control.disabled, true, `${name}.disabled`);
+    assert.equal(control.getAttribute("aria-describedby"), "preview-settings-note", `${name} aria-describedby`);
+  }
+  const note = preview.elements.get("preview-settings-note");
+  assert.equal(note.hidden, false);
+  assert.match(fs.readFileSync(indexPath, "utf8"), /<p class="privacy-note" id="preview-settings-note" hidden>Browser preview: map radius, refresh interval, alert threshold, the confidence filter, and home location work only in the Airloom desktop app\.<\/p>/);
+
+  const desktop = loadApp();
+  configureMap(desktop);
+  openSettings(desktop);
+  for (const [name, control] of unsupportedControls(desktop)) {
+    assert.equal(control.disabled, false, `${name}.disabled`);
+    assert.equal(control.getAttribute("aria-describedby"), null, `${name} aria-describedby`);
+  }
+  assert.equal(desktop.elements.get("preview-settings-note").hidden, true);
+});
+
+test("disabled Preferences controls have a muted, not-allowed style distinct from enabled ones", () => {
+  for (const selector of ['.form-grid input:not([type="checkbox"]):not([type="radio"]):disabled', ".form-grid select:disabled"]) {
+    assert.equal(cssDeclaration(selector, "cursor"), "not-allowed", selector);
+    assert.equal(cssDeclaration(selector, "color"), "var(--muted)", selector);
+    // --muted on --soft (the enabled background) is under 4.5:1 in the light theme.
+    assert.equal(cssDeclaration(selector, "background"), "var(--panel-solid)", selector);
+    assert.equal(cssDeclaration(selector, "opacity"), "1", selector);
+  }
+  // WebKitGTK's native select painting ignores author colors.
+  assert.equal(cssDeclaration(".form-grid select:disabled", "appearance"), "none");
+  for (const selector of [".form-grid fieldset:disabled label", ".form-grid .checkbox:has(input:disabled)"]) {
+    assert.equal(cssDeclaration(selector, "cursor"), "not-allowed", selector);
+    assert.equal(cssDeclaration(selector, "color"), "var(--muted)", selector);
+  }
+  assert.equal(cssDeclaration(".form-grid select", "background"), "var(--soft)");
+});
+
+test("fixed-home search input shares the form input styling", () => {
+  for (const p of ["width", "height", "padding", "border", "border-radius", "background", "color"]) {
+    assert.equal(
+      cssDeclaration('.form-grid input[type="search"]', p),
+      cssDeclaration('.form-grid input[type="text"]', p),
+    );
+    assert.notEqual(cssDeclaration('.form-grid input[type="search"]', p), null, p);
+  }
+});
+
+test("the fixed-home place row stays hidden while its hidden attribute is set", () => {
+  // `.form-grid > label:not(.checkbox)` sets display: flex, which beats the UA [hidden] rule.
+  assert.equal(cssDeclaration(".form-grid > label:not(.checkbox)", "display"), "flex");
+  assert.equal(cssDeclaration("#home-place-row[hidden]", "display"), "none");
+});
+
+test("preview Save ignores unimplemented settings", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  form.elements.radius_km.value = "99";
+  form.elements.refresh_minutes.value = "30";
+  form.elements.alert_threshold.value = "5";
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+  assert.equal(app.elements.get("settings-dialog").open, false);
+  assert.match(app.elements.get("ui-status").textContent, /browser preview only/i);
+  // Reopen from the app's own config, not a test payload.
+  app.document.dispatch("keydown", { key: ",", ctrlKey: true, metaKey: false });
+
+  assert.equal(app.elements.get("settings-dialog").open, true);
+  assert.equal(form.elements.radius_km.value, 22);
+  assert.equal(form.elements.refresh_minutes.value, 2);
+  assert.equal(form.elements.alert_threshold.value, 101);
+});
+
+test("preview heat-map threshold has an observable effect", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  assert.equal(app.context.Airloom.debugState().heatmapActive, false);
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  form.elements.heatmap_threshold_km.value = "5";
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+
+  assert.equal(app.context.Airloom.debugState().heatmapActive, true);
 });
 
 test("preview place submission explains that remote search needs the desktop app", () => {
