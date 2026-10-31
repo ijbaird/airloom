@@ -264,19 +264,29 @@
     return null;
   }
 
+  // Python flags every favorite: remote_favorite is false for a favorited area
+  // reading, which shares the area batch's provenance, and true for a separate
+  // fetch, which never inherits it. Only a missing flag is inferred: a copy of
+  // the area's same observation is that area reading; anything else is remote.
+  function favoriteReading(favorite, areaById) {
+    if (typeof favorite.remote_favorite === "boolean") return favorite;
+    const local = areaById.get(favorite.id);
+    const areaCopy = Boolean(local) && readingVersion(local.last_seen) === readingVersion(favorite.last_seen);
+    return { ...favorite, remote_favorite: !areaCopy };
+  }
+
   function applySensors(payload) {
     const area = Array.isArray(payload.area) ? payload.area : (payload.items || []);
-    const favorites = Array.isArray(payload.favorites) ? payload.favorites : [];
-    const merged = new Map(area.map((sensor) => [sensor.id, sensor]));
+    const areaById = new Map(area.map((sensor) => [sensor.id, sensor]));
+    const favorites = (Array.isArray(payload.favorites) ? payload.favorites : []).map((favorite) => favoriteReading(favorite, areaById));
+    const merged = new Map(areaById);
     for (const favorite of favorites) {
       const local = merged.get(favorite.id);
-      merged.set(favorite.id, local ? { ...local, favorite: local.favorite || favorite.favorite } : { ...favorite, remote_favorite: true });
+      merged.set(favorite.id, local ? { ...local, favorite: local.favorite || favorite.favorite } : favorite);
     }
     state.sensors = [...merged.values()];
     state.areaSensors = Array.isArray(payload.area) ? area : state.sensors;
-    // Favorites rows come from their own fetch; marking them remote keeps the
-    // area batch's demo or stale metadata off their provenance.
-    state.favoriteSensors = Array.isArray(payload.favorites) ? favorites.map((favorite) => ({ ...favorite, remote_favorite: true })) : null;
+    state.favoriteSensors = Array.isArray(payload.favorites) ? favorites : null;
     state.coverage = payload.coverage || null;
     state.fetchedBounds = publicationBounds(payload) || state.fetchedBounds;
     const selectedId = payload.selected_id ?? state.sensors[0]?.id ?? null;

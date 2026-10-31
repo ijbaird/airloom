@@ -1620,6 +1620,77 @@ test("a favorite row that shares an area id selects the favorite's own reading",
   assert.equal(app.elements.get("detail-provenance").textContent, "Stale");
 });
 
+// The real controller's sensors payload for one favorited area reading served
+// from the cache after a failed refresh.
+function staleFallbackPublication() {
+  const script = `import json
+from airloom.controller import ApplicationController
+from airloom.models import Sensor
+now = ${NOW_S}
+controller = ApplicationController({"latitude": 0, "longitude": 0, "radius_km": 22, "favorites": [1],
+    "location_filter": "both", "confidence_filter": False}, wall_clock=lambda: now)
+controller.sensors = [Sensor(1, "Real cached favorite", 0.0, 0.0, 42, 10.0, last_seen=now - 60,
+    favorite=True, origin="live", delivery="cache")]
+controller.area_ids = {1}
+controller.monitoring_ids = {1}
+controller.last_source = "PurpleAir · cached"
+controller.last_stale = True
+print(json.dumps(controller.publication()))`;
+  return JSON.parse(require("node:child_process").execFileSync(
+    "python3",
+    ["-c", script],
+    { cwd: path.resolve(__dirname, "../.."), encoding: "utf8" },
+  ));
+}
+
+test("a favorited area reading from a stale fallback says Stale in both lists, its detail, and after a tick", () => {
+  const payload = staleFallbackPublication();
+  assert.equal(payload.favorites[0].remote_favorite, false);
+  assert.equal(payload.favorites[0].stale, undefined, "stale fallback is a batch flag, not a per-reading one");
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", payload);
+
+  const expectStale = (when) => {
+    assert.equal(rowFor(app, "sensor-list", 1).getAttribute("aria-label"), "Real cached favorite, AQI 42, Good, Stale, favorite", `Nearby ${when}`);
+    assert.equal(rowFor(app, "favorites-list", 1).getAttribute("aria-label"), "Real cached favorite, AQI 42, Good, Stale, favorite", `Favorites ${when}`);
+    assert.match(rowFor(app, "favorites-list", 1).innerHTML, /class="provenance-badge"[^>]*>Stale</, `Favorites badge ${when}`);
+    assert.equal(app.elements.get("detail-provenance").hidden, false, `detail ${when}`);
+    assert.equal(app.elements.get("detail-provenance").textContent, "Stale", `detail ${when}`);
+  };
+  rowFor(app, "favorites-list", 1).click();
+  assert.equal(app.elements.get("ui-status").textContent, "Real cached favorite. AQI 42, Good. Stale.");
+  expectStale("after selecting the favorite");
+
+  app.setNow((NOW_S + 60) * 1000);
+  app.runTimers();
+  expectStale("after a minute tick");
+});
+
+test("explicit remote favorites stay independent; a missing flag follows the matching area observation", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app);
+  app.elements.get("sensors-panel").hidden = false;
+  const publish = (favorite) => app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { delivery: "cache", last_seen: FRESH })],
+    favorites: [fixtureSensor(1, { favorite: true, ...favorite })],
+    selected_id: 1,
+    source: "PurpleAir · cached",
+    stale: true,
+  });
+  const favoriteBadge = () => rowFor(app, "favorites-list", 1).innerHTML.match(/class="provenance-badge"[^>]*>(\w+)</)?.[1] ?? "";
+
+  publish({ delivery: "cache", last_seen: FRESH, remote_favorite: true });
+  assert.equal(favoriteBadge(), "", "an explicit remote favorite ignores the area batch");
+  publish({ delivery: "cache", last_seen: FRESH, remote_favorite: false });
+  assert.equal(favoriteBadge(), "Stale", "an explicit area favorite inherits the area batch");
+  publish({ delivery: "cache", last_seen: FRESH });
+  assert.equal(favoriteBadge(), "Stale", "an unflagged copy of the area observation is the area reading");
+  publish({ delivery: "network", last_seen: FRESH - 600 });
+  assert.equal(favoriteBadge(), "", "an unflagged different observation is an independent fetch");
+});
+
 test("a selected favorite accepts trend events for its own reading, not the area's", () => {
   const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app, { has_api_key: true });
