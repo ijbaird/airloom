@@ -751,6 +751,31 @@ class TrendRequestTest(ApplicationRequestTestCase):
         self.assertEqual(app.cache.stored, [])
         self.assertNotIn(1, app.controller.trend_unsettled)
 
+    def test_obsolete_cache_read_error_sends_no_live_fetch_toast(self):
+        app = self.make_app(sensors=[make_sensor(last_seen=1234)])
+        app.cache.get_trend = mock.Mock(side_effect=CacheError("cache read failed"))
+        threads, idles = ThreadQueue(), IdleQueue()
+        client_type = mock.Mock()
+
+        with (
+            mock.patch.object(app_module.threading, "Thread", new=threads.factory),
+            mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
+            mock.patch.object(app_module, "PurpleAirClient", client_type),
+        ):
+            app._ensure_trend(1)
+            app._save_settings(
+                {**TransactionalActionTest.settings_message(), "clear_api_key": True}
+            )
+            threads.threads[0].run()
+            for index in range(len(idles.callbacks)):
+                idles.run(index)
+
+        client_type.assert_not_called()
+        messages = [p["message"] for event, p in app.sent if event == "error"]
+        self.assertFalse(
+            [m for m in messages if "Fetching a live trend instead" in m], messages
+        )
+
 
 class CoalescedQueueTest(ApplicationRequestTestCase):
     def submit(self, app, key, job, run):

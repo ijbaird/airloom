@@ -1545,7 +1545,13 @@ class AirloomApplication(Adw.Application):
         from_cache: bool = False,
         cache_error: str | None = None,
     ) -> bool:
-        if cache_error is not None and not self._shutting_down:
+        update = self.controller.finish_trend(
+            sensor_id, reading_last_seen, token, trend, failed, cached=from_cache
+        )
+        if update is None:
+            # A discarded completion reports nothing, not even its cache read.
+            return GLib.SOURCE_REMOVE
+        if cache_error is not None:
             self._send(
                 "error",
                 {
@@ -1555,11 +1561,6 @@ class AirloomApplication(Adw.Application):
                     )
                 },
             )
-        update = self.controller.finish_trend(
-            sensor_id, reading_last_seen, token, trend, failed, cached=from_cache
-        )
-        if update is None:
-            return GLib.SOURCE_REMOVE
         if update.store and self.cache is not None:
             self._queue_trend_write(sensor_id, trend, reading_last_seen)
         if update.sensor_changed:
