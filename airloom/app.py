@@ -618,8 +618,10 @@ class AirloomApplication(Adw.Application):
         if self._debug_port is not None:
             self._debug_port.stop()
             self._debug_port = None
-        # Nothing persists settings once shutdown has begun, so this is the
-        # last chance to confirm the final save reached the disk.
+        # Workers drain asynchronously, but none of their completions can
+        # persist settings once shutdown has begun (adapter and controller
+        # both refuse them; ShutdownPersistenceTest pins this), so the last
+        # save has already happened and this is the place to confirm it.
         if not self.store.flush(SETTINGS_FLUSH_TIMEOUT_SECONDS):
             print(
                 "Airloom: could not confirm the last settings save reached the disk",

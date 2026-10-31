@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import io
 import json
@@ -1354,6 +1355,123 @@ class InterfaceScaleAdapterTest(ApplicationAdapterTestCase):
                     [event for event, _payload in app.sent], ["pinch", "pinch"]
                 )
                 self.assertEqual(app.webview.zoom_level, scale)
+
+
+class ShutdownPersistenceTest(ApplicationAdapterTestCase):
+    """Shutdown flushes the settings store once, so nothing may persist
+    settings after it begins.
+
+    Late refresh (alert-state), home-label, and location-fix completions are
+    cut off both by the adapter and by the stopped controller; each layer is
+    pinned on its own, and the end-to-end check pins the invariant."""
+
+    PERSISTING = ("accept_refresh", "evaluate_alerts", "set_home_label", "set_detected_home")
+
+    def make_late_completion_app(self, directory):
+        store = self.real_store(Path(directory) / "config.json")
+        store.data.update({
+            "home_mode": "auto",
+            "latitude": 10.0,
+            "longitude": 20.0,
+            "favorites": [1],
+            "alert_states": {"1": False},
+        })
+        store.save()
+        app = self.make_app(store=store)
+        app._auto_refresh_id = None
+        app._locator_focus_handler = None
+        app._locator_focus_fallback = None
+        app.locator = None
+        app._debug_port = None
+        app._home_name_generation = 1
+        app._view_name_generation = 0
+        app._refresh_home = lambda *_args, **_kwargs: None
+        app._captured_notifications = []
+        # No geocoder worker; patching threading.Thread would also stall the
+        # store's own sync worker.
+        app._start_worker = mock.Mock(return_value=False)
+        # Started before shutdown; they complete after it begins.
+        outcome = self.make_outcome(app, [make_sensor(1, favorite=True, aqi=150)])
+        label = app.requests.begin("home-label", 1)
+        return app, outcome, label
+
+    @staticmethod
+    def deliver(app, outcome, label):
+        with mock.patch.object(controller_module.time, "time", return_value=NOW):
+            app._finish_refresh(outcome)
+            app._apply_location_name("Detected home", 10.0, 20.0, 1, label)
+            app._on_location_fix(30.0, 40.0, 10.0)
+
+    def deliver_late_completions(self, *, shut_down):
+        with self.settings_directory() as directory:
+            app, outcome, label = self.make_late_completion_app(directory)
+            store = app.store
+            if shut_down:
+                app._on_shutdown()
+            before = (deepcopy(store.data), store.path.read_bytes())
+            with mock.patch.object(store, "_write", wraps=store._write) as write:
+                self.deliver(app, outcome, label)
+            after = (deepcopy(store.data), store.path.read_bytes())
+            return write.call_count, before, after
+
+    def test_completions_after_shutdown_persist_nothing(self):
+        writes, before, after = self.deliver_late_completions(shut_down=True)
+
+        self.assertEqual(writes, 0)
+        self.assertEqual(after, before)
+
+    def test_the_same_completions_persist_before_shutdown(self):
+        # Control: each delivery is a real settings write when not cut off,
+        # so the tests here do not pass vacuously.
+        writes, _before, after = self.deliver_late_completions(shut_down=False)
+
+        self.assertEqual(writes, 3)
+        self.assertEqual(after[0]["alert_states"], {"1": True})
+        self.assertEqual(after[0]["location_name"], "Detected home")
+        self.assertEqual((after[0]["latitude"], after[0]["longitude"]), (30.0, 40.0))
+
+    def test_adapter_drops_late_completions_before_the_controller(self):
+        with self.settings_directory() as directory:
+            app, outcome, label = self.make_late_completion_app(directory)
+            app._on_shutdown()
+            with contextlib.ExitStack() as stack:
+                spies = {
+                    name: stack.enter_context(
+                        mock.patch.object(
+                            app.controller, name, wraps=getattr(app.controller, name)
+                        )
+                    )
+                    for name in self.PERSISTING
+                }
+                self.deliver(app, outcome, label)
+
+        self.assertEqual({name: spy.call_count for name, spy in spies.items()},
+                         dict.fromkeys(self.PERSISTING, 0))
+
+    def controller_writes(self, *, stopped):
+        with self.settings_directory() as directory:
+            app, _outcome, _label = self.make_late_completion_app(directory)
+            # The alert crossing is already published; only persistence remains.
+            app.sensors = [make_sensor(1, favorite=True, aqi=150)]
+            app._area_ids = {1}
+            app._monitoring_ids = {1}
+            if stopped:
+                app.controller.shutdown()
+            store = app.store
+            with (
+                mock.patch.object(store, "_write", wraps=store._write) as write,
+                mock.patch.object(controller_module.time, "time", return_value=NOW),
+            ):
+                app.controller.evaluate_alerts()
+                app.controller.set_home_label("Detected home", 10.0, 20.0)
+                app.controller.set_detected_home(30.0, 40.0)
+            return write.call_count
+
+    def test_stopped_controller_persists_nothing(self):
+        self.assertEqual(self.controller_writes(stopped=True), 0)
+
+    def test_running_controller_persists_each_change(self):
+        self.assertEqual(self.controller_writes(stopped=False), 3)
 
 
 class FilterSaveFailureTest(ApplicationAdapterTestCase):

@@ -1518,20 +1518,27 @@ class SettingsDurabilityWarningTest(ApplicationRequestTestCase):
             self.assert_one_main_loop_warning(app, idles, send_threads)
 
     def test_blocked_directory_sync_leaves_the_main_loop_responsive(self):
+        entered = threading.Event()
         release = threading.Event()
+
+        def blocked_fsync(_path):
+            entered.set()
+            release.wait(5)
+
         with self.settings_directory() as directory:
             app = self.make_real_store_app(directory)
             idles = IdleQueue()
             with (
-                mock.patch.object(
-                    store_module, "_fsync_directory", side_effect=lambda _path: release.wait(5)
-                ),
+                mock.patch.object(store_module, "_fsync_directory", side_effect=blocked_fsync),
                 mock.patch.object(app_module.GLib, "idle_add", new=idles.add),
             ):
                 started = time.monotonic()
                 try:
                     app._save_settings(self.settings_message())
                     elapsed = time.monotonic() - started
+                    # The save returned while the worker is inside the sync.
+                    self.assertTrue(entered.wait(5))
+                    self.assertFalse(app.store.flush(0.05))
                 finally:
                     release.set()
                 self.assertTrue(app.store.flush(5))
