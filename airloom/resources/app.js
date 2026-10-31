@@ -62,18 +62,17 @@
       bridge({ action: "place-search", query, request_id: requestId, context });
     },
   };
+  // Preferences the browser preview cannot honor are disabled there; Save
+  // applies only the settings that visibly change the preview.
+  const PREVIEW_UNSUPPORTED_FIELDS = ["radius_km", "refresh_minutes", "alert_threshold", "confidence_filter"];
+  const PREVIEW_SUPPORTED_SETTINGS = ["temperature_unit", "interface_scale", "heatmap_threshold_km"];
   const previewAdapter = {
     favorite(id) { togglePreviewFavorite(id); },
     refresh() { refreshPreview(); },
     saveSettings(settings) {
-      const { api_key, clear_api_key, ...supported } = settings;
-      const config = { ...supported };
-      if (config.home_mode === "fixed") {
-        config.latitude = Number(config.home_lat);
-        config.longitude = Number(config.home_lon);
-      }
-      delete config.home_lat;
-      delete config.home_lon;
+      const config = Object.fromEntries(PREVIEW_SUPPORTED_SETTINGS.map((name) => [name, settings[name]]));
+      config.heatmap_threshold_km = Number(config.heatmap_threshold_km);
+      config.interface_scale = Number(config.interface_scale);
       applyConfig(config);
       renderAll();
       $("#settings-dialog").close();
@@ -1208,6 +1207,13 @@
       : "Browser preview preferences apply to this tab only. PurpleAir keys and remote place search require the desktop app.";
     form.elements.api_key.disabled = !desktopMode;
     form.elements.clear_api_key.disabled = !desktopMode;
+    const unsupported = [...PREVIEW_UNSUPPORTED_FIELDS.map((name) => form.elements[name]), $("#home-fieldset"), $("#home-place-input")];
+    for (const control of unsupported) {
+      control.disabled = !desktopMode;
+      if (desktopMode) control.removeAttribute("aria-describedby");
+      else control.setAttribute("aria-describedby", "preview-settings-note");
+    }
+    $("#preview-settings-note").hidden = desktopMode;
     for (const field of ["radius_km", "alert_threshold", "heatmap_threshold_km", "refresh_minutes"]) form.elements[field].value = config[field];
     form.elements.api_key.value = "";
     form.elements.clear_api_key.checked = false;

@@ -1382,7 +1382,13 @@ PREVIEW_ACTIONS_JS = r"""
   out.filter = chip.textContent;
   chip.click(); chip.click();
   window.Airloom.receive("open-settings");
-  document.querySelector("#settings-form").requestSubmit(document.querySelector("#save-settings"));
+  const form = document.querySelector("#settings-form");
+  out.unsupportedDisabled = ["radius_km", "refresh_minutes", "alert_threshold", "confidence_filter"]
+    .map((name) => form.elements[name]).concat(document.querySelector("#home-fieldset"))
+    .every((control) => control.disabled);
+  const note = document.querySelector("#preview-settings-note");
+  out.noteVisible = !note.hidden && note.getClientRects().length > 0;
+  form.requestSubmit(document.querySelector("#save-settings"));
   out.settingsOpen = document.querySelector("#settings-dialog").open;
   out.saveStatus = document.querySelector("#ui-status").textContent;
   return JSON.stringify(out);
@@ -1542,6 +1548,9 @@ def scenario_layouts(root: Path):
             expect(actions["filter"] == "Indoor", f"{label}: preview filter chip cycles locally")
             expect(actions["settingsOpen"] is False and "browser preview only" in actions["saveStatus"],
                    f"{label}: preview Save applies locally and closes Preferences")
+            expect(actions["unsupportedDisabled"] is True,
+                   f"{label}: preview disables radius, refresh, alert, confidence and home settings")
+            expect(actions["noteVisible"] is True, f"{label}: preview explains its disabled settings")
             continue
         expected_css = "1" if row["mode"] == "desktop" else ("%g" % row["scale"])
         expect(row["cssScale"] == expected_css and float(row["configuredScale"]) == row["scale"],

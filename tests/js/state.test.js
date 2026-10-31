@@ -206,6 +206,7 @@ class FakeElement {
     } else this[name] = setting;
   }
   getAttribute(name) { return this.attributes[name] ?? null; }
+  removeAttribute(name) { delete this.attributes[name]; }
   setPointerCapture() {}
   getBoundingClientRect() {
     return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight };
@@ -2021,6 +2022,74 @@ test("preview settings disable unsupported API-key persistence with an explanati
 
   assert.equal(app.elements.get("settings-form").elements.api_key.disabled, true);
   assert.match(app.elements.get("settings-intro").textContent, /browser preview/i);
+});
+
+const PREVIEW_UNSUPPORTED_FIELDS = ["radius_km", "refresh_minutes", "alert_threshold", "confidence_filter"];
+
+function unsupportedControls(app) {
+  const form = app.elements.get("settings-form");
+  return [
+    ...PREVIEW_UNSUPPORTED_FIELDS.map((name) => [name, form.elements[name]]),
+    ["home-fieldset", app.elements.get("home-fieldset")],
+    ["home-place-input", app.elements.get("home-place-input")],
+  ];
+}
+
+test("preview disables unimplemented settings with a visible explanation", () => {
+  const preview = loadApp({ preview: true });
+  preview.runTimers();
+  openSettings(preview);
+  for (const [name, control] of unsupportedControls(preview)) {
+    assert.ok(control, `${name} must exist`);
+    assert.equal(control.disabled, true, `${name}.disabled`);
+    assert.equal(control.getAttribute("aria-describedby"), "preview-settings-note", `${name} aria-describedby`);
+  }
+  const note = preview.elements.get("preview-settings-note");
+  assert.equal(note.hidden, false);
+  assert.match(fs.readFileSync(indexPath, "utf8"), /<p class="privacy-note" id="preview-settings-note" hidden>Browser preview: map radius, refresh interval, alert threshold, the confidence filter, and home location work only in the Airloom desktop app\.<\/p>/);
+
+  const desktop = loadApp();
+  configureMap(desktop);
+  openSettings(desktop);
+  for (const [name, control] of unsupportedControls(desktop)) {
+    assert.equal(control.disabled, false, `${name}.disabled`);
+    assert.equal(control.getAttribute("aria-describedby"), null, `${name} aria-describedby`);
+  }
+  assert.equal(desktop.elements.get("preview-settings-note").hidden, true);
+});
+
+test("preview Save ignores unimplemented settings", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  form.elements.radius_km.value = "99";
+  form.elements.refresh_minutes.value = "30";
+  form.elements.alert_threshold.value = "5";
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+  assert.equal(app.elements.get("settings-dialog").open, false);
+  assert.match(app.elements.get("ui-status").textContent, /browser preview only/i);
+  // Reopen from the app's own config, not a test payload.
+  app.document.dispatch("keydown", { key: ",", ctrlKey: true, metaKey: false });
+
+  assert.equal(app.elements.get("settings-dialog").open, true);
+  assert.equal(form.elements.radius_km.value, 22);
+  assert.equal(form.elements.refresh_minutes.value, 2);
+  assert.equal(form.elements.alert_threshold.value, 101);
+});
+
+test("preview heat-map threshold has an observable effect", () => {
+  const app = loadApp({ preview: true });
+  app.runTimers();
+  assert.equal(app.context.Airloom.debugState().heatmapActive, false);
+  openSettings(app);
+  const form = app.elements.get("settings-form");
+  form.elements.heatmap_threshold_km.value = "5";
+
+  form.dispatch("submit", { submitter: app.elements.get("save-settings") });
+
+  assert.equal(app.context.Airloom.debugState().heatmapActive, true);
 });
 
 test("preview place submission explains that remote search needs the desktop app", () => {

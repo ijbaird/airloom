@@ -140,7 +140,7 @@
         <div class="form-grid">
           <label class="wide"><span>PurpleAir read key</span><input name="api_key" type="password" placeholder="Paste a new key"></label>
           <label class="checkbox wide"><input name="clear_api_key" type="checkbox"><span>Remove the saved key</span><small id="key-status">No key saved</small></label>
-          <fieldset class="wide"><legend>Home location</legend>
+          <fieldset class="wide" id="home-fieldset"><legend>Home location</legend>
             <label><input name="home_mode" type="radio" value="auto" checked><span>Detect automatically</span></label>
             <label><input name="home_mode" type="radio" value="fixed"><span>Fixed home</span></label>
           </fieldset>
@@ -171,6 +171,7 @@
             <button type="button" id="unhide-all" class="unhide-button" hidden>Unhide all</button>
           </fieldset>
         </div>
+        <p class="privacy-note" id="preview-settings-note" hidden>Browser preview: map radius, refresh interval, alert threshold, the confidence filter, and home location work only in the Airloom desktop app.</p>
         <p class="privacy-note">Your key and favorites stay in a private local config file. Location detection uses your system's GeoClue service; place search and labels use OpenStreetMap Nominatim; map tiles load from OpenStreetMap; your coordinates go to PurpleAir only as map bounds when live data is enabled.</p>
         <p class="settings-error" id="settings-error" role="alert" hidden></p>
         <div class="dialog-actions"><button type="button" id="cancel-settings" class="secondary">Cancel</button><button value="default" id="save-settings" class="primary">Save & refresh</button></div>
