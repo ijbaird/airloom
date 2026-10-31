@@ -45,5 +45,29 @@ class PassesConfidenceTest(unittest.TestCase):
         self.assertEqual(reading.to_dict()["delivery"], "cache")
 
 
+class ObservationFreshnessTest(unittest.TestCase):
+    NOW = 1_800_000_000.0
+
+    def test_freshness_boundaries(self):
+        from airloom.models import (
+            FUTURE_SKEW_TOLERANCE,
+            MAX_OBSERVATION_AGE,
+            is_fresh_observation,
+            plausible_observation_time,
+        )
+
+        NOW = self.NOW
+        self.assertEqual((MAX_OBSERVATION_AGE, FUTURE_SKEW_TOLERANCE), (7200, 600))
+        for age, fresh in ((0, True), (7200, True), (7201, False), (-600, True), (-601, False)):
+            with self.subTest(age=age):
+                self.assertIs(is_fresh_observation(int(NOW - age), NOW), fresh)
+        self.assertFalse(is_fresh_observation(None, NOW))
+        self.assertFalse(is_fresh_observation(int(NOW) * 1000, NOW))
+        self.assertEqual(plausible_observation_time(int(NOW) + 600, NOW), int(NOW) + 600)
+        self.assertIsNone(plausible_observation_time(int(NOW) + 601, NOW))
+        self.assertIsNone(plausible_observation_time(None, NOW))
+        self.assertEqual(plausible_observation_time(1, NOW), 1)  # old is plausible, just not fresh
+
+
 if __name__ == "__main__":
     unittest.main()

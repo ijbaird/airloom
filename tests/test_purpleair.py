@@ -1,10 +1,28 @@
 import io
 import json
+import time
 import unittest
 from unittest import mock
 
-from airloom import purpleair
+from airloom import presentation, purpleair
 from airloom.purpleair import PurpleAirClient, PurpleAirError, Bounds, bounds_around, bounds_contains, parse_sensor_payload
+
+
+NOW = 1_800_000_000
+
+
+def map_row(sensor_id, **values) -> list:
+    defaults = {
+        "sensor_index": sensor_id,
+        "name": f"S{sensor_id}",
+        "latitude": 45.5,
+        "longitude": -122.6,
+        "last_seen": NOW,
+        "pm2.5_cf_1": 20.0,
+        "humidity": 50,
+    }
+    defaults.update(values)
+    return [defaults.get(field) for field in purpleair.MAP_FIELDS]
 
 
 class PurpleAirTest(unittest.TestCase):
@@ -55,16 +73,22 @@ class PurpleAirTest(unittest.TestCase):
             '{"fields": ["sensor_index", "latitude", "longitude", "humidity", "pm2.5_cf_1", "last_seen"],'
             ' "data": [[10, 45.0, -122.0, 50, Infinity, 1700000000],'
             '          [11, 45.1, -122.1, NaN, 20, "xyz"],'
-            '          ["abc", 45.2, -122.2, 50, 20, 1700000000],'
-            '          [13, 45.3, -122.3, 50, 20]]}'
+            '          ["abc", 45.2, -122.2, 50, 20, 1700000000]]}'
         )
         sensors = parse_sensor_payload(payload)
         by_id = {sensor.sensor_id: sensor for sensor in sensors}
-        self.assertEqual(sorted(by_id), [10, 11, 13])  # "abc" row dropped
+        self.assertEqual(sorted(by_id), [10, 11])  # "abc" row dropped
         self.assertIsNone(by_id[10].aqi)  # Infinity pm2.5 -> no reading
         self.assertIsNone(by_id[11].last_seen)  # bad last_seen tolerated
         self.assertIsNotNone(by_id[11].aqi)  # NaN humidity -> neutral default
-        self.assertIsNotNone(by_id[13].aqi)  # short row tolerated
+
+    def test_short_row_is_rejected_not_tolerated(self):
+        payload = {
+            "fields": ["sensor_index", "latitude", "longitude", "humidity", "pm2.5_cf_1", "last_seen"],
+            "data": [[10, 45.0, -122.0, 50, 20, 1700000000], [13, 45.3, -122.3, 50, 20]],
+        }
+        with self.assertRaises(PurpleAirError):
+            parse_sensor_payload(payload)
 
     def test_string_sensor_index_is_coerced(self):
         payload = {"fields": ["sensor_index", "latitude", "longitude"], "data": [["42", 45.0, -122.0]]}
@@ -84,7 +108,7 @@ class PurpleAirTest(unittest.TestCase):
             captured["url"] = request.full_url
             import io
             return mock.MagicMock(
-                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __enter__=lambda s: io.StringIO(json.dumps({"fields": list(purpleair.MAP_FIELDS), "data": []})),
                 __exit__=lambda s, *a: False,
             )
 
@@ -101,7 +125,7 @@ class PurpleAirTest(unittest.TestCase):
             captured["url"] = request.full_url
             import io
             return mock.MagicMock(
-                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __enter__=lambda s: io.StringIO(json.dumps({"fields": list(purpleair.MAP_FIELDS), "data": []})),
                 __exit__=lambda s, *a: False,
             )
 
@@ -125,7 +149,7 @@ class PurpleAirTest(unittest.TestCase):
             captured["url"] = request.full_url
             import io
             return mock.MagicMock(
-                __enter__=lambda s: io.StringIO('{"fields": [], "data": []}'),
+                __enter__=lambda s: io.StringIO(json.dumps({"fields": list(purpleair.MAP_FIELDS), "data": []})),
                 __exit__=lambda s, *a: False,
             )
 
@@ -184,7 +208,7 @@ class FieldListTest(unittest.TestCase):
 
 
 class FetchRowsTest(unittest.TestCase):
-    def _fetch_rows_with_payload(self, payload, **kwargs):
+    def _fetch_rows_with_payload(self, payload, clock=time.time, **kwargs):
         captured = {}
 
         def fake_urlopen(request, timeout=None):
@@ -195,11 +219,11 @@ class FetchRowsTest(unittest.TestCase):
             )
 
         with mock.patch("airloom.purpleair.urlopen", side_effect=fake_urlopen):
-            result = PurpleAirClient("key").fetch_rows(**kwargs)
+            result = PurpleAirClient("key", clock=clock).fetch_rows(**kwargs)
         return captured["url"], result
 
     def test_modified_since_and_fields_in_query(self):
-        payload = {"fields": ["sensor_index", "pm2.5_cf_1"], "data": [], "time_stamp": 1754680000}
+        payload = {"fields": list(purpleair.DATA_FIELDS), "data": [], "time_stamp": 1754680000}
         url, result = self._fetch_rows_with_payload(
             payload,
             bounds=Bounds(46.0, -123.0, 45.0, -122.0),
@@ -218,9 +242,115 @@ class FetchRowsTest(unittest.TestCase):
             "data": [[7, 4.0, 40], [8, 9.0, 55]],
             "time_stamp": 1754680000,
         }
-        _, result = self._fetch_rows_with_payload(payload, bounds=Bounds(46.0, -123.0, 45.0, -122.0))
+        _, result = self._fetch_rows_with_payload(
+            payload, bounds=Bounds(46.0, -123.0, 45.0, -122.0),
+            fields=("sensor_index", "pm2.5_cf_1", "humidity"))
         self.assertEqual(result.rows[0]["sensor_index"], 7)
         self.assertEqual(result.rows[1]["humidity"], 55)
+
+
+class ResponseValidationTest(unittest.TestCase):
+    BOUNDS = Bounds(46.0, -123.0, 45.0, -122.0)
+
+    def _fetch(self, payload, **kwargs):
+        return FetchRowsTest._fetch_rows_with_payload(
+            self, payload, clock=lambda: NOW, bounds=self.BOUNDS, **kwargs)[1]
+
+    def _assert_rejected(self, payload, **kwargs):
+        with self.assertRaises(PurpleAirError):
+            self._fetch(payload, **kwargs)
+
+    def test_short_row_rejects_whole_response(self):
+        self._assert_rejected(
+            {"fields": list(purpleair.DATA_FIELDS), "data": [[1, NOW]], "time_stamp": NOW},
+            fields=purpleair.DATA_FIELDS)
+
+    def test_long_row_rejects_whole_response(self):
+        self._assert_rejected(
+            {"fields": list(purpleair.MAP_FIELDS), "data": [map_row(1), [*map_row(2), 99]]})
+
+    def test_non_list_row_rejects_whole_response(self):
+        self._assert_rejected({"fields": list(purpleair.MAP_FIELDS), "data": [map_row(1), "junk"]})
+
+    def test_missing_requested_measurement_field_rejects_response(self):
+        fields = [field for field in purpleair.MAP_FIELDS if field != "pm2.5_cf_1"]
+        rows = [[value for field, value in zip(purpleair.MAP_FIELDS, map_row(1))
+                 if field != "pm2.5_cf_1"]]
+        self._assert_rejected({"fields": fields, "data": rows})
+
+    def test_missing_sensor_index_rejects_response(self):
+        self._assert_rejected({"fields": list(purpleair.MAP_FIELDS[1:]), "data": [map_row(1)[1:]]})
+
+    def test_non_string_field_name_rejects_response(self):
+        self._assert_rejected({"fields": [*purpleair.MAP_FIELDS[:-1], 5], "data": [map_row(1)]})
+
+    def test_omitted_metadata_is_not_required_for_delta(self):
+        result = self._fetch(
+            {"fields": list(purpleair.DATA_FIELDS),
+             "data": [[1, NOW, 50, 70, 1.0, 4.0, 5.0, 99]], "time_stamp": NOW},
+            fields=purpleair.DATA_FIELDS)
+        self.assertEqual(result.rows[0]["sensor_index"], 1)
+        self.assertEqual(result.rows[0]["last_seen"], NOW)
+        self.assertEqual(result.time_stamp, NOW)
+
+
+class FutureTimestampTest(unittest.TestCase):
+    BOUNDS = Bounds(46.0, -123.0, 45.0, -122.0)
+
+    def _fetch(self, payload):
+        return FetchRowsTest._fetch_rows_with_payload(
+            self, payload, clock=lambda: NOW, bounds=self.BOUNDS)[1]
+
+    def test_future_last_seen_is_missing_at_parse_and_sensor_boundaries(self):
+        payload = {
+            "fields": list(purpleair.MAP_FIELDS),
+            "data": [
+                map_row(1, last_seen=NOW + 600),
+                map_row(2, last_seen=NOW + 601),
+                map_row(3, last_seen=NOW * 1000),
+                map_row(4, last_seen=2**63 - 1),
+            ],
+        }
+        result = self._fetch(payload)
+        self.assertEqual([r["last_seen"] for r in result.rows], [NOW + 600, None, None, None])
+        base = {"sensor_index": 9, "latitude": 45.5, "longitude": -122.6}
+        self.assertIsNone(
+            purpleair.sensor_from_values({**base, "last_seen": NOW + 601}, now=NOW).last_seen)
+        self.assertEqual(
+            purpleair.sensor_from_values({**base, "last_seen": NOW + 600}, now=NOW).last_seen,
+            NOW + 600)
+
+    def test_future_time_stamp_is_not_a_checkpoint(self):
+        stamps = []
+        for time_stamp in (NOW + 601, NOW * 1000, NOW + 600):
+            payload = {"fields": list(purpleair.MAP_FIELDS), "data": [], "time_stamp": time_stamp}
+            stamps.append(self._fetch(payload).time_stamp)
+        self.assertEqual(stamps, [None, None, NOW + 600])
+
+    def test_fetch_sensors_uses_the_injected_clock(self):
+        # The wall clock is pinned a day behind NOW, so NOW + 600 survives only
+        # if the client's clock, not time.time(), decides what is in the future.
+        payload = {
+            "fields": list(purpleair.MAP_FIELDS),
+            "data": [map_row(1, last_seen=NOW + 600), map_row(2, last_seen=NOW + 601)],
+        }
+        with mock.patch("airloom.purpleair.urlopen", return_value=mock.MagicMock(
+            __enter__=lambda s: io.StringIO(json.dumps(payload)),
+            __exit__=lambda s, *a: False,
+        )), mock.patch("airloom.purpleair.time") as wall_clock:
+            wall_clock.time.return_value = NOW - 86400
+            sensors = PurpleAirClient("key", clock=lambda: NOW).fetch_sensors(bounds=self.BOUNDS)
+        self.assertEqual([s.last_seen for s in sensors], [NOW + 600, None])
+
+    def test_far_future_observation_parses_ineligible_for_alerts(self):
+        sensors = parse_sensor_payload({
+            "fields": list(purpleair.MAP_FIELDS),
+            "data": [map_row(1, last_seen=2**63 - 1, **{"pm2.5_cf_1": 100.0})],
+        }, now=NOW)
+        self.assertEqual(
+            presentation.alert_transitions(
+                sensors, favorites={1}, previous={}, threshold=101, now=NOW, origin="live"),
+            ([], {}))
 
 
 class SensorFromValuesTest(unittest.TestCase):
@@ -335,6 +465,59 @@ class SensorFromValuesTest(unittest.TestCase):
         indoor = purpleair.trend_from_values({**values, "location_type": 1})
         self.assertEqual([point["aqi"] for point in outdoor], [168, 168, 168, 168, 168, 168, 146])
         self.assertEqual([point["aqi"] for point in indoor], [146, 146, 146, 146, 146, 146, 146])
+
+
+class BooleanValueTest(unittest.TestCase):
+    base = {"sensor_index": 7, "latitude": 45.5, "longitude": -122.6, "humidity": 50}
+
+    def test_boolean_pm25_is_unavailable_not_good(self):
+        for value in (False, True):
+            with self.subTest(value=value):
+                sensor = purpleair.sensor_from_values({**self.base, "pm2.5_cf_1": value})
+                self.assertIsNone(sensor.aqi)
+                self.assertIsNone(sensor.pm25)
+
+    def test_boolean_humidity_uses_neutral_assumption(self):
+        sensor = purpleair.sensor_from_values(
+            {**self.base, "pm2.5_cf_1": 20, "humidity": True})
+        neutral = purpleair.sensor_from_values(
+            {**self.base, "pm2.5_cf_1": 20, "humidity": None})
+        self.assertIsNone(sensor.humidity)
+        self.assertEqual(sensor.aqi, neutral.aqi)
+
+    def test_boolean_metadata_and_secondary_measurements_are_missing(self):
+        for key, attribute in (("temperature", "temperature_f"), ("pm1.0", "pm1"),
+                               ("pm10.0", "pm10"), ("confidence", "confidence"),
+                               ("last_seen", "last_seen")):
+            with self.subTest(key=key):
+                sensor = purpleair.sensor_from_values({**self.base, key: True})
+                self.assertIsNone(getattr(sensor, attribute))
+        self.assertIs(
+            purpleair.sensor_from_values({**self.base, "location_type": True}).indoor, False)
+        self.assertEqual(
+            purpleair.trend_from_values(
+                {**self.base, "location_type": True, "pm2.5_60minute": 30.0}),
+            purpleair.trend_from_values(
+                {**self.base, "location_type": 0, "pm2.5_60minute": 30.0}),
+        )
+
+    def test_boolean_coordinates_drop_the_row(self):
+        for key in ("latitude", "longitude"):
+            for value in (True, False):
+                with self.subTest(key=key, value=value):
+                    self.assertIsNone(purpleair.sensor_from_values({**self.base, key: value}))
+
+    def test_boolean_trend_windows_are_unavailable(self):
+        trend = purpleair.trend_from_values(
+            {**self.base, "pm2.5_cf_1": 10.0, "pm2.5_60minute": True, "pm2.5_1week": False})
+        points = {point["label"]: point["aqi"] for point in trend}
+        self.assertIsNone(points["1h"])
+        self.assertIsNone(points["1w"])
+        self.assertIsNotNone(points["Now"])
+
+    def test_boolean_time_stamp_is_not_a_checkpoint(self):
+        result = purpleair.parse_rows({"fields": ["sensor_index"], "data": [], "time_stamp": True})
+        self.assertIsNone(result.time_stamp)
 
 
 class CapBoundsTest(unittest.TestCase):

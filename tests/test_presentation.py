@@ -192,6 +192,37 @@ class AlertTransitionsTest(unittest.TestCase):
         self.assertEqual([sensor.sensor_id for sensor in alerted], [1])
         self.assertEqual(state, {"1": True})
 
+    def test_future_observation_beyond_skew_never_alerts_or_changes_state(self):
+        sensors = [
+            make_sensor(1, aqi=150, favorite=True, last_seen=NOW + 601),
+            make_sensor(2, aqi=150, favorite=True, last_seen=2**63 - 1),
+            make_sensor(3, aqi=150, favorite=True, last_seen=int(NOW) * 1000),
+        ]
+        previous = {"1": False, "2": False, "3": False}
+        alerted, state = alert_transitions(
+            sensors,
+            favorites={1, 2, 3},
+            previous=previous,
+            threshold=101,
+            now=NOW,
+            origin="live",
+        )
+        self.assertEqual(alerted, [])
+        self.assertEqual(state, previous)
+
+    def test_observation_within_future_skew_is_eligible(self):
+        reading = make_sensor(aqi=150, favorite=True, last_seen=NOW + 600)
+        alerted, state = alert_transitions(
+            [reading],
+            favorites={1},
+            previous={"1": False},
+            threshold=101,
+            now=NOW,
+            origin="live",
+        )
+        self.assertEqual([sensor.sensor_id for sensor in alerted], [1])
+        self.assertEqual(state, {"1": True})
+
     def test_missing_aqi_or_observation_time_does_not_alert_or_create_state(self):
         sensors = [
             make_sensor(1, aqi=None, favorite=True),

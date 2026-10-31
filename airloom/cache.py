@@ -18,9 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .purpleair import (
-    Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, FetchResult,
-    PurpleAirError, _integer, _number,
+    Bounds, bounds_contains, split_bounds, DATA_FIELDS, MAP_FIELDS, MEASUREMENT_FIELDS,
+    FetchResult, PurpleAirError, _integer, _number,
 )
+from .models import FUTURE_SKEW_TOLERANCE, plausible_observation_time
 from .validation import sensor_id
 
 MAX_REGIONS = 50
@@ -98,6 +99,24 @@ def _coordinates(values: dict) -> tuple[float, float] | None:
     ):
         return None
     return latitude, longitude
+
+
+def _observed_at(merged: dict, stored_observed_at: float | None, now: float) -> float:
+    """When a merged row was observed; its last_seen must already be validated."""
+    last_seen = _integer(merged.get("last_seen"))
+    if last_seen is not None:
+        return float(last_seen)
+    return float(stored_observed_at) if stored_observed_at is not None else now
+
+
+def _checkpoint(value, now: float) -> int | None:
+    """A delta checkpoint safe to store or send: an integer no further in the
+    future than clock skew allows. Anything else means "full snapshot next"."""
+    return plausible_observation_time(_integer(value), now)
+
+
+def _already_expired(merged: dict, stored_observed_at: float | None, now: float) -> bool:
+    return _observed_at(merged, stored_observed_at, now) < now - SENSOR_MAX_AGE
 
 
 class SensorCache:
@@ -187,10 +206,13 @@ class SensorCache:
                 raise
 
     def unknown_rows(self, rows: list[dict]) -> list[int]:
-        """Return delta IDs that need full metadata, without staging writes."""
+        """Return delta IDs that need full metadata, without staging writes.
+        Rows the cache would discard as already expired never need metadata."""
         with self._lock:
+            now = self.clock()
             order: list[int] = []
             merged_by_id: dict[int, dict] = {}
+            stored_observed_at: dict[int, float | None] = {}
             for values in rows:
                 normalized_id = sensor_id(values.get("sensor_index"))
                 if normalized_id is None:
@@ -198,14 +220,22 @@ class SensorCache:
                 if normalized_id not in merged_by_id:
                     order.append(normalized_id)
                     cursor = self._db.execute(
-                        "SELECT data FROM sensors WHERE sensor_index = ?", (normalized_id,))
+                        "SELECT data, observed_at FROM sensors WHERE sensor_index = ?",
+                        (normalized_id,))
                     existing = cursor.fetchone()
                     merged_by_id[normalized_id] = dict(json.loads(existing[0])) if existing else {}
-                merged_by_id[normalized_id].update(values)
-                merged_by_id[normalized_id]["sensor_index"] = normalized_id
+                    stored_observed_at[normalized_id] = existing[1] if existing else None
+                merged = merged_by_id[normalized_id]
+                merged.update(values)
+                if "last_seen" in values:
+                    merged["last_seen"] = plausible_observation_time(
+                        _integer(values["last_seen"]), now)
+                merged["sensor_index"] = normalized_id
             return [
                 normalized_id for normalized_id in order
-                if _coordinates(merged_by_id[normalized_id]) is None
+                if not _already_expired(
+                    merged_by_id[normalized_id], stored_observed_at[normalized_id], now)
+                and _coordinates(merged_by_id[normalized_id]) is None
             ]
 
     def _upsert_locked(self, rows: list[dict]) -> list[int]:
@@ -218,20 +248,30 @@ class SensorCache:
             cursor = self._db.execute(
                 "SELECT data, observed_at FROM sensors WHERE sensor_index = ?", (normalized_id,))
             existing = cursor.fetchone()
-            merged = dict(json.loads(existing[0])) if existing else {}
+            previous = json.loads(existing[0]) if existing else {}
+            merged = dict(previous)
             merged.update(values)
+            if "last_seen" in values:
+                observed = plausible_observation_time(_integer(values["last_seen"]), now)
+                merged["last_seen"] = observed
+                # A new observation time must never date a retained old reading.
+                if observed is not None and observed != _integer(previous.get("last_seen")):
+                    for key in MEASUREMENT_FIELDS - {"last_seen"}:
+                        if key in previous and key not in values:
+                            merged[key] = None
             merged["sensor_index"] = normalized_id
+            stored_observed_at = existing[1] if existing else None
+            if _already_expired(merged, stored_observed_at, now):
+                # Storing an already-expired row would only make the next prune
+                # wipe every region's coverage; the caller still shows the row.
+                continue
+            observed_at = _observed_at(merged, stored_observed_at, now)
             coordinates = _coordinates(merged)
             if coordinates is None:
                 unknown.append(normalized_id)
                 continue
             lat, lon = coordinates
             merged["latitude"], merged["longitude"] = lat, lon
-            last_seen = _integer(merged.get("last_seen"))
-            observed_at = (
-                float(last_seen) if last_seen is not None
-                else float(existing[1]) if existing else now
-            )
             self._db.execute(
                 "INSERT INTO sensors (sensor_index, latitude, longitude, data, fetched_at,"
                 " observed_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(sensor_index) DO UPDATE SET"
@@ -277,7 +317,7 @@ class SensorCache:
                     " fetched_at, api_time_stamp, metadata_fetched_at)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (bounds.north, bounds.west, bounds.south, bounds.east,
-                     location_filter, now, api_time_stamp, now),
+                     location_filter, now, _checkpoint(api_time_stamp, now), now),
                 )
                 self._prune_locked(now, preserve_region=cursor.lastrowid)
                 self._db.commit()
@@ -291,10 +331,14 @@ class SensorCache:
             try:
                 unknown = self._upsert_locked(rows)
                 now = self.clock()
+                # An implausible response checkpoint keeps the previous one
+                # (a safe, older lower bound), unless that is itself in the
+                # future, as 0.13 could store; then the next poll is a full one.
                 self._db.execute(
-                    "UPDATE regions SET fetched_at = ?, api_time_stamp ="
-                    " COALESCE(?, api_time_stamp) WHERE id = ?",
-                    (now, api_time_stamp, region_id),
+                    "UPDATE regions SET fetched_at = ?, api_time_stamp = COALESCE(?,"
+                    " CASE WHEN api_time_stamp <= ? THEN api_time_stamp END) WHERE id = ?",
+                    (now, _checkpoint(api_time_stamp, now), now + FUTURE_SKEW_TOLERANCE,
+                     region_id),
                 )
                 self._prune_locked(now)
                 self._db.commit()
@@ -317,9 +361,11 @@ class SensorCache:
                  metadata_fetched_at) in cursor:
                 if max_age is not None and now - fetched_at >= max_age:
                     break  # ordered newest-first: everything after is older
+                # A future checkpoint persisted by 0.13 is treated as absent,
+                # so the region is refreshed by a full snapshot.
                 region = Region(
-                    rid, Bounds(north, west, south, east), mode, fetched_at, stamp,
-                    metadata_fetched_at,
+                    rid, Bounds(north, west, south, east), mode, fetched_at,
+                    _checkpoint(stamp, now), metadata_fetched_at,
                 )
                 if bounds_contains(region.bounds, bounds):
                     return region
@@ -353,7 +399,10 @@ class SensorCache:
 
     def _prune_locked(self, now: float, preserve_region: int | None = None) -> None:
         cutoff = now - SENSOR_MAX_AGE
-        cursor = self._db.execute("DELETE FROM sensors WHERE observed_at < ?", (cutoff,))
+        cursor = self._db.execute(
+            "DELETE FROM sensors WHERE observed_at < ? OR observed_at > ?",
+            (cutoff, now + FUTURE_SKEW_TOLERANCE),
+        )
         if cursor.rowcount:
             # A delta checkpoint cannot prove that a pruned row was absent from
             # the next response. Keep only a just-completed full snapshot, if any.
@@ -370,13 +419,17 @@ class SensorCache:
 
     def store_trend(self, sensor_id: int, trend: list) -> None:
         with self._lock:
-            self._db.execute(
-                "INSERT INTO trends (sensor_index, data, fetched_at) VALUES (?, ?, ?)"
-                " ON CONFLICT(sensor_index) DO UPDATE SET data = excluded.data,"
-                " fetched_at = excluded.fetched_at",
-                (int(sensor_id), json.dumps(trend), self.clock()),
-            )
-            self._db.commit()
+            try:
+                self._db.execute(
+                    "INSERT INTO trends (sensor_index, data, fetched_at) VALUES (?, ?, ?)"
+                    " ON CONFLICT(sensor_index) DO UPDATE SET data = excluded.data,"
+                    " fetched_at = excluded.fetched_at",
+                    (int(sensor_id), json.dumps(trend), self.clock()),
+                )
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def get_trend(self, sensor_id: int, max_age: float) -> list | None:
         with self._lock:
@@ -389,10 +442,14 @@ class SensorCache:
 
     def clear(self) -> None:
         with self._lock:
-            self._db.execute("DELETE FROM sensors")
-            self._db.execute("DELETE FROM regions")
-            self._db.execute("DELETE FROM trends")
-            self._db.commit()
+            try:
+                self._db.execute("DELETE FROM sensors")
+                self._db.execute("DELETE FROM regions")
+                self._db.execute("DELETE FROM trends")
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
 
 @dataclass(frozen=True, slots=True)
