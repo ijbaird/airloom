@@ -208,6 +208,54 @@ class GeocoderStub:
             return query in self.done
 
 
+class TileInterceptor:
+    """Loopback proxy that refuses and records every request routed to it.
+
+    WebKit honors proxy environment variables only through GLib's libproxy
+    resolver, so `env` selects that resolver too. Loopback stays direct, so
+    the geocoder stub and debug socket are unaffected."""
+
+    def __init__(self):
+        self.requests: list[str] = []
+        self._lock = threading.Lock()
+        interceptor = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _refuse(self):
+                with interceptor._lock:
+                    interceptor.requests.append(self.requestline)
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+            do_CONNECT = do_GET = do_HEAD = do_POST = _refuse
+
+            def log_message(self, *_args):
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self.env = {name: url for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")}
+        self.env.update(no_proxy="127.0.0.1,localhost", NO_PROXY="127.0.0.1,localhost",
+                        GIO_USE_PROXY_RESOLVER="libproxy")
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    def seen(self) -> list[str]:
+        with self._lock:
+            return list(self.requests)
+
+
 # --------------------------------------------------------- owned processes
 
 def stop_owned(process: subprocess.Popen, sock_path: str | None = None) -> None:
@@ -859,7 +907,82 @@ def scenario_resize(app: DebugApp):
         wait_for_width(sock, 1240, frame=frame)
 
 
-def scenario_shell_recovery(app: DebugApp):
+# WebKit records a resource entry even for a refused tile, so count the
+# entries that show any part of a response (a protocol, a response time, or
+# bytes) rather than entries at all.
+TILE_EVIDENCE_JS = """
+(() => {
+  const tiles = [...document.querySelectorAll("img.tile")];
+  const osm = performance.getEntriesByType("resource").filter((e) => e.name.includes("tile.openstreetmap.org"));
+  return { requested: tiles.length,
+    loaded: tiles.filter((t) => t.classList.contains("loaded") || (t.complete && t.naturalWidth > 0)).length,
+    osmResponses: osm.filter((e) => e.nextHopProtocol || e.responseStart || e.transferSize || e.encodedBodySize).length };
+})()
+"""
+
+# Records the page's view-changed posts. Python handles bridge messages in
+# order, so a later reload-shell reaches it after the recorded view. The spy
+# wraps the prototype: WebKit can collect and recreate the handler object
+# itself, which would drop a wrapper set on that instance.
+VIEW_POSTS_JS = """
+(() => {
+  if (!window.__viewPosts) {
+    window.__viewPosts = [];
+    const proto = Object.getPrototypeOf(window.webkit.messageHandlers.airloom);
+    const post = proto.postMessage;
+    proto.postMessage = function (raw) {
+      const message = JSON.parse(raw);
+      if (message.action === "view-changed") window.__viewPosts.push({ lat: message.lat, lon: message.lon });
+      return post.call(this, raw);
+    };
+  }
+  return window.__viewPosts;
+})()
+"""
+
+
+def check_no_tiles(sock: str, label: str):
+    evidence = eval_js(sock, TILE_EVIDENCE_JS)
+    check(evidence["requested"] > 0 and evidence["loaded"] == 0 and evidence["osmResponses"] == 0,
+          f"{label}: no OSM tile loaded or recorded a response ({evidence})")
+
+
+def scenario_shell_recovery(root: Path, geocoder: GeocoderStub):
+    print("— shell reload restores the away view —")
+    with TileInterceptor() as tiles:
+        app = DebugApp(root, "shell-recovery", geocoder.url, extra_env=tiles.env)
+        try:
+            app.start().wait_ready()
+            sock = app.sock_path
+            check(near(request(sock, "state")["center"], HOME), "the app starts at home")
+            eval_js(sock, VIEW_POSTS_JS)
+            eval_js(sock, location_js(AWAY))
+            wait_for(lambda: any(near(view, AWAY) for view in eval_js(sock, VIEW_POSTS_JS)), 20,
+                     "the page to report the Seattle view to Python")
+            check_no_tiles(sock, "the original page")
+
+            eval_js(sock, """(() => { window.__oldPage = true;
+              window.webkit.messageHandlers.airloom.postMessage(JSON.stringify({ action: "reload-shell" }));
+              return "reloading"; })()""")
+            wait_for(lambda: eval_js(sock, "window.__oldPage === undefined") is True, 20,
+                     "the old document to be replaced")
+            state = wait_for(lambda: (lambda s: s if s["sensorCount"] > 0 else None)(request(sock, "state")),
+                             30, "sensors on the recovered page")
+            check(near(state["center"], AWAY) and not near(state["center"], HOME),
+                  f"the recovered page restores the Seattle view, not home ({state['center']})")
+            check_no_tiles(sock, "the recovered page")
+
+            renderer_crash_recovery(app)
+            check(near(request(sock, "state")["center"], AWAY), "crash recovery also keeps the Seattle view")
+            check_no_tiles(sock, "the page after crash recovery")
+            hosts = {line.split()[1] for line in tiles.seen() if len(line.split()) > 1}
+            check(hosts == {"tile.openstreetmap.org:443"},
+                  f"every off-host request was an intercepted OSM tile ({len(tiles.seen())} refused, {hosts})")
+        finally:
+            app.stop()
+
+
+def renderer_crash_recovery(app: DebugApp):
     print("— renderer crash recovery and Reload —")
     sock = app.sock_path
     web_processes = [pid for pid in descendants(app.process.pid)
@@ -2084,7 +2207,6 @@ APP_SCENARIOS = {
     "focus": scenario_keyboard_focus,
     "filters": scenario_filters,
     "resize": scenario_resize,
-    "shell-recovery": scenario_shell_recovery,  # reloads the page; keep last
 }
 STANDALONE_SCENARIOS = {
     "layouts": lambda root, _geocoder: scenario_layouts(root),
@@ -2094,6 +2216,7 @@ STANDALONE_SCENARIOS = {
     "trend-retry": scenario_trend_retry,
     "stripped-debug": scenario_stripped_debug,
     "keyboard-map": scenario_keyboard_map,
+    "shell-recovery": scenario_shell_recovery,
 }
 ALL_SCENARIOS = [*APP_SCENARIOS, *STANDALONE_SCENARIOS]
 

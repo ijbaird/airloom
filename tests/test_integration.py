@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,7 @@ REQUIRED_COVERAGE = {
     "filter persistence": "filters",
     "trend retry": "trend-retry",
     "renderer crash recovery": "shell-recovery",
+    "shell reload restores the controller's away view": "shell-recovery",
     "system reduced-motion preference": "reduced-motion",
     "demo/expired/fresh alert behavior": "alerts",
     "filtered cached fallback with provenance": "cache-fallback",
@@ -750,6 +752,25 @@ class UiRegressionScriptContractTest(unittest.TestCase):
         self.assertIn("trend-retry", self.script.STANDALONE_SCENARIOS)
         self.assertNotIn("trend-retry", self.script.APP_SCENARIOS)
         self.assertNotIn("1000000", inspect.getsource(self.script.scenario_trend_retry))
+
+    def test_shell_recovery_runs_its_own_tile_intercepted_instance(self):
+        self.assertIn("shell-recovery", self.script.STANDALONE_SCENARIOS)
+        self.assertNotIn("shell-recovery", self.script.APP_SCENARIOS)
+        source = inspect.getsource(self.script.scenario_shell_recovery)
+        self.assertIn("TileInterceptor()", source)
+        self.assertIn("extra_env=tiles.env", source)
+
+    def test_tile_interceptor_refuses_and_records_proxied_requests(self):
+        with self.script.TileInterceptor() as tiles:
+            self.assertEqual(tiles.env["GIO_USE_PROXY_RESOLVER"], "libproxy")
+            self.assertEqual(tiles.env["https_proxy"], tiles.env["HTTPS_PROXY"])
+            self.assertIn("127.0.0.1", tiles.env["no_proxy"].split(","))
+            port = int(tiles.env["https_proxy"].rsplit(":", 1)[1])
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+                conn.sendall(b"CONNECT tile.openstreetmap.org:443 HTTP/1.1\r\nHost: tile.openstreetmap.org:443\r\n\r\n")
+                status = conn.makefile("rb").readline()
+        self.assertIn(b" 403 ", status)
+        self.assertEqual(tiles.seen(), ["CONNECT tile.openstreetmap.org:443 HTTP/1.1"])
 
     def test_fixed_sleeps_are_justified(self):
         unjustified = [
