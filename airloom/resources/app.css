@@ -178,6 +178,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .chart .line { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
 .chart .dot { stroke: var(--panel-solid); stroke-width: 2; }
 .chart text { fill: var(--muted); font: calc(8px * var(--interface-scale)) system-ui; }
+.chart .point-value { fill: var(--ink); font-weight: 750; font-variant-numeric: tabular-nums; }
 
 .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: calc(9px * var(--interface-scale)); margin-top: calc(12px * var(--interface-scale)); }
 .metrics-grid article { min-height: calc(90px * var(--interface-scale)); padding: calc(12px * var(--interface-scale)); display: flex; flex-direction: column; border-radius: calc(13px * var(--interface-scale)); background: var(--soft); border: 1px solid transparent; }

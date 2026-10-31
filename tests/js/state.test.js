@@ -1718,6 +1718,27 @@ test("rolling-average charts name the actual current comparison", () => {
   assert.equal(app.elements.get("trend-direction").textContent, "Holding steady");
 });
 
+test("trend values are exposed as accessible text and visible point labels", () => {
+  const app = loadApp();
+  configureMap(app, { has_api_key: true });
+  receiveSensors(app, [fixtureSensor(1, { last_seen: 100 })], { config: { has_api_key: true } });
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: 1,
+    status: "loaded",
+    reading_last_seen: 100,
+    trend: [{ label: "1w", aqi: 40 }, { label: "1d", aqi: 45 }, { label: "Now", aqi: 48 }],
+  });
+
+  const chart = app.elements.get("chart").innerHTML;
+  assert.match(chart, /<svg[^>]*role="img"[^>]*aria-labelledby="trend-chart-title"[^>]*aria-describedby="trend-chart-desc"/);
+  assert.ok(chart.includes('<title id="trend-chart-title">Current vs 1-week average</title>'));
+  assert.ok(chart.includes('<desc id="trend-chart-desc">Up 8 points. 1-week average AQI 40, Good; 1-day average AQI 45, Good; Current AQI 48, Good.</desc>'));
+  assert.ok(chart.includes('<tr data-window="1d"><th scope="row">1-day average</th><td>45</td><td>Good</td></tr>'));
+  assert.deepEqual([...chart.matchAll(/<text class="point-value"[^>]*>([^<]*)<\/text>/g)].map((match) => match[1]), ["40", "45", "48"]);
+  assert.doesNotMatch(chart, /history/i);
+});
+
 test("preview detail favorite toggles local state and pressed state", () => {
   const app = loadApp({ preview: true });
   app.runTimers();

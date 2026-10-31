@@ -595,6 +595,10 @@
     renderDetail();
   }
 
+  // Spoken and tabulated names for each rolling-average window.
+  const WINDOW_LABELS = { "1w": "1-week average", "1d": "1-day average", "6h": "6-hour average", "1h": "1-hour average", "30m": "30-minute average", "10m": "10-minute average", Now: "Current" };
+  const windowName = (label) => Object.hasOwn(WINDOW_LABELS, label) ? WINDOW_LABELS[label] : escapeHtml(label);
+
   function renderChart(sensor) {
     const trendState = state.trends.get(trendKey(sensor));
     const status = trendState?.status || (state.config.has_api_key ? "loading" : "unavailable");
@@ -624,17 +628,23 @@
     const line = coordinates.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
     const area = `${line} L${coordinates.at(-1).x},${height - padBottom} L${coordinates[0].x},${height - padBottom} Z`;
     const labels = coordinates.map((point) => `<text x="${point.x}" y="${height - 4}" text-anchor="middle">${escapeHtml(point.label)}</text>`).join("");
+    const values = coordinates.map((point) => `<text class="point-value" x="${point.x}" y="${point.y - 7}" text-anchor="middle">${point.aqi}</text>`).join("");
     const dots = coordinates.map((point) => `<circle class="dot" cx="${point.x}" cy="${point.y}" r="3.5" fill="${sensor.color}"/>`).join("");
-    $("#chart").innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-      <line class="grid" x1="0" y1="${height - padBottom}" x2="${width}" y2="${height - padBottom}"/>
-      <path class="area" d="${area}" fill="${sensor.color}"/><path class="line" d="${line}" stroke="${sensor.color}"/>${dots}${labels}
-    </svg>`;
-    const comparisonLabels = { "1w": "1-week average", "1d": "1-day average", "6h": "6-hour average", "1h": "1-hour average", "30m": "30-minute average", "10m": "10-minute average" };
-    if (points.at(-1).label === "Now" && comparisonLabels[points[0].label]) {
-      $("#chart-period").textContent = `Current vs ${comparisonLabels[points[0].label]}`;
+    const baseline = points[0].label;
+    if (points.at(-1).label === "Now" && baseline !== "Now" && Object.hasOwn(WINDOW_LABELS, baseline)) {
+      $("#chart-period").textContent = `Current vs ${WINDOW_LABELS[baseline]}`;
     }
     const delta = points.at(-1).aqi - points[0].aqi;
-    $("#trend-direction").textContent = Math.abs(delta) < 4 ? "Holding steady" : delta > 0 ? `Up ${delta} points` : `Down ${Math.abs(delta)} points`;
+    const direction = Math.abs(delta) < 4 ? "Holding steady" : delta > 0 ? `Up ${delta} points` : `Down ${Math.abs(delta)} points`;
+    $("#trend-direction").textContent = direction;
+    const windows = points.map((point) => ({ label: escapeHtml(point.label), name: windowName(point.label), aqi: point.aqi, category: AirloomCore.bandForAQI(point.aqi).label }));
+    const items = windows.map((point) => `${point.name} AQI ${point.aqi}, ${point.category}`).join("; ");
+    const rows = windows.map((point) => `<tr data-window="${point.label}"><th scope="row">${point.name}</th><td>${point.aqi}</td><td>${point.category}</td></tr>`).join("");
+    $("#chart").innerHTML = `<svg role="img" aria-labelledby="trend-chart-title" aria-describedby="trend-chart-desc" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      <title id="trend-chart-title">${escapeHtml($("#chart-period").textContent)}</title><desc id="trend-chart-desc">${direction}. ${items}.</desc>
+      <line class="grid" x1="0" y1="${height - padBottom}" x2="${width}" y2="${height - padBottom}"/>
+      <path class="area" d="${area}" fill="${sensor.color}"/><path class="line" d="${line}" stroke="${sensor.color}"/>${dots}${values}${labels}
+    </svg><table class="visually-hidden" id="trend-values"><caption>Rolling-average AQI values</caption><thead><tr><th scope="col">Window</th><th scope="col">AQI</th><th scope="col">Category</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   // Minimal slippy-map renderer: bundled code, standard OSM raster tiles, no JS CDN.
