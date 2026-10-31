@@ -1327,6 +1327,36 @@ test("a favorite row that shares an area id selects the favorite's own reading",
   assert.equal(app.elements.get("detail-provenance").textContent, "Stale");
 });
 
+test("a selected favorite accepts trend events for its own reading, not the area's", () => {
+  const app = loadApp({ nowMs: NOW_S * 1000 });
+  configureMap(app, { has_api_key: true });
+  app.elements.get("sensors-panel").hidden = false;
+  app.context.Airloom.receive("sensors", {
+    area: [fixtureSensor(1, { last_seen: FRESH })],
+    favorites: [fixtureSensor(1, { aqi: 77, favorite: true, last_seen: FRESH - 600 })],
+    selected_id: 1,
+    source: "PurpleAir live",
+    config: { has_api_key: true },
+  });
+  rowFor(app, "favorites-list", 1).click();
+  assert.equal(app.elements.get("aqi-number").textContent, "77");
+
+  app.context.Airloom.receive("trend", {
+    sensor_id: 1,
+    request_id: 1,
+    status: "loaded",
+    reading_last_seen: FRESH - 600,
+    trend: [{ label: "1w", aqi: 40 }, { label: "Now", aqi: 48 }],
+  });
+  assert.match(app.elements.get("chart").innerHTML, /<svg/);
+  assert.equal(app.elements.get("trend-direction").textContent, "Up 8 points");
+
+  // The area row keeps its own, still-unloaded reading.
+  rowFor(app, "sensor-list", 1).click();
+  assert.equal(app.elements.get("aqi-number").textContent, "21");
+  assert.match(app.elements.get("chart").innerHTML, /Trend not loaded/);
+});
+
 test("relative ages tick every minute without refetching", () => {
   const app = loadApp({ nowMs: NOW_S * 1000 });
   configureMap(app);

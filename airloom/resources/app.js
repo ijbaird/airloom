@@ -224,8 +224,13 @@
     return Number.isFinite(timestamp) ? timestamp : 0;
   }
 
+  // Trend state belongs to a reading, not a sensor id: a favorite fetched on
+  // its own can share an id with an area reading yet carry another last_seen.
+  const trendKey = (sensor) => `${sensor.remote_favorite ? "favorite" : "area"}:${sensor.id}`;
+
   function syncTrendWithSensor(sensor) {
-    const previous = state.trends.get(sensor.id);
+    const key = trendKey(sensor);
+    const previous = state.trends.get(key);
     const readingLastSeen = readingVersion(sensor.last_seen);
     // An explicit event is authoritative for its reading. Only a genuinely
     // newer sensor publication may replace it with inline data or idle state.
@@ -234,9 +239,9 @@
     }
     const inlineSuccess = Array.isArray(sensor.trend) && sensor.trend.some((point) => Number.isFinite(point.aqi));
     if (inlineSuccess) {
-      state.trends.set(sensor.id, { status: "loaded", trend: sensor.trend, retries: 0, readingLastSeen, requestId: 0, source: "inline" });
+      state.trends.set(key, { status: "loaded", trend: sensor.trend, retries: 0, readingLastSeen, requestId: 0, source: "inline" });
     } else if (!previous || readingLastSeen > previous.readingLastSeen) {
-      state.trends.set(sensor.id, { status: "idle", trend: [], retries: previous?.retries ?? 0, readingLastSeen, requestId: 0, source: "publication" });
+      state.trends.set(key, { status: "idle", trend: [], retries: previous?.retries ?? 0, readingLastSeen, requestId: 0, source: "publication" });
     }
   }
 
@@ -280,7 +285,7 @@
     state.source = payload.source || "Demo data";
     state.stale = payload.stale;
     state.config = { ...state.config, ...(payload.config || {}) };
-    for (const sensor of state.sensors) syncTrendWithSensor(sensor);
+    for (const sensor of [...state.sensors, ...(state.favoriteSensors || [])]) syncTrendWithSensor(sensor);
     stampPlaceName();
     applyInterfaceScale();
     $("#data-source").textContent = state.source;
@@ -555,37 +560,43 @@
     const sensorId = Number(payload.sensor_id);
     const requestId = Number(payload.request_id);
     if (!Number.isInteger(sensorId) || !Number.isInteger(requestId) || payload.reading_last_seen === undefined || !["idle", "loading", "loaded", "unavailable", "error"].includes(payload.status)) return;
-    const sensor = state.sensors.find((item) => item.id === sensorId);
-    if (!sensor) return;
     const readingLastSeen = readingVersion(payload.reading_last_seen);
-    if (readingLastSeen !== readingVersion(sensor.last_seen)) return;
-    const previous = state.trends.get(sensorId);
-    if (previous) {
-      if (readingLastSeen < previous.readingLastSeen) return;
-      if (readingLastSeen === previous.readingLastSeen && previous.source === "event" && requestId < previous.requestId) return;
-    }
     let status = payload.status;
     const trend = Array.isArray(payload.trend) ? payload.trend : [];
     if (status === "loaded" && !trend.some((point) => Number.isFinite(point.aqi))) status = "unavailable";
-    const retries = status === "loaded" ? 0 : (previous?.retries ?? 0);
-    state.trends.set(sensorId, { status, trend, retries, readingLastSeen, requestId, source: "event" });
-    if (status === "loaded") sensor.trend = trend;
-    if (sensorId === state.selectedId) renderDetail();
+    // The event names one observation; it applies to each collection's
+    // reading of that observation and to no other.
+    const readings = new Map([...state.sensors, ...(state.favoriteSensors || [])]
+      .filter((sensor) => sensor.id === sensorId && readingVersion(sensor.last_seen) === readingLastSeen)
+      .map((sensor) => [trendKey(sensor), sensor]));
+    let accepted = false;
+    for (const [key, sensor] of readings) {
+      const previous = state.trends.get(key);
+      if (previous) {
+        if (readingLastSeen < previous.readingLastSeen) continue;
+        if (readingLastSeen === previous.readingLastSeen && previous.source === "event" && requestId < previous.requestId) continue;
+      }
+      const retries = status === "loaded" ? 0 : (previous?.retries ?? 0);
+      state.trends.set(key, { status, trend, retries, readingLastSeen, requestId, source: "event" });
+      if (status === "loaded") sensor.trend = trend;
+      accepted = true;
+    }
+    if (accepted && sensorId === state.selectedId) renderDetail();
   }
 
   function retryTrend() {
-    const sensorId = state.selectedId;
-    const trend = state.trends.get(sensorId);
+    const sensor = selectedSensor();
+    const trend = sensor && state.trends.get(trendKey(sensor));
     if (!trend || trend.status !== "error" || trend.retries >= 3) return;
     trend.retries++;
     trend.requestId++;
     trend.status = "loading";
-    if (desktopMode) bridge({ action: "select", id: sensorId });
+    if (desktopMode) bridge({ action: "select", id: sensor.id });
     renderDetail();
   }
 
   function renderChart(sensor) {
-    const trendState = state.trends.get(sensor.id);
+    const trendState = state.trends.get(trendKey(sensor));
     const status = trendState?.status || (state.config.has_api_key ? "loading" : "unavailable");
     const retries = trendState?.retries || 0;
     const retry = $("#trend-retry");
