@@ -109,6 +109,12 @@ def _observed_at(merged: dict, stored_observed_at: float | None, now: float) -> 
     return float(stored_observed_at) if stored_observed_at is not None else now
 
 
+def _checkpoint(value, now: float) -> int | None:
+    """A delta checkpoint safe to store or send: an integer no further in the
+    future than clock skew allows. Anything else means "full snapshot next"."""
+    return plausible_observation_time(_integer(value), now)
+
+
 def _already_expired(merged: dict, stored_observed_at: float | None, now: float) -> bool:
     return _observed_at(merged, stored_observed_at, now) < now - SENSOR_MAX_AGE
 
@@ -311,7 +317,7 @@ class SensorCache:
                     " fetched_at, api_time_stamp, metadata_fetched_at)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (bounds.north, bounds.west, bounds.south, bounds.east,
-                     location_filter, now, api_time_stamp, now),
+                     location_filter, now, _checkpoint(api_time_stamp, now), now),
                 )
                 self._prune_locked(now, preserve_region=cursor.lastrowid)
                 self._db.commit()
@@ -325,10 +331,14 @@ class SensorCache:
             try:
                 unknown = self._upsert_locked(rows)
                 now = self.clock()
+                # An implausible response checkpoint keeps the previous one
+                # (a safe, older lower bound), unless that is itself in the
+                # future, as 0.13 could store; then the next poll is a full one.
                 self._db.execute(
-                    "UPDATE regions SET fetched_at = ?, api_time_stamp ="
-                    " COALESCE(?, api_time_stamp) WHERE id = ?",
-                    (now, api_time_stamp, region_id),
+                    "UPDATE regions SET fetched_at = ?, api_time_stamp = COALESCE(?,"
+                    " CASE WHEN api_time_stamp <= ? THEN api_time_stamp END) WHERE id = ?",
+                    (now, _checkpoint(api_time_stamp, now), now + FUTURE_SKEW_TOLERANCE,
+                     region_id),
                 )
                 self._prune_locked(now)
                 self._db.commit()
@@ -351,9 +361,11 @@ class SensorCache:
                  metadata_fetched_at) in cursor:
                 if max_age is not None and now - fetched_at >= max_age:
                     break  # ordered newest-first: everything after is older
+                # A future checkpoint persisted by 0.13 is treated as absent,
+                # so the region is refreshed by a full snapshot.
                 region = Region(
-                    rid, Bounds(north, west, south, east), mode, fetched_at, stamp,
-                    metadata_fetched_at,
+                    rid, Bounds(north, west, south, east), mode, fetched_at,
+                    _checkpoint(stamp, now), metadata_fetched_at,
                 )
                 if bounds_contains(region.bounds, bounds):
                     return region
