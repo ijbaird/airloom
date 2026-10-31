@@ -480,6 +480,45 @@ class PreferenceTransactionTest(unittest.TestCase):
         self.assertEqual(h.config, before)
         self.assertEqual(h.saves, [])
 
+    MALFORMED = (
+        ("radius_km", "NaN"), ("radius_km", "Infinity"), ("radius_km", "-inf"), ("radius_km", True),
+        ("radius_km", None), ("radius_km", []), ("heatmap_threshold_km", "NaN"),
+        ("heatmap_threshold_km", True), ("alert_threshold", True), ("alert_threshold", "NaN"),
+        ("alert_threshold", "120.5"), ("refresh_minutes", True), ("refresh_minutes", "inf"),
+        ("home_lat", "NaN"), ("home_lon", True), ("confidence_filter", "false"),
+        ("confidence_filter", 1), ("clear_api_key", "yes"), ("api_key", {"x": 1}),
+        ("api_key", 123), ("api_key", ["k"]), ("location_name", {"x": 1}),
+    )
+
+    def test_malformed_settings_values_are_rejected_without_persisting(self):
+        for field, value in self.MALFORMED:
+            with self.subTest(field=field, value=value):
+                h = Harness()
+                before = deepcopy(h.config)
+                result = h.controller.save_settings({**self.SETTINGS, field: value})
+                self.assertEqual(result.status, "invalid")
+                self.assertIn(field, result.error)
+                self.assertEqual(h.config, before)
+                self.assertEqual(h.saves, [])
+
+    def test_form_numeric_strings_still_save(self):
+        h = Harness(home_mode="auto")
+        result = h.controller.save_settings({
+            **self.SETTINGS, "radius_km": "30", "heatmap_threshold_km": "50",
+            "alert_threshold": "120", "refresh_minutes": "5", "home_lat": "10.5",
+            "home_lon": "-20.25", "api_key": "  new-key  ", "clear_api_key": False,
+            "confidence_filter": False, "interface_scale": 1,
+        })
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            {k: h.config[k] for k in ("radius_km", "heatmap_threshold_km", "alert_threshold",
+                                      "refresh_minutes", "latitude", "longitude", "api_key",
+                                      "confidence_filter")},
+            {"radius_km": 30.0, "heatmap_threshold_km": 50.0, "alert_threshold": 120,
+             "refresh_minutes": 5, "latitude": 10.5, "longitude": -20.25,
+             "api_key": "new-key", "confidence_filter": False},
+        )
+
     def test_detected_home_requires_auto_mode(self):
         h = Harness(home_mode="fixed")
         self.assertIsNone(h.controller.set_detected_home(1.0, 2.0))

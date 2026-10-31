@@ -149,6 +149,32 @@ def _persistence_error(action: str, exc: Exception) -> str:
     )
 
 
+def _finite_number(value, field: str) -> float:
+    """Accept a JSON number or a form's numeric string; never a boolean."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{field} must be a finite number.")
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        raise ValueError(f"{field} must be a finite number.") from None
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be a finite number.")
+    return number
+
+
+def _whole_number(value, field: str) -> int:
+    number = _finite_number(value, field)
+    if number != int(number):
+        raise ValueError(f"{field} must be a whole number.")
+    return int(number)
+
+
+def _real_bool(value, field: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{field} must be true or false.")
+    return value
+
+
 class ApplicationController:
     """Own refresh intent, collections, selection, preferences, and lifecycle.
 
@@ -752,13 +778,21 @@ class ApplicationController:
         previous_home = (config.get("latitude"), config.get("longitude"))
         try:
             updates = self._settings_updates(message, config)
+            clear_api_key = (
+                _real_bool(message["clear_api_key"], "clear_api_key")
+                if "clear_api_key" in message
+                else False
+            )
+            api_key = message.get("api_key")
+            if api_key is not None and not isinstance(api_key, str):
+                raise ValueError("api_key must be text or null.")
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             return SettingsResult("invalid", f"Could not save preferences: {exc}")
 
         candidate = deepcopy(config)
         candidate.update(updates)
-        api_key = str(message.get("api_key") or "").strip()
-        if message.get("clear_api_key"):
+        api_key = (api_key or "").strip()
+        if clear_api_key:
             candidate["api_key"] = ""
         elif api_key:
             candidate["api_key"] = api_key
@@ -782,13 +816,20 @@ class ApplicationController:
     @staticmethod
     def _settings_updates(message: dict, config: dict) -> dict:
         home_mode = "fixed" if message.get("home_mode") == "fixed" else "auto"
+        radius = _finite_number(message["radius_km"], "radius_km")
+        heatmap = _finite_number(message["heatmap_threshold_km"], "heatmap_threshold_km")
+        alert = _whole_number(message["alert_threshold"], "alert_threshold")
         updates = {
-            "radius_km": max(2.0, min(100.0, float(message["radius_km"]))),
-            "heatmap_threshold_km": max(5.0, min(1000.0, float(message["heatmap_threshold_km"]))),
-            "alert_threshold": max(1, min(500, int(message["alert_threshold"]))),
+            "radius_km": max(2.0, min(100.0, radius)),
+            "heatmap_threshold_km": max(5.0, min(1000.0, heatmap)),
+            "alert_threshold": max(1, min(500, alert)),
             "home_mode": home_mode,
             "temperature_unit": "C" if message.get("temperature_unit") == "C" else "F",
-            "confidence_filter": bool(message.get("confidence_filter")),
+            "confidence_filter": (
+                _real_bool(message["confidence_filter"], "confidence_filter")
+                if "confidence_filter" in message
+                else config.get("confidence_filter")
+            ),
             "interface_scale": config.get("interface_scale", 1.0),
         }
         if "interface_scale" in message:
@@ -797,14 +838,17 @@ class ApplicationController:
             if isinstance(scale, bool) or float(scale) not in INTERFACE_SCALES:
                 raise ValueError("Interface size must be 100%, 125%, or 150%.")
             updates["interface_scale"] = float(scale)
-        minutes = int(message["refresh_minutes"])
+        minutes = _whole_number(message["refresh_minutes"], "refresh_minutes")
         updates["refresh_minutes"] = minutes if minutes in REFRESH_MINUTES else 2
         if home_mode == "fixed":
-            latitude = float(message["home_lat"])
-            longitude = float(message["home_lon"])
+            latitude = _finite_number(message["home_lat"], "home_lat")
+            longitude = _finite_number(message["home_lon"], "home_lon")
             if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
                 raise ValueError("Coordinates are outside their valid range.")
+            name = message.get("location_name")
+            if name is not None and not isinstance(name, str):
+                raise ValueError("location_name must be text or null.")
             updates["latitude"] = latitude
             updates["longitude"] = longitude
-            updates["location_name"] = str(message.get("location_name") or "Custom location")[:80]
+            updates["location_name"] = (name or "Custom location")[:80]
         return updates

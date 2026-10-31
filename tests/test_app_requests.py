@@ -1043,6 +1043,33 @@ class TransactionalActionTest(ApplicationRequestTestCase):
             [payload for event, payload in app.sent if event == "error"], []
         )
 
+    def test_malformed_settings_payload_gets_matching_error_result(self):
+        app = self.make_app()
+        message = {
+            **self.settings_message(), "radius_km": "NaN", "confidence_filter": "false",
+        }
+
+        app._on_script_message(
+            None, ScriptMessage({"action": "save-settings", **message})
+        )
+
+        results = [
+            payload
+            for event, payload in app.sent
+            if event == "settings-save-result"
+        ]
+        self.assertEqual(
+            results,
+            [{"request_id": "settings-17", "status": "error", "error": mock.ANY}],
+        )
+        self.assertEqual(app.store.saves, 0)
+        self.assertEqual(
+            [payload for event, payload in app.sent if event == "config"], []
+        )
+        self.assertEqual(
+            [payload for event, payload in app.sent if event == "error"], []
+        )
+
     def test_unhide_permission_and_space_failures_are_actionable_and_unchanged(self):
         failures = (
             PermissionError(errno.EACCES, "Permission denied"),
