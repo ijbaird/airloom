@@ -515,17 +515,22 @@ def scenario_save(app: DebugApp):
 
 
 def search_behind(sock: str, geocoder: GeocoderStub, earlier: str, sentinel: str) -> None:
-    """Return once the earlier search's result has been delivered or dropped.
+    """Return once the earlier search's result has almost certainly been
+    delivered or dropped.
 
     Python drops a superseded or canceled result without telling the page,
-    so the drop itself is not observable. Instead: the earlier worker held the
-    geocoder's search lock for its whole request, and once the stub has
-    answered it only parses, releases the lock and queues its GLib idle. The
-    sentinel is submitted after that answer and still needs its own worker,
-    the same search lock, the request throttle and a loopback round trip
-    before it queues its idle. Equal-priority GLib idles run FIFO, so by the
-    time the sentinel's results render, the earlier result was delivered or
-    dropped first.
+    so the drop itself is not observable. Geocoder admission is serialized and
+    equal-priority GLib idles run FIFO, so the earlier result almost always
+    reaches the page (or is dropped) before the sentinel's, which is submitted
+    only after the stub answered the earlier query and still needs its own
+    worker, lock, throttle and loopback round trip.
+
+    This is not strictly guaranteed: the earlier worker releases the search
+    lock before it calls GLib.idle_add, and Python's Lock isn't FIFO. A worker
+    descheduled in that gap for longer than the sentinel's whole round trip
+    would let a negative check pass falsely; it can never fail falsely. A
+    strict guarantee would need a test-only hook in app.py, deliberately not
+    added.
     """
     wait_for(lambda: geocoder.completed(earlier), 10, f"the {earlier} response to complete")
     eval_js(sock, type_and_submit("#search", sentinel))
@@ -567,10 +572,13 @@ def scenario_search(app: DebugApp, geocoder: GeocoderStub):
     eval_js(sock, type_and_submit("#home-place-input", "queuedhome"))
     eval_js(sock, "document.querySelector('#cancel-settings').click()")
     # The queued home worker has waited on the geocoder's search lock since
-    # before blockertown finished, so it is admitted or rejected as soon as
-    # blockertown releases the lock. The sentinel is submitted only after
-    # that, and renders only after its own trip through the same lock, so a
-    # wrongly admitted home search would already have reached the stub.
+    # before blockertown finished. Admission is serialized and the sentinel,
+    # submitted only after blockertown completed, renders only after its own
+    # trip through the same lock, so a wrongly admitted home search almost
+    # always reaches the stub first. Not strictly guaranteed: Python's Lock
+    # isn't FIFO, so the sentinel could take the lock first and this negative
+    # check could pass falsely (it can never fail falsely). A strict guarantee
+    # would need a test-only hook in app.py, deliberately not added.
     wait_for(lambda: geocoder.completed("blockertown"), 10, "the blocking search to complete")
     eval_js(sock, type_and_submit("#search", "sentinelville"))
     wait_for(lambda: "Sentinelville" in eval_js(sock, SEARCH_RESULTS_TEXT_JS), 15, "the later sentinel results")
