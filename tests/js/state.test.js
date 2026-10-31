@@ -1099,6 +1099,52 @@ test("removing a focused row during refresh advances to the remaining row", () =
   assert.equal(app.document.activeElement, remaining);
 });
 
+test("hidden list keeps focus through refreshes and Unhide moves to a successor", () => {
+  const app = loadApp();
+  configureMap(app);
+  const publish = (hidden) => receiveSensors(app, [fixtureSensor(9)], { config: { hidden } });
+  const unhideButton = (id) => app.elements.get("hidden-list").querySelectorAll(".hidden-row")
+    .find((row) => row.dataset.key === String(id))?.querySelector(".unhide-button");
+  const [a, b, c] = [{ id: 1, name: "A" }, { id: 2, name: "B" }, { id: 3, name: "C" }];
+  publish([a, b, c]);
+  openSettings(app);
+  const buttonB = unhideButton(2);
+  buttonB.focus();
+
+  publish([a, b, c]);
+  assert.equal(app.document.activeElement, buttonB);
+  assert.equal(unhideButton(2), buttonB);
+
+  buttonB.click();
+  assert.deepEqual(app.messages.at(-1), { action: "unhide", id: 2 });
+  publish([a, c]);
+  assert.equal(app.document.activeElement, unhideButton(3));
+
+  unhideButton(3).click();
+  publish([a]);
+  assert.equal(app.document.activeElement, unhideButton(1));
+
+  unhideButton(1).click();
+  publish([]);
+  assert.equal(app.document.activeElement, app.elements.get("close-settings"));
+});
+
+test("hidden list stays enabled in preview and Unhide all hands focus to Close", () => {
+  const app = loadApp({ preview: true });
+  configureMap(app);
+  receiveSensors(app, [fixtureSensor(9)], { config: { hidden: [{ id: 1, name: "A" }] } });
+  openSettings(app);
+  const unhideAll = app.elements.get("unhide-all");
+  assert.equal(app.elements.get("hidden-list").querySelector(".unhide-button").disabled, false);
+  assert.equal(unhideAll.disabled, false);
+  unhideAll.focus();
+
+  unhideAll.click();
+
+  assert.equal(unhideAll.hidden, true);
+  assert.equal(app.document.activeElement, app.elements.get("close-settings"));
+});
+
 test("search and settings have accessible names and Ctrl K focuses search", () => {
   const app = loadApp();
   const search = app.elements.get("search");

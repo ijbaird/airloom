@@ -1234,15 +1234,48 @@
     $("#settings-dialog").showModal();
   }
 
+  // Reconciled by sensor ID so a background refresh keeps the focused Unhide
+  // button, and an unhidden row hands focus to a neighbour instead of dropping it.
   function renderHiddenList() {
     const items = state.config.hidden || [];
-    $("#hidden-list").innerHTML = items.length
-      ? items.map((item) => `<div class="hidden-row"><span>${escapeHtml(item.name || `Sensor ${item.id}`)}</span><button type="button" class="unhide-button" data-id="${item.id}">Unhide</button></div>`).join("")
-      : '<div class="empty-state small">No hidden sensors.</div>';
+    const list = $("#hidden-list");
     const all = $("#unhide-all");
+    const previousKeys = [...list.children].map((row) => row.dataset.key).filter((key) => key !== undefined);
+    const unhideAllFocused = document.activeElement === all;
+    const result = AirloomState.reconcileKeyed(list, items, (item) => item.id, createHiddenRow, updateHiddenRow);
+    if (!items.length) list.innerHTML = '<div class="empty-state small">No hidden sensors.</div>';
     all.hidden = !items.length;
     all.textContent = `Unhide all (${items.length})`;
-    document.querySelectorAll("#hidden-list .unhide-button").forEach((button) => button.addEventListener("click", () => requestUnhide(Number(button.dataset.id))));
+    if (result.removedFocus) focusHiddenSuccessor(previousKeys, result.removedFocus.key);
+    else if (unhideAllFocused && all.hidden) $("#close-settings").focus();
+  }
+
+  function createHiddenRow() {
+    const row = document.createElement("div");
+    row.className = "hidden-row";
+    row.appendChild(document.createElement("span"));
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "unhide-button";
+    button.textContent = "Unhide";
+    button.addEventListener("click", () => requestUnhide(Number(row.dataset.key)));
+    row.appendChild(button);
+    return row;
+  }
+
+  function updateHiddenRow(row, item) {
+    row.querySelector("span").textContent = item.name || `Sensor ${item.id}`;
+  }
+
+  // The next surviving row in the previous order, else the previous one,
+  // else Close once the list is empty.
+  function focusHiddenSuccessor(previousKeys, removedKey) {
+    const rows = [...$("#hidden-list").children];
+    const surviving = (key) => rows.find((row) => row.dataset.key === key);
+    const index = previousKeys.indexOf(removedKey);
+    const successor = previousKeys.slice(index + 1).map(surviving).find(Boolean)
+      || previousKeys.slice(0, index).reverse().map(surviving).find(Boolean);
+    (successor?.querySelector(".unhide-button") || $("#close-settings")).focus();
   }
 
   // Bridge mode: Python owns hiding and answers with a fresh sensors payload.
