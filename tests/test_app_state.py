@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import io
 import json
 import sys
 import tempfile
@@ -1440,6 +1441,27 @@ class AlertAdapterTest(ApplicationAdapterTestCase):
                 self.assertEqual(notification_type.new.call_count, notification_count)
                 self.assertEqual(store.data["alert_states"], {"1": should_save})
                 self.assertEqual(store.saves, int(should_save))
+
+    def test_failed_notification_is_retried_then_settles(self):
+        store = FakeStore(favorites=[1], alert_states={"1": False})
+        app = self.make_app(store=store)
+        app.sensors = [make_sensor(1, favorite=True)]
+        app._area_ids = {1}
+        with (
+            mock.patch.object(controller_module.time, "time", return_value=NOW),
+            mock.patch.object(app_module.Notify, "Notification") as notification_type,
+            mock.patch.object(app_module.sys, "stderr", new_callable=io.StringIO) as stderr,
+        ):
+            show = notification_type.new.return_value.show
+            show.side_effect = [app_module.GLib.Error("daemon busy"), True]
+            app._check_alerts()
+            app._check_alerts()
+            app._check_alerts()
+
+        self.assertEqual(show.call_count, 2)
+        self.assertEqual(store.data["alert_states"], {"1": True})
+        self.assertIn("Airloom: could not show alert notification:", stderr.getvalue())
+        self.assertIn("daemon busy", stderr.getvalue())
 
 
 if __name__ == "__main__":

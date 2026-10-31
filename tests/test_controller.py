@@ -646,6 +646,7 @@ class AlertWorkflowTest(unittest.TestCase):
         self.assertTrue(decision.publish)
 
         alerts = h.controller.evaluate_alerts()
+        h.controller.record_alert_delivery(1, True)
         repeat = h.controller.evaluate_alerts()
 
         self.assertEqual([sensor.sensor_id for sensor in alerts.notify], [1])
@@ -675,6 +676,50 @@ class AlertWorkflowTest(unittest.TestCase):
 
         self.assertIn("Could not save alert state", alerts.error)
         self.assertEqual(h.config["alert_states"], {"1": False})
+
+    def test_failed_delivery_retries_each_evaluation_only_while_eligible(self):
+        h = Harness(favorites=[1], alert_states={})
+        h.finish(h.controller.refresh(), [reading(1, aqi=150)])
+        first = h.controller.evaluate_alerts()
+        self.assertEqual([s.sensor_id for s in first.notify], [1])
+        h.controller.record_alert_delivery(1, False)
+        self.assertEqual([s.sensor_id for s in h.controller.evaluate_alerts().notify], [1])
+        h.controller.record_alert_delivery(1, False)
+        h.wall += 7201                                     # age 7261 s > 7200: not is_fresh_observation
+        self.assertEqual(h.controller.evaluate_alerts().notify, ())
+        h.finish(h.controller.refresh(), [reading(1, aqi=160, last_seen=int(h.wall) - 60)])
+        retry = h.controller.evaluate_alerts()
+        self.assertEqual([s.aqi for s in retry.notify], [160])
+        h.controller.record_alert_delivery(1, True)
+        self.assertEqual(h.controller.evaluate_alerts().notify, ())
+        self.assertEqual(h.config["alert_states"], {"1": True})
+        self.assertEqual(len(h.saves), 1)
+
+    def test_persistence_failure_never_renotifies_the_same_crossing(self):
+        h = Harness(favorites=[1], alert_states={})
+        h.finish(h.controller.refresh(), [reading(1, aqi=150)])
+        h.failure = DENIED
+        counts = []
+        for _ in range(3):
+            decision = h.controller.evaluate_alerts()
+            counts.append(len(decision.notify))
+            self.assertIn("Could not save alert state", decision.error)
+            for sensor in decision.notify:
+                h.controller.record_alert_delivery(sensor.sensor_id, True)
+        self.assertEqual(counts, [1, 0, 0])
+        self.assertEqual(h.config["alert_states"], {})
+        h.failure = None
+        self.assertEqual(h.controller.evaluate_alerts().notify, ())
+        self.assertEqual(h.config["alert_states"], {"1": True})
+
+    def test_reset_crossing_alerts_again(self):
+        h = Harness(favorites=[1], alert_states={})
+        h.finish(h.controller.refresh(), [reading(1, aqi=150)])
+        h.controller.evaluate_alerts(); h.controller.record_alert_delivery(1, True)
+        h.finish(h.controller.refresh(), [reading(1, aqi=20)])
+        self.assertEqual(h.controller.evaluate_alerts().notify, ())
+        h.finish(h.controller.refresh(), [reading(1, aqi=150)])
+        self.assertEqual([s.sensor_id for s in h.controller.evaluate_alerts().notify], [1])
 
 
 class TrendDecisionTest(unittest.TestCase):

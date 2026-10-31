@@ -1438,23 +1438,26 @@ class AirloomApplication(Adw.Application):
     def _check_alerts(self) -> None:
         decision = self.controller.evaluate_alerts()
         for sensor in decision.notify:
-            self._notify_alert(sensor)
+            self.controller.record_alert_delivery(sensor.sensor_id, self._notify_alert(sensor))
         if decision.error:
             self._send("error", {"message": decision.error})
 
-    def _notify_alert(self, sensor: Sensor) -> None:
+    def _notify_alert(self, sensor: Sensor) -> bool:
+        """Show one alert; True when it was submitted or captured."""
         title = f"Air quality alert · {sensor.name[:80]}"
         body = f"AQI is now {sensor.aqi}. Open Airloom for health guidance."
         if self._captured_notifications is not None:
             self._captured_notifications.append(
                 {"sensor_id": sensor.sensor_id, "title": title, "body": body}
             )
-            return
+            return True
         notification = Notify.Notification.new(title, body, APP_ID)
         try:
             notification.show()
-        except GLib.Error:
-            pass
+        except GLib.Error as exc:
+            print(f"Airloom: could not show alert notification: {exc}", file=sys.stderr)
+            return False
+        return True
 
     def _send(self, event: str, payload) -> None:
         if self._shutting_down or not self.webview:

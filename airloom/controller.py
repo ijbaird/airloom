@@ -229,6 +229,12 @@ class ApplicationController:
         self.last_stale = False
         self.coverage: dict | None = None
         self.trend_inflight: dict[int, tuple[RequestToken, int | None]] = {}
+        # Observed threshold state, overlaying persisted alert_states so a
+        # failed save never makes the same crossing look new again.
+        self._alert_observed: dict[str, bool] = {}
+        # Alert delivery per crossing: False is pending, True is delivered
+        # this session. Cleared when the sensor drops below threshold.
+        self._alert_delivery: dict[int, bool] = {}
 
     # -- Configuration and lifecycle ----------------------------------------
 
@@ -594,7 +600,11 @@ class ApplicationController:
     # -- Alerts -------------------------------------------------------------
 
     def evaluate_alerts(self) -> AlertDecision:
-        """Decide eligible favorite alerts and persist the next alert state."""
+        """Decide eligible favorite alerts and persist the next alert state.
+
+        A crossing stays pending until ``record_alert_delivery`` confirms it,
+        and is offered again on each evaluation while it remains eligible.
+        """
         if self._stopped:
             return AlertDecision(())
         config = self.config
@@ -602,24 +612,53 @@ class ApplicationController:
             threshold = int(config.get("alert_threshold", 101))
         except (TypeError, ValueError):
             threshold = 101
-        previous = dict(config.get("alert_states", {}))
+        persisted = config.get("alert_states", {})
+        collection = self._collections()[0]
+        favorites = {int(sensor_id) for sensor_id in config.get("favorites", [])}
+        now = self._wall_now()
         alerted, states = alert_transitions(
-            self._collections()[0],
-            favorites={int(sensor_id) for sensor_id in config.get("favorites", [])},
-            previous=previous,
+            collection,
+            favorites=favorites,
+            previous={**persisted, **self._alert_observed},
             threshold=threshold,
-            now=self._wall_now(),
+            now=now,
             origin=self.last_origin,
         )
+        self._alert_observed = dict(states)
+        for sensor_id in list(self._alert_delivery):
+            if not states.get(str(sensor_id), False):
+                del self._alert_delivery[sensor_id]
+        for sensor in alerted:
+            self._alert_delivery[sensor.sensor_id] = False
+        # The same eligibility guard with no prior state yields every sensor
+        # currently eligible and high; only pending ones among them notify.
+        eligible_high, _ = alert_transitions(
+            collection,
+            favorites=favorites,
+            previous={},
+            threshold=threshold,
+            now=now,
+            origin=self.last_origin,
+        )
+        notify = tuple(
+            sensor
+            for sensor in eligible_high
+            if self._alert_delivery.get(sensor.sensor_id) is False
+        )
         error = None
-        if states != previous:
+        if states != persisted:
             candidate = deepcopy(config)
             candidate["alert_states"] = states
             try:
                 self._save(candidate)
             except Exception as exc:  # noqa: BLE001 — persistence is nonfatal here
                 error = f"Could not save alert state: {exc}"
-        return AlertDecision(tuple(alerted), error)
+        return AlertDecision(notify, error)
+
+    def record_alert_delivery(self, sensor_id: int, delivered: bool) -> None:
+        """Settle a pending alert once its notification was delivered."""
+        if delivered and sensor_id in self._alert_delivery:
+            self._alert_delivery[sensor_id] = True
 
     # -- Trends -------------------------------------------------------------
 
